@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.coordinatorlayout.widget.CoordinatorLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/gbx_bg">
+
+    <!-- Map fills entire screen -->
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/gbx_bg">
+
+        <android.webkit.WebView
+            android:id="@+id/webViewMap"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <ProgressBar
+            android:id="@+id/progressMap"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:layout_gravity="center"
+            android:indeterminateTint="@color/gbx_orange" />
+
+        <TextView
+            android:id="@+id/textNoLocation"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:text="No location data"
+            android:textColor="@color/gbx_gray"
+            android:textSize="14sp"
+            android:fontFamily="monospace"
+            android:visibility="gone" />
+
+    </FrameLayout>
+
+    <!-- Map overlay controls -->
+    <LinearLayout
+        android:id="@+id/layoutMapControls"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:padding="12dp">
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/switchShowPath"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Path"
+            android:textColor="@color/gbx_fg"
+            android:textSize="13sp"
+            android:checked="true"
+            android:background="@drawable/bg_chip_rounded"
+            android:paddingHorizontal="12dp"
+            android:paddingVertical="4dp" />
+
+        <View
+            android:layout_width="0dp"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/textSightingCount"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/gbx_fg"
+            android:textSize="11sp"
+            android:background="@drawable/bg_chip_rounded"
+            android:paddingHorizontal="12dp"
+            android:paddingVertical="6dp" />
+
+    </LinearLayout>
+
+    <!-- Timeline bottom sheet -->
+    <LinearLayout
+        android:id="@+id/bottomSheet"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="@color/gbx_bg"
+        app:layout_behavior="com.google.android.material.bottomsheet.BottomSheetBehavior"
+        app:behavior_peekHeight="56dp"
+        app:behavior_hideable="false"
+        app:behavior_halfExpandedRatio="0.5"
+        app:behavior_fitToContents="false">
+
+        <!-- Drag handle + header -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@color/gbx_bg0_hard">
+
+            <!-- Drag indicator -->
+            <View
+                android:layout_width="32dp"
+                android:layout_height="4dp"
+                android:layout_gravity="center_horizontal"
+                android:layout_marginTop="8dp"
+                android:background="@drawable/bg_chip_rounded" />
+
+            <!-- Header row: title + sort buttons -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingHorizontal="12dp"
+                android:paddingTop="8dp"
+                android:paddingBottom="8dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Timeline"
+                    android:textColor="@color/gbx_orange"
+                    android:textSize="16sp"
+                    android:textStyle="bold" />
+
+                <View
+                    android:layout_width="0dp"
+                    android:layout_height="0dp"
+                    android:layout_weight="1" />
+
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/sortToggle"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    app:singleSelection="true"
+                    app:selectionRequired="true"
+                    app:checkedButton="@+id/btnSortLatest">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnSortLatest"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:text="New"
+                        android:textSize="10sp"
+                        android:paddingHorizontal="8dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnSortOldest"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:text="Old"
+                        android:textSize="10sp"
+                        android:paddingHorizontal="8dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnSortCamera"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:text="Cam"
+                        android:textSize="10sp"
+                        android:paddingHorizontal="8dp" />
+
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+
+            </LinearLayout>
+
+        </LinearLayout>
+
+        <!-- Sightings list -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/recyclerTimeline"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:paddingHorizontal="8dp"
+            android:paddingBottom="8dp"
+            android:clipToPadding="false" />
+
+        <TextView
+            android:id="@+id/textEmptyTimeline"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:text="No sightings"
+            android:textColor="@color/gbx_gray"
+            android:textSize="14sp"
+            android:fontFamily="monospace"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+</androidx.coordinatorlayout.widget.CoordinatorLayout>

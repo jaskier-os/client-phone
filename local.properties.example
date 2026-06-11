@@ -1,0 +1,62 @@
+# Copy this file to local.properties and fill in your values.
+# local.properties is gitignored and must NEVER be committed.
+#
+# Every value here can alternatively be supplied as an environment variable
+# of the same name (env vars take precedence over local.properties), which is
+# convenient for CI. If neither is set, the safe placeholder default in
+# app/build.gradle.kts is used (localhost / empty), keeping the build working.
+
+# --- Android SDK location (REQUIRED to build) ---
+# Absolute path to your local Android SDK install.
+sdk.dir=/path/to/Android/Sdk
+
+# --- Default orchestrator WebSocket URLs (per build flavor) ---
+# The app talks to a backend "orchestrator" over WebSocket. These are only the
+# build-time DEFAULTS; the user can override the URL at runtime in the app's
+# server-config screen (stored in SharedPreferences via AppConfig).
+# Default (placeholder) if unset: ws://127.0.0.1:10001/ws/device
+LOCAL_ORCHESTRATOR_URL=ws://127.0.0.1:10001/ws/device
+# Default (placeholder) if unset: wss://127.0.0.1:8443/ws/device
+PRODUCTION_ORCHESTRATOR_URL=wss://your-server.example.com:8443/ws/device
+
+# --- Google Maps API key (OPTIONAL) ---
+# Enables in-app Google map rendering. Leave blank to disable map features gracefully.
+GOOGLE_MAPS_API_KEY=
+
+# --- Yandex MapKit API key (OPTIONAL) ---
+# Used by the :navigation module for Yandex maps. Leave blank to disable.
+MAPKIT_API_KEY=
+
+# --- WebRTC TURN relay (OPTIONAL) ---
+# Used for audio streaming NAT traversal. If TURN_URL is blank, the app falls
+# back to STUN-only (public Google STUN) and does not require any TURN server.
+# Example: turn:turn.example.com:3478?transport=tcp
+TURN_URL=
+TURN_USERNAME=
+TURN_PASSWORD=
+
+# --- Orchestrator API key (OPTIONAL) ---
+# Bearer/x-api-key the app sends to the orchestrator. Empty by default; also
+# settable at runtime in the app's server-config screen.
+ORCHESTRATOR_API_KEY=
+
+# --- Azure Speech key (OPTIONAL) ---
+# Enables Azure speech-to-text / translation. Leave blank to disable; also
+# settable at runtime in settings. Region defaults to southeastasia.
+AZURE_SPEECH_KEY=
+
+# --- Yandex Locator API key (OPTIONAL) ---
+# WiFi/cell/IP geolocation (https://developer.tech.yandex.com/), separate from
+# MapKit. Leave blank to fall back to GPS only; also settable at runtime.
+LOCATOR_API_KEY=
+
+# --- Region-specific ReID tabs (OPTIONAL) ---
+# Shows the "Phone Numbers" sub-tab in the ReID screen and the "Intel" tab in
+# person detail. Hidden by default. Set to true to enable on your build.
+ENABLE_REID_RU_TABS=false
+
+# --- OSINT ReID lookups (OPTIONAL) ---
+# Gates the assistant-driven OSINT lookup tool (person-info / phone-number /
+# sherlock intel via lookup_person_info). Core face re-identification
+# (identify_person) is unaffected. Disabled by default; set to true to enable.
+ENABLE_REID_OSINT=false

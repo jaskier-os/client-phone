@@ -1,0 +1,668 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MapTouchWrapper prevents ViewPager2 from intercepting horizontal swipes anywhere on the map tab -->
+<com.repository.navigation.ui.MapTouchWrapper
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+  <androidx.coordinatorlayout.widget.CoordinatorLayout
+      android:layout_width="match_parent"
+      android:layout_height="match_parent">
+
+    <!-- Provider-neutral map host. The active MapProvider's InteractiveMap.attach()
+         inflates and adds the concrete map view (Yandex MapView / Google MapView)
+         into this container. -->
+    <FrameLayout
+        android:id="@+id/mapContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- Map control buttons - positioned dynamically above bottom sheet -->
+    <LinearLayout
+        android:id="@+id/mapControls"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:layout_gravity="end|bottom"
+        android:layout_marginEnd="12dp"
+        android:layout_marginBottom="8dp">
+
+        <ImageButton
+            android:id="@+id/btnZoomIn"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:src="@drawable/ic_zoom_in"
+            android:scaleType="centerInside"
+            android:background="@drawable/bg_map_button"
+            android:padding="10dp"
+            android:elevation="4dp"
+            app:tint="@color/nav_fg"
+            android:contentDescription="Zoom in"
+            android:layout_marginBottom="8dp" />
+
+        <ImageButton
+            android:id="@+id/btnZoomOut"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:src="@drawable/ic_zoom_out"
+            android:scaleType="centerInside"
+            android:background="@drawable/bg_map_button"
+            android:padding="10dp"
+            android:elevation="4dp"
+            app:tint="@color/nav_fg"
+            android:contentDescription="Zoom out"
+            android:layout_marginBottom="8dp" />
+
+        <ImageButton
+            android:id="@+id/btnMyLocation"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:src="@drawable/ic_my_location"
+            android:scaleType="centerInside"
+            android:background="@drawable/bg_map_button"
+            android:padding="10dp"
+            android:elevation="4dp"
+            app:tint="@color/nav_orange"
+            android:contentDescription="My location" />
+    </LinearLayout>
+
+    <!-- Bottom sheet -->
+    <FrameLayout
+        android:id="@+id/bottomSheet"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@drawable/bg_bottom_sheet_nav"
+        android:elevation="0dp"
+        android:clickable="true"
+        android:focusable="true"
+        app:layout_behavior="com.google.android.material.bottomsheet.BottomSheetBehavior"
+        app:behavior_peekHeight="120dp">
+
+        <!-- Drag handle -->
+        <View
+            android:layout_width="40dp"
+            android:layout_height="4dp"
+            android:layout_gravity="center_horizontal|top"
+            android:layout_marginTop="8dp"
+            android:background="@color/nav_bg2" />
+
+        <!-- All state views stacked, toggled GONE/VISIBLE -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:paddingTop="20dp">
+
+            <!-- 1. IDLE: Search pill + recents -->
+            <LinearLayout
+                android:id="@+id/idleView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:visibility="visible">
+
+                <com.google.android.material.textfield.TextInputLayout
+                    android:id="@+id/idleSearchInputLayout"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    style="@style/Widget.Material3.TextInputLayout.OutlinedBox"
+                    app:startIconDrawable="@android:drawable/ic_menu_search"
+                    app:startIconTint="@color/nav_gray"
+                    app:boxBackgroundColor="@color/nav_bg1"
+                    app:boxStrokeColor="@color/nav_bg2"
+                    app:boxCornerRadiusTopStart="24dp"
+                    app:boxCornerRadiusTopEnd="24dp"
+                    app:boxCornerRadiusBottomStart="24dp"
+                    app:boxCornerRadiusBottomEnd="24dp"
+                    app:hintTextColor="@color/nav_gray">
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/idleSearchPill"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:hint="Search destination"
+                        android:focusable="false"
+                        android:clickable="true"
+                        android:textColor="@color/nav_fg"
+                        android:textColorHint="@color/nav_gray" />
+                </com.google.android.material.textfield.TextInputLayout>
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/recentRecycler"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:nestedScrollingEnabled="true" />
+            </LinearLayout>
+
+            <!-- 2. SEARCH: Full search with back + input + results -->
+            <LinearLayout
+                android:id="@+id/searchView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:visibility="gone">
+
+                <!-- Header: back + input -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <ImageButton
+                        android:id="@+id/searchBackButton"
+                        android:layout_width="40dp"
+                        android:layout_height="40dp"
+                        android:src="@android:drawable/ic_menu_revert"
+                        android:background="?attr/selectableItemBackgroundBorderless"
+                        android:scaleType="centerInside"
+                        app:tint="@color/nav_orange"
+                        android:contentDescription="Back" />
+
+                    <com.google.android.material.textfield.TextInputEditText
+                        android:id="@+id/searchEditText"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:layout_marginStart="8dp"
+                        android:hint="Search destination"
+                        android:inputType="text"
+                        android:singleLine="true"
+                        android:textColor="@color/nav_fg"
+                        android:textColorHint="@color/nav_gray"
+                        android:background="@null" />
+                </LinearLayout>
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:layout_marginTop="8dp"
+                    android:background="@color/nav_bg2" />
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/searchResultsRecycler"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:nestedScrollingEnabled="true" />
+            </LinearLayout>
+
+            <!-- 3. DESTINATION_PREVIEW: Address info + Route button -->
+            <LinearLayout
+                android:id="@+id/destPreviewView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/destName"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/nav_orange"
+                    android:textSize="16sp"
+                    android:textStyle="bold"
+                    android:maxLines="2"
+                    android:ellipsize="end" />
+
+                <TextView
+                    android:id="@+id/destCityPostal"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:textColor="@color/nav_gray"
+                    android:textSize="13sp"
+                    android:visibility="gone" />
+
+                <!-- Coordinates row -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <TextView
+                        android:id="@+id/destCoords"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:textColor="@color/nav_fg"
+                        android:textSize="13sp"
+                        android:fontFamily="monospace" />
+
+                    <ImageButton
+                        android:id="@+id/destCopyButton"
+                        android:layout_width="24dp"
+                        android:layout_height="24dp"
+                        android:layout_marginStart="8dp"
+                        android:src="@drawable/ic_copy"
+                        android:background="?attr/selectableItemBackgroundBorderless"
+                        android:scaleType="centerInside"
+                        app:tint="@color/nav_orange"
+                        android:contentDescription="Copy coordinates" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/destApproxEtaRow"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:visibility="gone">
+
+                    <ImageView
+                        android:layout_width="14dp"
+                        android:layout_height="14dp"
+                        android:src="@drawable/ic_clock"
+                        app:tint="@color/nav_gray"
+                        android:scaleType="centerInside"
+                        android:importantForAccessibility="no" />
+
+                    <TextView
+                        android:id="@+id/destApproxEtaText"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="4dp"
+                        android:textColor="@color/nav_gray"
+                        android:textSize="13sp" />
+
+                    <ImageView
+                        android:layout_width="14dp"
+                        android:layout_height="14dp"
+                        android:layout_marginStart="12dp"
+                        android:src="@drawable/ic_route_distance"
+                        app:tint="@color/nav_gray"
+                        android:scaleType="centerInside"
+                        android:importantForAccessibility="no" />
+
+                    <TextView
+                        android:id="@+id/destApproxDistText"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="4dp"
+                        android:textColor="@color/nav_gray"
+                        android:textSize="13sp" />
+                </LinearLayout>
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/destRouteButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="48dp"
+                    android:layout_marginTop="24dp"
+                    android:text="Route"
+                    android:textColor="@color/nav_bg"
+                    app:backgroundTint="@color/nav_orange"
+                    style="@style/Widget.Material3.Button" />
+            </LinearLayout>
+
+            <!-- 4. PLANNING: Spinner -->
+            <LinearLayout
+                android:id="@+id/planningView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center"
+                android:padding="24dp"
+                android:visibility="gone">
+
+                <ProgressBar
+                    android:layout_width="24dp"
+                    android:layout_height="24dp"
+                    android:indeterminateTint="@color/nav_orange" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="12dp"
+                    android:text="Finding routes..."
+                    android:textColor="@color/nav_fg"
+                    android:textSize="16sp" />
+            </LinearLayout>
+
+            <!-- 5. ROUTE_SELECTION: From/To + chips + alternatives + buttons -->
+            <LinearLayout
+                android:id="@+id/routeSelectionView"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:visibility="gone">
+
+                <!-- From/To + action buttons on one line -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical">
+
+                    <!-- From/To column -->
+                    <LinearLayout
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:orientation="vertical">
+
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:orientation="horizontal"
+                            android:gravity="center_vertical">
+
+                            <ImageView
+                                android:layout_width="14dp"
+                                android:layout_height="14dp"
+                                android:src="@drawable/ic_origin_dot"
+                                app:tint="@color/nav_green"
+                                android:scaleType="centerInside"
+                                android:importantForAccessibility="no" />
+
+                            <TextView
+                                android:id="@+id/routeFromText"
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_weight="1"
+                                android:layout_marginStart="8dp"
+                                android:textColor="@color/nav_fg"
+                                android:textSize="13sp"
+                                android:maxLines="1"
+                                android:ellipsize="end" />
+                        </LinearLayout>
+
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="4dp"
+                            android:orientation="horizontal"
+                            android:gravity="center_vertical">
+
+                            <ImageView
+                                android:layout_width="14dp"
+                                android:layout_height="14dp"
+                                android:src="@drawable/ic_destination_pin"
+                                app:tint="@color/nav_orange"
+                                android:scaleType="centerInside"
+                                android:importantForAccessibility="no" />
+
+                            <TextView
+                                android:id="@+id/routeToText"
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_weight="1"
+                                android:layout_marginStart="8dp"
+                                android:textColor="@color/nav_fg"
+                                android:textSize="13sp"
+                                android:maxLines="1"
+                                android:ellipsize="end" />
+                        </LinearLayout>
+                    </LinearLayout>
+
+                    <!-- Action buttons -->
+                    <ImageButton
+                        android:id="@+id/refreshRoutesButton"
+                        android:layout_width="36dp"
+                        android:layout_height="36dp"
+                        android:src="@drawable/ic_refresh"
+                        android:background="?attr/selectableItemBackgroundBorderless"
+                        android:contentDescription="Refresh routes"
+                        android:scaleType="centerInside"
+                        android:padding="6dp"
+                        app:tint="@color/nav_fg" />
+
+                    <FrameLayout
+                        android:layout_width="36dp"
+                        android:layout_height="36dp"
+                        android:layout_marginStart="4dp">
+
+                        <ImageButton
+                            android:id="@+id/routeMenuButton"
+                            android:layout_width="match_parent"
+                            android:layout_height="match_parent"
+                            android:src="@drawable/ic_more_vert"
+                            android:background="?attr/selectableItemBackgroundBorderless"
+                            android:contentDescription="Route options"
+                            android:scaleType="centerInside"
+                            android:padding="6dp"
+                            app:tint="@color/nav_fg" />
+
+                        <View
+                            android:id="@+id/routeMenuBadge"
+                            android:layout_width="8dp"
+                            android:layout_height="8dp"
+                            android:layout_gravity="top|end"
+                            android:layout_marginTop="4dp"
+                            android:layout_marginEnd="4dp"
+                            android:background="@drawable/bg_timeline_dot"
+                            android:backgroundTint="@color/nav_orange"
+                            android:visibility="gone" />
+                    </FrameLayout>
+                </LinearLayout>
+
+                <!-- Scrollable: chips + alternatives -->
+                <androidx.core.widget.NestedScrollView
+                    android:layout_width="match_parent"
+                    android:layout_height="0dp"
+                    android:layout_weight="1"
+                    android:fillViewport="true">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="vertical">
+
+                        <!-- Transport mode chips -->
+                        <HorizontalScrollView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="12dp"
+                            android:scrollbars="none">
+
+                            <com.google.android.material.chip.ChipGroup
+                                android:id="@+id/modeChipGroup"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                app:singleSelection="true"
+                                app:selectionRequired="true" />
+                        </HorizontalScrollView>
+
+                        <!-- Route alternatives list -->
+                        <androidx.recyclerview.widget.RecyclerView
+                            android:id="@+id/routeVariationsRecycler"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="12dp"
+                            android:nestedScrollingEnabled="false" />
+                    </LinearLayout>
+                </androidx.core.widget.NestedScrollView>
+
+                <!-- Button row (pinned at bottom) -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:orientation="horizontal">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/routeDetailsButton"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="Details"
+                        android:textColor="@color/nav_fg"
+                        app:backgroundTint="@color/nav_bg2"
+                        style="@style/Widget.Material3.Button.TonalButton"
+                        android:layout_marginEnd="8dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/routeStartButton"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="Start"
+                        android:textColor="@color/nav_bg"
+                        app:backgroundTint="@color/nav_orange"
+                        style="@style/Widget.Material3.Button" />
+                </LinearLayout>
+            </LinearLayout>
+
+            <!-- 6. ROUTE_DETAILS: Step-by-step + start button -->
+            <LinearLayout
+                android:id="@+id/routeDetailsView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:visibility="gone">
+
+                <!-- Header: back + mode icon + ETA + distance -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="12dp">
+
+                    <ImageView
+                        android:id="@+id/detailsBackButton"
+                        android:layout_width="32dp"
+                        android:layout_height="32dp"
+                        android:src="@drawable/ic_chevron_left"
+                        android:scaleType="centerInside"
+                        android:background="?attr/selectableItemBackgroundBorderless"
+                        android:contentDescription="Back" />
+
+                    <ImageView
+                        android:id="@+id/detailsModeIcon"
+                        android:layout_width="24dp"
+                        android:layout_height="24dp"
+                        android:layout_marginStart="4dp"
+                        android:scaleType="centerInside"
+                        android:importantForAccessibility="no" />
+
+                    <TextView
+                        android:id="@+id/detailsEtaText"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="12dp"
+                        android:textColor="@color/nav_orange"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/detailsDistanceText"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="12dp"
+                        android:textColor="@color/nav_gray"
+                        android:textSize="13sp" />
+                </LinearLayout>
+
+                <!-- Scrollable timeline -->
+                <androidx.core.widget.NestedScrollView
+                    android:layout_width="match_parent"
+                    android:layout_height="0dp"
+                    android:layout_weight="1">
+
+                    <FrameLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:background="@drawable/bg_timeline_card"
+                        android:padding="8dp">
+
+                        <androidx.recyclerview.widget.RecyclerView
+                            android:id="@+id/detailsStepsRecycler"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:nestedScrollingEnabled="false" />
+                    </FrameLayout>
+                </androidx.core.widget.NestedScrollView>
+
+                <!-- Start button (pinned at bottom) -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/detailsStartButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="44dp"
+                    android:layout_marginTop="16dp"
+                    android:text="Start"
+                    android:textColor="@color/nav_bg"
+                    app:backgroundTint="@color/nav_orange"
+                    style="@style/Widget.Material3.Button" />
+            </LinearLayout>
+
+            <!-- 7. ACTIVE: Navigation in progress (unchanged) -->
+            <LinearLayout
+                android:id="@+id/activeView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:id="@+id/activeEtaText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="@color/nav_orange"
+                    android:textSize="28sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/activeInstructionText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:textColor="@color/nav_fg"
+                    android:textSize="16sp" />
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/activeStepsRecycler"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
+                    android:visibility="gone" />
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginTop="16dp">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/activeDetailsButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="36dp"
+                        android:text="Details"
+                        android:textColor="@color/nav_fg"
+                        app:backgroundTint="@color/nav_bg2"
+                        style="@style/Widget.Material3.Button" />
+
+                    <View
+                        android:layout_width="0dp"
+                        android:layout_height="0dp"
+                        android:layout_weight="1" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/stopButton"
+                        android:layout_width="wrap_content"
+                        android:layout_height="44dp"
+                        android:text="Stop Navigation"
+                        android:textColor="@color/nav_fg"
+                        app:backgroundTint="@color/nav_red"
+                        style="@style/Widget.Material3.Button"
+                        android:minWidth="140dp" />
+                </LinearLayout>
+            </LinearLayout>
+
+        </LinearLayout>
+    </FrameLayout>
+
+  </androidx.coordinatorlayout.widget.CoordinatorLayout>
+
+</com.repository.navigation.ui.MapTouchWrapper>

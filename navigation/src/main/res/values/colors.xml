@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="nav_bg">#FF282828</color>
+    <color name="nav_bg1">#FF3c3836</color>
+    <color name="nav_bg2">#FF504945</color>
+    <color name="nav_fg">#FFebdbb2</color>
+    <color name="nav_gray">#FFa89984</color>
+    <color name="nav_orange">#FFfe8019</color>
+    <color name="nav_red">#FFcc241d</color>
+    <color name="nav_green">#FF98971a</color>
+    <color name="nav_blue">#FF458588</color>
+    <color name="nav_bg_semi">#CC282828</color>
+
+    <!-- Transit segment colors (gruvbox palette) -->
+    <color name="nav_transit_walk">#FFa89984</color>
+    <color name="nav_transit_bus">#FF98971a</color>
+    <color name="nav_transit_metro">#FFcc241d</color>
+    <color name="nav_transit_tram">#FFd79921</color>
+    <color name="nav_transit_trolleybus">#FFb16286</color>
+    <color name="nav_transit_train">#FF458588</color>
+    <color name="nav_transit_suburban">#FF689d6a</color>
+    <color name="nav_yellow">#FFd79921</color>
+    <color name="nav_purple">#FFb16286</color>
+
+    <!-- High-contrast segment palette for map polylines -->
+    <color name="nav_segment_0">#FFcc241d</color>
+    <color name="nav_segment_1">#FF458588</color>
+    <color name="nav_segment_2">#FFd79921</color>
+    <color name="nav_segment_3">#FFb16286</color>
+    <color name="nav_segment_4">#FF98971a</color>
+    <color name="nav_segment_5">#FF689d6a</color>
+    <color name="nav_segment_6">#FFd65d0e</color>
+    <color name="nav_segment_7">#FF83a598</color>
+</resources>

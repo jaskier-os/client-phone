@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="tab_todo" type="id" />
+    <item name="tab_chats" type="id" />
+    <item name="tab_reid" type="id" />
+    <item name="tab_glasses" type="id" />
+    <item name="tab_desktop" type="id" />
+    <item name="tab_navigation" type="id" />
+    <item name="tab_config" type="id" />
+    <item name="rc_session_root" type="id" />
+    <item name="rc_session_title" type="id" />
+</resources>

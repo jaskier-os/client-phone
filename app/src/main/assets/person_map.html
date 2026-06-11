@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  body { margin: 0; padding: 0; background: #282828; }
+  #map { width: 100%; height: 100vh; background: #282828; }
+  .leaflet-popup-content-wrapper { background: #3c3836; color: #ebdbb2; border-radius: 8px; }
+  .leaflet-popup-tip { background: #3c3836; }
+  .leaflet-popup-content { font-size: 12px; }
+  .gaze-icon { display: flex; align-items: center; justify-content: center; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+var map = null;
+var markersGroup = null;
+var trajectoryGroup = null;
+var markersList = [];
+var highlightedIdx = -1;
+
+function initMap(baseUrl, apiKey) {
+  map = L.map('map', { zoomControl: false, attributionControl: false }).setView([55.75, 37.62], 10);
+  var AuthTileLayer = L.TileLayer.extend({
+    createTile: function(coords, done) {
+      var tile = document.createElement('img');
+      tile.alt = '';
+      tile.setAttribute('role', 'presentation');
+      var url = this.getTileUrl(coords);
+      fetch(url, { headers: { 'x-api-key': apiKey || '' } })
+        .then(function(r) { return r.blob(); })
+        .then(function(blob) {
+          tile.src = URL.createObjectURL(blob);
+          done(null, tile);
+        })
+        .catch(function(e) { done(e, tile); });
+      return tile;
+    }
+  });
+  new AuthTileLayer(baseUrl + '/api/v1/tiles/map/osm/{z}/{x}/{y}', {
+    maxZoom: 19,
+    attribution: ''
+  }).addTo(map);
+  markersGroup = L.featureGroup().addTo(map);
+  trajectoryGroup = L.featureGroup().addTo(map);
+}
+
+function createGazeIcon(gazeDeg, isHighlighted) {
+  var size = isHighlighted ? 36 : 26;
+  var half = size / 2;
+  var dotR = isHighlighted ? 6 : 4;
+  var arrowLen = isHighlighted ? 14 : 10;
+  var borderColor = isHighlighted ? '#fb4934' : '#cc241d';
+  var fillColor = '#fe8019';
+
+  if (gazeDeg === null || gazeDeg === undefined) {
+    return L.circleMarker([0,0], {
+      radius: isHighlighted ? 10 : 7,
+      fillColor: fillColor,
+      color: borderColor,
+      weight: isHighlighted ? 3 : 2,
+      opacity: 1,
+      fillOpacity: 0.8
+    });
+  }
+
+  var svg = '<svg width="' + size + '" height="' + size + '" viewBox="0 0 ' + size + ' ' + size + '" xmlns="http://www.w3.org/2000/svg">' +
+    '<circle cx="' + half + '" cy="' + half + '" r="' + dotR + '" fill="' + fillColor + '" stroke="' + borderColor + '" stroke-width="1.5"/>' +
+    '<line x1="' + half + '" y1="' + half + '" x2="' + half + '" y2="' + (half - arrowLen) + '" stroke="' + borderColor + '" stroke-width="2" stroke-linecap="round"/>' +
+    '<polygon points="' + half + ',' + (half - arrowLen - 3) + ' ' + (half - 3) + ',' + (half - arrowLen + 3) + ' ' + (half + 3) + ',' + (half - arrowLen + 3) + '" fill="' + borderColor + '"/>' +
+    '</svg>';
+
+  return L.divIcon({
+    className: 'gaze-icon',
+    html: '<div style="transform:rotate(' + gazeDeg + 'deg);width:' + size + 'px;height:' + size + 'px;">' + svg + '</div>',
+    iconSize: [size, size],
+    iconAnchor: [half, half]
+  });
+}
+
+function formatTime(dateStr) {
+  if (!dateStr) return '';
+  return dateStr.replace('T', ' ').substring(0, 19);
+}
+
+function buildPopup(s) {
+  var pct = Math.round((s.confidence_score || 0) * 100);
+  var html = '<b>Camera ' + (s.camera_id || '?') + '</b><br>' +
+    formatTime(s.detected_at) + '<br>' +
+    '<hr style="border-color:#504945;margin:4px 0">' +
+    'Lat: ' + (s.latitude ? s.latitude.toFixed(6) : 'N/A') + '<br>' +
+    'Lon: ' + (s.longitude ? s.longitude.toFixed(6) : 'N/A') + '<br>';
+  if (s.gaze_degrees !== null && s.gaze_degrees !== undefined) {
+    html += 'Gaze: ' + s.gaze_degrees.toFixed(1) + '&deg;<br>';
+  }
+  if (s.heading_degrees !== null && s.heading_degrees !== undefined) {
+    html += 'Heading: ' + s.heading_degrees.toFixed(1) + '&deg;<br>';
+  }
+  html += 'Confidence: ' + pct + '%';
+  return html;
+}
+
+function setSightings(sightings) {
+  setSightingsWithTrajectory(sightings, false);
+}
+
+function setSightingsWithTrajectory(sightings, showTrajectory) {
+  if (!map || !markersGroup) return;
+  markersGroup.clearLayers();
+  trajectoryGroup.clearLayers();
+  markersList = [];
+  highlightedIdx = -1;
+  if (!sightings || sightings.length === 0) return;
+
+  sightings.forEach(function(s, idx) {
+    var gazeDeg = s.gaze_degrees !== null && s.gaze_degrees !== undefined ? s.gaze_degrees :
+                  (s.heading_degrees !== null && s.heading_degrees !== undefined ? s.heading_degrees : null);
+    var icon = createGazeIcon(gazeDeg, false);
+    var marker;
+
+    if (gazeDeg !== null) {
+      marker = L.marker([s.latitude, s.longitude], { icon: icon });
+    } else {
+      marker = L.circleMarker([s.latitude, s.longitude], {
+        radius: 7,
+        fillColor: '#fe8019',
+        color: s.confidence_score >= 0.8 ? '#98971a' : (s.confidence_score >= 0.5 ? '#d79921' : '#cc241d'),
+        weight: 2,
+        opacity: 1,
+        fillOpacity: 0.7
+      });
+    }
+
+    marker.bindPopup(buildPopup(s));
+    marker._sightingData = s;
+    marker._sightingIdx = idx;
+    markersGroup.addLayer(marker);
+    markersList.push({ marker: marker, data: s, hasGaze: gazeDeg !== null });
+  });
+
+  if (showTrajectory) {
+    drawTrajectory(sightings);
+  }
+
+  map.fitBounds(markersGroup.getBounds().pad(0.1));
+}
+
+function drawTrajectory(sightings) {
+  trajectoryGroup.clearLayers();
+  var located = sightings.filter(function(s) {
+    return s.latitude && s.longitude;
+  });
+  if (located.length < 2) return;
+
+  var sorted = located.slice().sort(function(a, b) {
+    return new Date(a.detected_at) - new Date(b.detected_at);
+  });
+
+  var times = sorted.map(function(s) { return new Date(s.detected_at).getTime(); });
+  var tMin = Math.min.apply(null, times);
+  var tMax = Math.max.apply(null, times);
+  var range = tMax - tMin || 1;
+
+  for (var i = 0; i < sorted.length - 1; i++) {
+    var t1 = (times[i] - tMin) / range;
+    var t2 = (times[i + 1] - tMin) / range;
+    var opacity = 0.3 + ((t1 + t2) / 2) * 0.7;
+    var line = L.polyline(
+      [[sorted[i].latitude, sorted[i].longitude], [sorted[i+1].latitude, sorted[i+1].longitude]],
+      { color: '#d79921', weight: 3, opacity: opacity }
+    );
+    trajectoryGroup.addLayer(line);
+  }
+}
+
+function toggleTrajectory(show) {
+  if (!map) return;
+  if (show) {
+    map.addLayer(trajectoryGroup);
+  } else {
+    map.removeLayer(trajectoryGroup);
+  }
+}
+
+function flyTo(lat, lng) {
+  if (map) map.flyTo([lat, lng], 18, { duration: 0.7 });
+}
+
+function highlightSighting(index) {
+  if (highlightedIdx >= 0 && highlightedIdx < markersList.length) {
+    var prev = markersList[highlightedIdx];
+    if (prev.hasGaze) {
+      var prevGaze = prev.data.gaze_degrees !== null && prev.data.gaze_degrees !== undefined ?
+        prev.data.gaze_degrees : prev.data.heading_degrees;
+      prev.marker.setIcon(createGazeIcon(prevGaze, false));
+    } else {
+      prev.marker.setRadius(7);
+      prev.marker.setStyle({ weight: 2 });
+    }
+  }
+
+  if (index >= 0 && index < markersList.length) {
+    var curr = markersList[index];
+    if (curr.hasGaze) {
+      var currGaze = curr.data.gaze_degrees !== null && curr.data.gaze_degrees !== undefined ?
+        curr.data.gaze_degrees : curr.data.heading_degrees;
+      curr.marker.setIcon(createGazeIcon(currGaze, true));
+    } else {
+      curr.marker.setRadius(10);
+      curr.marker.setStyle({ weight: 3, color: '#fb4934' });
+    }
+    highlightedIdx = index;
+  }
+}
+</script>
+</body>
+</html>

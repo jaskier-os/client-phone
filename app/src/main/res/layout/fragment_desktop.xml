@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/gbx_bg">
+
+    <!-- Video surface (fills screen, hidden when not streaming) -->
+    <TextureView
+        android:id="@+id/surfaceVideo"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <!-- Empty state -->
+    <TextView
+        android:id="@+id/txtEmptyState"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:text="No active stream"
+        android:textColor="@color/gbx_gray"
+        android:textSize="14sp"
+        android:fontFamily="monospace" />
+
+    <ImageView
+        android:id="@+id/progressLoading"
+        android:layout_width="24dp"
+        android:layout_height="24dp"
+        android:layout_gravity="center"
+        android:layout_marginTop="32dp"
+        android:src="@drawable/ic_spinner"
+        android:visibility="gone" />
+
+    <!-- Compact translucent bottom panel -->
+    <LinearLayout
+        android:id="@+id/controlOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="@color/gbx_overlay"
+        android:paddingVertical="8dp"
+        android:paddingHorizontal="12dp">
+
+        <!-- Orchestrator indicator -->
+        <View
+            android:id="@+id/dotOrchestrator"
+            android:layout_width="8dp"
+            android:layout_height="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="4dp"
+            android:text="ORK"
+            android:textColor="@android:color/white"
+            android:textSize="10sp"
+            android:fontFamily="monospace" />
+
+        <!-- Mouse relay button (visible when pointer device connected + streaming) -->
+        <ImageButton
+            android:id="@+id/btnMouse"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="12dp"
+            android:src="@drawable/ic_mouse"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Mouse relay"
+            android:scaleType="centerInside"
+            android:visibility="gone"
+            app:tint="@color/gbx_fg" />
+
+        <!-- Audio relay button + loading spinner -->
+        <FrameLayout
+            android:id="@+id/audioContainer"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="12dp"
+            android:visibility="gone">
+
+            <ImageButton
+                android:id="@+id/btnAudio"
+                android:layout_width="36dp"
+                android:layout_height="36dp"
+                android:src="@drawable/ic_speaker"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Audio relay"
+                android:scaleType="centerInside"
+                app:tint="@color/gbx_fg" />
+
+            <ImageView
+                android:id="@+id/progressAudio"
+                android:layout_width="24dp"
+                android:layout_height="24dp"
+                android:layout_gravity="center"
+                android:src="@drawable/ic_spinner"
+                android:visibility="gone" />
+        </FrameLayout>
+
+        <!-- Keyboard input button (visible when streaming) -->
+        <ImageButton
+            android:id="@+id/btnKeyboard"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:layout_marginStart="12dp"
+            android:src="@drawable/ic_keyboard"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Keyboard input"
+            android:scaleType="centerInside"
+            android:visibility="gone"
+            app:tint="@color/gbx_fg" />
+
+        <!-- Spacer -->
+        <View
+            android:layout_width="0dp"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <!-- Monitor switcher (hidden when only 1 monitor) -->
+        <FrameLayout
+            android:id="@+id/monitorSwitcher"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginEnd="8dp"
+            android:visibility="gone">
+
+            <ImageButton
+                android:id="@+id/btnMonitor"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:src="@drawable/ic_monitor"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Switch monitor"
+                android:scaleType="centerInside"
+                app:tint="@color/gbx_fg" />
+
+            <TextView
+                android:id="@+id/txtMonitorBadge"
+                android:layout_width="16dp"
+                android:layout_height="16dp"
+                android:layout_gravity="top|end"
+                android:background="@drawable/ic_badge_bg"
+                android:gravity="center"
+                android:text="0"
+                android:textColor="@color/gbx_bg"
+                android:textSize="9sp"
+                android:fontFamily="monospace"
+                android:textStyle="bold" />
+        </FrameLayout>
+
+        <!-- Stream button + loading spinner -->
+        <FrameLayout
+            android:id="@+id/streamContainer"
+            android:layout_width="44dp"
+            android:layout_height="44dp">
+
+            <ImageButton
+                android:id="@+id/btnStream"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:src="@drawable/ic_play"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Stream"
+                android:scaleType="centerInside"
+                app:tint="@color/gbx_fg" />
+
+            <ImageView
+                android:id="@+id/progressStream"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_gravity="center"
+                android:src="@drawable/ic_spinner"
+                android:visibility="gone" />
+        </FrameLayout>
+
+    </LinearLayout>
+
+</FrameLayout>

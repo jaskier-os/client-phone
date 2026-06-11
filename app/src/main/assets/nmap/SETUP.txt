@@ -1,0 +1,15 @@
+Download nmap binary and data files from:
+https://github.com/kost/nmap-android/releases/tag/v7.12
+
+Required files in this directory:
+- nmap              (arm64-v8a binary)
+- nmap-services     (port/service mappings)
+- nmap-service-probes (service detection probes)
+- nmap-protocols    (protocol definitions)
+- nmap-mac-prefixes (MAC vendor lookup)
+
+Steps:
+1. Download nmap-arm64-v8a.tar.gz from the release
+2. Extract the nmap binary and place it here
+3. Copy the data files (nmap-services etc.) from the extracted archive
+4. Build the app - AssetExtractor will bundle them into the APK

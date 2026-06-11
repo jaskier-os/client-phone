@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- Left bar (short) -->
+    <path
+        android:pathData="M4,10L4,14C4,14.55 4.45,15 5,15C5.55,15 6,14.55 6,14L6,10C6,9.45 5.55,9 5,9C4.45,9 4,9.45 4,10Z"
+        android:fillColor="#000000" />
+    <!-- Center-left bar (medium) -->
+    <path
+        android:pathData="M8,7L8,17C8,17.55 8.45,18 9,18C9.55,18 10,17.55 10,17L10,7C10,6.45 9.55,6 9,6C8.45,6 8,6.45 8,7Z"
+        android:fillColor="#000000" />
+    <!-- Center bar (tall) -->
+    <path
+        android:pathData="M12,4L12,20C12,20.55 12.45,21 13,21C13.55,21 14,20.55 14,20L14,4C14,3.45 13.55,3 13,3C12.45,3 12,3.45 12,4Z"
+        android:fillColor="#000000" />
+    <!-- Center-right bar (medium) -->
+    <path
+        android:pathData="M16,8L16,16C16,16.55 16.45,17 17,17C17.55,17 18,16.55 18,16L18,8C18,7.45 17.55,7 17,7C16.45,7 16,7.45 16,8Z"
+        android:fillColor="#000000" />
+    <!-- Right bar (short) -->
+    <path
+        android:pathData="M20,11L20,13C20,13.55 20.45,14 21,14C21.55,14 22,13.55 22,13L22,11C22,10.45 21.55,10 21,10C20.45,10 20,10.45 20,11Z"
+        android:fillColor="#000000" />
+</vector>

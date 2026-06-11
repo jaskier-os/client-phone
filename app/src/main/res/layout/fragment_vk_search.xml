@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/gbx_bg">
+
+    <androidx.core.widget.NestedScrollView
+        android:id="@+id/scrollContent"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:id="@+id/layoutCards"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="12dp" />
+
+    </androidx.core.widget.NestedScrollView>
+
+    <LinearLayout
+        android:id="@+id/layoutLoading"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center_horizontal"
+        android:visibility="gone">
+
+        <ProgressBar
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:indeterminateTint="@color/gbx_orange" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="Loading..."
+            android:textColor="@color/gbx_gray"
+            android:textSize="13sp"
+            android:fontFamily="monospace" />
+
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/layoutEmpty"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center_horizontal"
+        android:visibility="gone">
+
+        <ImageView
+            android:layout_width="64dp"
+            android:layout_height="64dp"
+            android:src="@drawable/ic_tab_face"
+            android:alpha="0.3"
+            android:scaleType="centerInside" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="No VK search data"
+            android:textColor="@color/gbx_gray"
+            android:textSize="14sp"
+            android:fontFamily="monospace" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnSearchVk"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="Search VK"
+            android:textColor="@color/gbx_bg"
+            android:fontFamily="monospace"
+            xmlns:app="http://schemas.android.com/apk/res-auto"
+            app:backgroundTint="@color/gbx_orange"
+            app:icon="@drawable/ic_tab_face"
+            app:iconTint="@color/gbx_bg"
+            app:iconGravity="textStart" />
+
+    </LinearLayout>
+
+    <!-- Bottom-right search button (visible when data is loaded) -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnRerunVk"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_margin="16dp"
+        android:text="Re-run"
+        android:textColor="@color/gbx_bg"
+        android:fontFamily="monospace"
+        android:visibility="gone"
+        xmlns:app="http://schemas.android.com/apk/res-auto"
+        app:backgroundTint="@color/gbx_orange"
+        app:icon="@drawable/ic_tab_face"
+        app:iconTint="@color/gbx_bg"
+        app:iconGravity="textStart"
+        app:cornerRadius="20dp" />
+
+</FrameLayout>

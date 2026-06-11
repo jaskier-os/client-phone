@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="@color/gbx_bg">
+
+    <!-- Top bar -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:background="@color/gbx_bg0_hard"
+        android:padding="12dp"
+        android:gravity="center_vertical">
+
+        <ImageButton
+            android:id="@+id/btnListBack"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:padding="0dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_back"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            app:tint="@color/gbx_orange"
+            android:contentDescription="Back" />
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="12dp"
+            android:text="Audio Recordings"
+            android:textSize="18sp"
+            android:textColor="@color/gbx_orange"
+            android:textStyle="bold" />
+
+        <ImageButton
+            android:id="@+id/btnAlwaysRecord"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:padding="0dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_clock"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="Toggle always record" />
+
+        <ImageButton
+            android:id="@+id/btnDeleteUnpinned"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:padding="0dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_delete"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            app:tint="@color/gbx_red"
+            android:contentDescription="Delete unpinned" />
+
+        <ImageButton
+            android:id="@+id/btnSort"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:padding="0dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/ic_sort"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            app:tint="@color/gbx_orange"
+            android:contentDescription="Sort" />
+
+    </LinearLayout>
+
+    <!-- Status card -->
+    <com.google.android.material.card.MaterialCardView
+        android:id="@+id/statusCard"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:layout_marginStart="8dp"
+        android:layout_marginEnd="8dp"
+        app:cardBackgroundColor="@color/gbx_bg1"
+        app:cardCornerRadius="12dp"
+        app:cardElevation="0dp"
+        app:strokeWidth="0dp">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:padding="16dp"
+            android:gravity="center_vertical">
+
+            <ImageView
+                android:id="@+id/statusDot"
+                android:layout_width="12dp"
+                android:layout_height="12dp"
+                android:src="@drawable/ic_fiber_manual_record"
+                app:tint="@color/gbx_gray"
+                android:layout_marginEnd="8dp" />
+
+            <TextView
+                android:id="@+id/txtStatus"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:textSize="14sp"
+                android:textColor="@color/gbx_fg" />
+
+            <TextView
+                android:id="@+id/txtDuration"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="14sp"
+                android:textColor="@color/gbx_gray" />
+
+            <ImageButton
+                android:id="@+id/btnRecordToggle"
+                android:layout_width="48dp"
+                android:layout_height="48dp"
+                android:padding="0dp"
+                android:scaleType="centerInside"
+                android:layout_marginStart="12dp"
+                android:src="@drawable/ic_fiber_manual_record"
+                android:background="?attr/selectableItemBackgroundBorderless"
+                android:contentDescription="Start or stop recording" />
+
+        </LinearLayout>
+
+    </com.google.android.material.card.MaterialCardView>
+
+    <!-- Storage info -->
+    <TextView
+        android:id="@+id/txtStorageInfo"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginEnd="16dp"
+        android:layout_marginTop="4dp"
+        android:textSize="12sp"
+        android:textColor="@color/gbx_gray" />
+
+    <!-- Recordings list -->
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recyclerRecordings"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:paddingTop="8dp"
+        android:clipToPadding="false" />
+
+</LinearLayout>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="gbx_bg">#FF282828</color>
+    <color name="gbx_bg0_hard">#FF1d2021</color>
+    <color name="gbx_bg1">#FF3c3836</color>
+    <color name="gbx_bg2">#FF504945</color>
+    <color name="gbx_fg">#FFebdbb2</color>
+    <color name="gbx_fg0">#FFfbf1c7</color>
+    <color name="gbx_red">#FFcc241d</color>
+    <color name="gbx_green">#FF98971a</color>
+    <color name="gbx_yellow">#FFd79921</color>
+    <color name="gbx_blue">#FF458588</color>
+    <color name="gbx_purple">#FFb16286</color>
+    <color name="gbx_aqua">#FF689d6a</color>
+    <color name="gbx_orange">#FFfe8019</color>
+    <color name="gbx_gray">#FFa89984</color>
+    <color name="gbx_overlay">#CC1d2021</color>
+    <color name="gbx_status_connected">#FF00AA00</color>
+    <color name="gbx_status_disconnected">#FFAA0000</color>
+</resources>

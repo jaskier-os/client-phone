@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:paddingStart="24dp"
+    android:paddingEnd="24dp"
+    android:paddingBottom="32dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Translation"
+        android:textColor="@color/gbx_orange"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:paddingTop="16dp"
+        android:paddingBottom="16dp" />
+
+    <!-- Source/target dropdowns + swap button. The button is overlaid via
+         ConstraintLayout so it doesn't add row height between the dropdowns. -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="12dp">
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/layoutFromLanguage"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="32dp"
+            app:layout_constraintTop_toTopOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            style="@style/Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+
+            <com.google.android.material.textfield.MaterialAutoCompleteTextView
+                android:id="@+id/dropdownFromLanguage"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Source Language"
+                android:inputType="text" />
+
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:id="@+id/layoutToLanguage"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            app:layout_constraintTop_toBottomOf="@id/layoutFromLanguage"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            style="@style/Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+
+            <com.google.android.material.textfield.MaterialAutoCompleteTextView
+                android:id="@+id/dropdownToLanguage"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Target Language"
+                android:inputType="text" />
+
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <!-- Overlay swap button: filled circular MaterialButton. insetTop/Bottom
+             zeroed to defeat Material's default 6dp insets that otherwise push
+             the icon off-center within the fixed 40dp box. cornerRadius=20dp
+             gives a perfect circle. -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnSwapLanguages"
+            style="@style/Widget.Material3.Button"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="8dp"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:insetTop="0dp"
+            android:insetBottom="0dp"
+            android:padding="0dp"
+            android:contentDescription="Swap source and target languages"
+            app:cornerRadius="20dp"
+            app:icon="@drawable/ic_swap_vert"
+            app:iconGravity="textStart"
+            app:iconPadding="0dp"
+            app:iconSize="20dp"
+            app:iconTint="?attr/colorOnPrimary"
+            app:layout_constraintTop_toBottomOf="@id/layoutFromLanguage"
+            app:layout_constraintBottom_toTopOf="@id/layoutToLanguage"
+            app:layout_constraintStart_toStartOf="parent" />
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <!-- Font Size -->
+    <TextView
+        android:id="@+id/labelFontSize"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Font size: 14sp"
+        android:textColor="@color/gbx_gray"
+        android:textSize="13sp" />
+
+    <com.google.android.material.slider.Slider
+        android:id="@+id/sliderTranslationFontSize"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="12dp"
+        android:valueFrom="8"
+        android:valueTo="24"
+        android:stepSize="1" />
+
+    <!-- Provider -->
+    <com.google.android.material.textfield.TextInputLayout
+        android:id="@+id/layoutProvider"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="8dp"
+        style="@style/Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+
+        <com.google.android.material.textfield.MaterialAutoCompleteTextView
+            android:id="@+id/dropdownProvider"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Provider"
+            android:inputType="none" />
+
+    </com.google.android.material.textfield.TextInputLayout>
+
+    <!-- Two-way translation (auto-detect both languages, dual-direction) -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnTwoWayTranslation"
+        style="@style/Widget.Material3.Button.OutlinedButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="12dp"
+        android:text="Two-way translation"
+        app:icon="@drawable/ic_translate"
+        app:iconGravity="textStart"
+        app:iconSize="20dp" />
+
+    <!-- Audio Source -->
+    <com.google.android.material.textfield.TextInputLayout
+        android:id="@+id/layoutAudioSource"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginBottom="24dp"
+        style="@style/Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+
+        <com.google.android.material.textfield.MaterialAutoCompleteTextView
+            android:id="@+id/dropdownAudioSource"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Audio Source"
+            android:inputType="none" />
+
+    </com.google.android.material.textfield.TextInputLayout>
+
+    <!-- Start Button -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnStartTranslation"
+        style="@style/Widget.Material3.Button"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Start"
+        app:icon="@drawable/ic_translate"
+        app:iconGravity="textStart"
+        app:iconSize="20dp" />
+
+</LinearLayout>

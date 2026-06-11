@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Repository</string>
+    <string name="hint_orchestrator_url">Orchestrator URL</string>
+    <string name="sherlock_bot_hint">\@username_bot</string>
+    <string name="hint_api_key">API Key</string>
+    <string name="hint_device_id">Device ID</string>
+    <string name="btn_start">Start Service</string>
+    <string name="btn_stop">Stop Service</string>
+    <string name="status_idle">Status: Idle</string>
+    <string name="status_listening">Status: Listening</string>
+    <string name="status_connecting">Status: Connecting...</string>
+    <string name="status_stopped">Status: Stopped</string>
+    <string name="notification_channel_name">Repository Service</string>
+    <string name="notification_channel_description">Voice listener foreground service</string>
+
+    <string name="tab_config">Config</string>
+    <string name="tab_reid">ReID</string>
+    <string name="tab_phones">Phones</string>
+
+    <string name="tab_desc_todo">Todo</string>
+    <string name="tab_desc_chats">Chats</string>
+    <string name="tab_desc_reid">ReID</string>
+    <string name="tab_desc_glasses">Glasses</string>
+    <string name="tab_desc_desktop">Desktop</string>
+    <string name="tab_desc_navigation">Navigation</string>
+    <string name="tab_desc_config">Config</string>
+    <string name="back">Back</string>
+    <string name="delete">Delete</string>
+    <string name="cancel">Cancel</string>
+
+    <string name="sherlock_result_title">Sherlock Result</string>
+    <string name="hint_glasses_serial">Glasses Serial Number</string>
+    <string name="config_map_provider_hint">Map provider</string>
+    <string name="phone_empty">No calls found</string>
+    <string name="sherlock_search">Sherlock</string>
+</resources>

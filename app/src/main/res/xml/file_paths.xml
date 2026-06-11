@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="logs" path="logs/" />
+    <files-path name="recordings" path="audio_recordings/" />
+    <cache-path name="shared" path="shared_audio/" />
+    <cache-path name="pdfs" path="pdfs/" />
+    <!-- Glasses-synced files live under the app's external Pictures dir.
+         Exposed via FileProvider so the Files-tab viewer can ACTION_VIEW
+         them in other apps without triggering FileUriExposedException. -->
+    <external-files-path name="glasses_repo" path="Pictures/Repository/" />
+</paths>

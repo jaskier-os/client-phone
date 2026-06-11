@@ -1,0 +1,58 @@
+# Gradle
+.gradle/
+build/
+**/build/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Android native build
+.cxx/
+
+# Local config and secrets (never commit)
+local.properties
+.env
+.env.local
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.crt
+*.key
+
+# Personal / enrollment data (not for version control)
+# Voice profile / enrollment recordings in any form, anywhere in the tree.
+voice_profile.*
+**/voice_profile.*
+test/voice_profile.mp3
+app/src/main/assets/voice_profile.bin
+app/src/main/assets/voice_profile.bin.bak
+
+# Large pretrained model fetched via fetch_models.sh (see README)
+app/src/main/assets/ecapa_tdnn.onnx
+
+# Bundled nmap binary + data (fetched per assets/nmap/SETUP.txt)
+app/src/main/assets/nmap/nmap
+app/src/main/assets/nmap/nmap-services
+app/src/main/assets/nmap/nmap-service-probes
+app/src/main/assets/nmap/nmap-protocols
+app/src/main/assets/nmap/nmap-mac-prefixes
+
+# IDE
+.idea/
+*.iml
+.kotlin/
+captures/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Test outputs
+test/ui/reports/
+test/ui/screenshots/

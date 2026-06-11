@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  User-position navigation arrow for the interactive phone map. Points "up"
+  (north / 0 deg) by default; the Marker is drawn flat and rotated to the travel
+  heading so the arrow always points along the path being followed.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <!-- White halo circle for contrast on the map. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M24,24m-13,0a13,13 0,1 1,26 0a13,13 0,1 1,-26 0" />
+    <!-- Blue heading chevron pointing up. -->
+    <path
+        android:fillColor="#1A73E8"
+        android:pathData="M24,9 L33,32 L24,26.5 L15,32 Z" />
+</vector>

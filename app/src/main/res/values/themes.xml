@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Listener" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/gbx_orange</item>
+        <item name="colorOnPrimary">@color/gbx_bg</item>
+        <item name="colorPrimaryContainer">@color/gbx_bg2</item>
+        <item name="colorOnPrimaryContainer">@color/gbx_orange</item>
+        <item name="colorSecondary">@color/gbx_yellow</item>
+        <item name="colorOnSecondary">@color/gbx_bg</item>
+        <item name="colorSurface">@color/gbx_bg</item>
+        <item name="colorOnSurface">@color/gbx_fg</item>
+        <item name="colorSurfaceVariant">@color/gbx_bg1</item>
+        <item name="colorOnSurfaceVariant">@color/gbx_gray</item>
+        <item name="colorOutline">@color/gbx_bg2</item>
+        <item name="colorError">@color/gbx_red</item>
+        <item name="colorOnError">@color/gbx_bg0_hard</item>
+        <item name="colorTertiary">@color/gbx_purple</item>
+        <item name="colorOnTertiary">@color/gbx_bg</item>
+        <item name="android:statusBarColor">@color/gbx_bg0_hard</item>
+        <item name="android:navigationBarColor">@color/gbx_bg0_hard</item>
+        <item name="android:windowBackground">@color/gbx_bg</item>
+        <item name="materialAlertDialogTheme">@style/ThemeOverlay.App.MaterialAlertDialog</item>
+        <item name="bottomSheetDialogTheme">@style/ThemeOverlay.App.BottomSheetDialog</item>
+    </style>
+
+    <style name="ShapeAppearance.App.Dialog" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">16dp</item>
+    </style>
+
+    <style name="ThemeOverlay.App.MaterialAlertDialog" parent="ThemeOverlay.Material3.MaterialAlertDialog">
+        <item name="shapeAppearanceOverlay">@style/ShapeAppearance.App.Dialog</item>
+        <item name="colorSurface">@color/gbx_bg1</item>
+    </style>
+
+    <style name="ThemeOverlay.App.BottomSheetDialog" parent="ThemeOverlay.Material3.BottomSheetDialog">
+        <item name="bottomSheetStyle">@style/Widget.App.BottomSheet</item>
+    </style>
+
+    <style name="Widget.App.BottomSheet" parent="Widget.Material3.BottomSheet">
+        <item name="shapeAppearanceOverlay">@style/ShapeAppearance.App.BottomSheet</item>
+        <item name="backgroundTint">@color/gbx_bg</item>
+    </style>
+
+    <style name="ShapeAppearance.App.BottomSheet" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSizeTopLeft">24dp</item>
+        <item name="cornerSizeTopRight">24dp</item>
+        <item name="cornerSizeBottomLeft">0dp</item>
+        <item name="cornerSizeBottomRight">0dp</item>
+    </style>
+
+    <style name="ShapeAppearance.App.RoundedCorner12" parent="">
+        <item name="cornerFamily">rounded</item>
+        <item name="cornerSize">12dp</item>
+    </style>
+
+    <style name="FullScreenDialog" parent="Theme.AppCompat.Dialog">
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowBackground">@color/gbx_bg</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>
