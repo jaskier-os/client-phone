@@ -19,9 +19,6 @@ import com.repository.listener.R
 import com.repository.listener.config.AppConfig
 import com.repository.listener.service.ListenerService
 import com.repository.listener.util.LogCollector
-import com.rokid.cxr.Caps
-import com.rokid.cxr.client.extend.CxrApi
-import org.json.JSONArray
 import org.json.JSONObject
 
 class GlassesSettingsFragment : Fragment() {
@@ -42,15 +39,7 @@ class GlassesSettingsFragment : Fragment() {
     private lateinit var txtTxTotal: TextView
     private lateinit var txtRxTotal: TextView
     private lateinit var chkAdbDebug: CheckBox
-    private lateinit var chkSideloading: CheckBox
-    private lateinit var chkOpenAfterInstall: CheckBox
-    private lateinit var chkOpenCloseAfterInstall: CheckBox
     private lateinit var chkWeatherWidget: CheckBox
-    private lateinit var relaySection: LinearLayout
-    private lateinit var txtRelayUrl: TextView
-    private lateinit var txtRelayStatus: TextView
-    private lateinit var txtRelayLastUpload: TextView
-    private lateinit var txtRelayInstallStatus: TextView
     private lateinit var btnInfo: View
     private lateinit var btnSettings: View
     private lateinit var btnPairMode: com.google.android.material.button.MaterialButton
@@ -78,18 +67,6 @@ class GlassesSettingsFragment : Fragment() {
             val rxTotal = intent.getLongExtra(ListenerService.EXTRA_RX_TOTAL, 0)
             activity?.runOnUiThread {
                 updateThroughput(txKbps, rxKbps, txTotal, rxTotal)
-            }
-        }
-    }
-
-    private val relayStatusReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            val running = intent.getBooleanExtra(ListenerService.EXTRA_RELAY_RUNNING, false)
-            val url = intent.getStringExtra(ListenerService.EXTRA_RELAY_URL)
-            val lastUpload = intent.getStringExtra(ListenerService.EXTRA_RELAY_LAST_UPLOAD)
-            val installStatus = intent.getStringExtra(ListenerService.EXTRA_RELAY_INSTALL_STATUS)
-            activity?.runOnUiThread {
-                updateRelayStatus(running, url, lastUpload, installStatus)
             }
         }
     }
@@ -131,12 +108,6 @@ class GlassesSettingsFragment : Fragment() {
         txtTxTotal = view.findViewById(R.id.txtTxTotal)
         txtRxTotal = view.findViewById(R.id.txtRxTotal)
         chkAdbDebug = view.findViewById(R.id.chkAdbDebug)
-        chkSideloading = view.findViewById(R.id.chkSideloading)
-        relaySection = view.findViewById(R.id.relaySection)
-        txtRelayUrl = view.findViewById(R.id.txtRelayUrl)
-        txtRelayStatus = view.findViewById(R.id.txtRelayStatus)
-        txtRelayLastUpload = view.findViewById(R.id.txtRelayLastUpload)
-        txtRelayInstallStatus = view.findViewById(R.id.txtRelayInstallStatus)
 
         // Make connection dot circular
         val dotDrawable = GradientDrawable().apply {
@@ -178,36 +149,6 @@ class GlassesSettingsFragment : Fragment() {
             } else {
                 sendAdbSetting(false)
             }
-        }
-
-        // Restore sideloading state
-        chkSideloading.isChecked = AppConfig.getSideloadEnabled(requireContext())
-        chkSideloading.setOnCheckedChangeListener { _, isChecked ->
-            AppConfig.setSideloadEnabled(requireContext(), isChecked)
-            requireContext().sendBroadcast(Intent(GlassesFragment.ACTION_TOGGLE_SIDELOADING).apply {
-                setPackage(requireContext().packageName)
-                putExtra(GlassesFragment.EXTRA_SIDELOADING_ENABLED, isChecked)
-            })
-        }
-
-        // Post-install action checkboxes (mutually exclusive)
-        chkOpenAfterInstall = view.findViewById(R.id.chkOpenAfterInstall)
-        chkOpenCloseAfterInstall = view.findViewById(R.id.chkOpenCloseAfterInstall)
-
-        chkOpenAfterInstall.isChecked = AppConfig.getOpenAfterInstall(requireContext())
-        chkOpenAfterInstall.setOnCheckedChangeListener { _, isChecked ->
-            if (isChecked) {
-                chkOpenCloseAfterInstall.isChecked = false
-            }
-            AppConfig.setOpenAfterInstall(requireContext(), isChecked)
-        }
-
-        chkOpenCloseAfterInstall.isChecked = AppConfig.getOpenCloseAfterInstall(requireContext())
-        chkOpenCloseAfterInstall.setOnCheckedChangeListener { _, isChecked ->
-            if (isChecked) {
-                chkOpenAfterInstall.isChecked = false
-            }
-            AppConfig.setOpenCloseAfterInstall(requireContext(), isChecked)
         }
 
         // Weather widget toggle
@@ -260,11 +201,6 @@ class GlassesSettingsFragment : Fragment() {
             Context.RECEIVER_NOT_EXPORTED
         )
         ctx.registerReceiver(
-            relayStatusReceiver,
-            IntentFilter(ListenerService.ACTION_APK_RELAY_STATUS),
-            Context.RECEIVER_NOT_EXPORTED
-        )
-        ctx.registerReceiver(
             retryCountdownReceiver,
             IntentFilter(ListenerService.ACTION_GLASSES_RETRY_COUNTDOWN),
             Context.RECEIVER_NOT_EXPORTED
@@ -289,7 +225,6 @@ class GlassesSettingsFragment : Fragment() {
         val ctx = requireContext()
         ctx.unregisterReceiver(glassesStateReceiver)
         ctx.unregisterReceiver(throughputReceiver)
-        ctx.unregisterReceiver(relayStatusReceiver)
         ctx.unregisterReceiver(retryCountdownReceiver)
         ctx.unregisterReceiver(batteryReceiver)
     }
@@ -363,18 +298,6 @@ class GlassesSettingsFragment : Fragment() {
         txtRxTotal.text = formatBytes(rxTotal)
     }
 
-    private fun updateRelayStatus(running: Boolean, url: String?, lastUpload: String?, installStatus: String?) {
-        if (running) {
-            relaySection.visibility = View.VISIBLE
-            txtRelayUrl.text = url ?: ""
-            txtRelayStatus.text = "Running"
-            txtRelayLastUpload.text = lastUpload ?: ""
-            txtRelayInstallStatus.text = installStatus ?: ""
-        } else {
-            relaySection.visibility = View.GONE
-        }
-    }
-
     private fun showAdbConfirmDialog() {
         MaterialAlertDialogBuilder(requireContext())
             .setTitle("Warning")
@@ -423,16 +346,7 @@ class GlassesSettingsFragment : Fragment() {
         AppConfig.setGlassesAdbEnabled(requireContext(), enabled)
         val value = if (enabled) "1" else "0"
         try {
-            val caps = Caps()
-            caps.write("Settings_Update")
-            val json = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("key", "settings_adb_enable")
-                    put("value", value)
-                })
-            }.toString()
-            caps.write(json)
-            CxrApi.getInstance().sendCustomCmd("Settings", caps)
+            sendAppSettings("settings_adb_enable" to value)
             LogCollector.i(TAG, "ADB debugging ${if (enabled) "enabled" else "disabled"} (sent settings_adb_enable=$value)")
         } catch (e: Exception) {
             LogCollector.e(TAG, "Failed to send ADB setting: ${e.message}")

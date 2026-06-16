@@ -26,7 +26,7 @@ import com.repository.listener.R
 import com.repository.listener.config.AppConfig
 import com.repository.listener.service.ListenerService
 import com.repository.listener.util.LogCollector
-import com.repository.listener.util.LogCollector.SIDELOAD_TAGS
+import com.repository.listener.util.LogCollector.FILESYNC_TAGS
 import com.repository.listener.util.LogCollector.VOICE_TAGS
 import org.json.JSONObject
 
@@ -205,11 +205,11 @@ class ServerConfigFragment : Fragment() {
             }
         }
 
-        view.findViewById<View>(R.id.btnViewSideloaderLogs).setOnClickListener {
-            showFilteredLogs("Sideloader Logs", SIDELOAD_TAGS)
+        view.findViewById<View>(R.id.btnViewFileSyncLogs).setOnClickListener {
+            showFilteredLogs("File Sync Logs", FILESYNC_TAGS)
         }
-        view.findViewById<View>(R.id.btnShareSideloaderLogs).setOnClickListener {
-            shareFilteredLogs("sideloader", SIDELOAD_TAGS)
+        view.findViewById<View>(R.id.btnShareFileSyncLogs).setOnClickListener {
+            shareFilteredLogs("filesync", FILESYNC_TAGS)
         }
         view.findViewById<View>(R.id.btnViewVoiceLogs).setOnClickListener {
             showFilteredLogs("Voice Input Logs", VOICE_TAGS)

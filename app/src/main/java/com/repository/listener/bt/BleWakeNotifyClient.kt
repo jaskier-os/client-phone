@@ -146,6 +146,13 @@ class BleWakeNotifyClient(private val context: Context) {
         }
     }
 
+    /**
+     * Cold-start the glasses listener: write LAUNCH_LISTENER (0x07), which bt-manager
+     * turns into a startForegroundService for the glasses ListenerService. Used when the
+     * RFCOMM relay connect has failed repeatedly (the listener process is likely dead).
+     */
+    fun sendLaunchListener(): Boolean = notify(BleWakeEvent.LAUNCH_LISTENER, System.nanoTime())
+
     /** Push a wake event to the glasses via CHAR_RX write. */
     fun notify(eventCode: Byte, epochNanos: Long): Boolean {
         val g = gatt ?: run { log("notify: no gatt"); return false }

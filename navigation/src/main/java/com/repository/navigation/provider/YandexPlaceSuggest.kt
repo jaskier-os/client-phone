@@ -11,6 +11,7 @@ import com.yandex.mapkit.search.SuggestResponse
 import com.yandex.mapkit.search.SuggestSession
 import com.yandex.mapkit.search.SuggestType
 import com.yandex.runtime.Error
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.asin
 import kotlin.math.cos
 import kotlin.math.sin
@@ -33,8 +34,16 @@ class YandexPlaceSuggest : PlaceSuggest {
         SearchFactory.getInstance().createSearchManager(SearchManagerType.COMBINED)
     }
     private var suggestSession: SuggestSession? = null
+    // True while this suggest session holds the shared map engine (acquired on first suggest,
+    // released on reset). Scoped to the session rather than per-call because superseded suggest
+    // listeners may never fire.
+    private val engineHeld = AtomicBoolean(false)
 
     override fun suggest(query: String, center: Point, callback: (List<SuggestItem>) -> Unit) {
+        // Engine hold: suggest is interactive and superseded calls may never fire their
+        // listener, so a per-call acquire/release would leak. Instead the whole suggest
+        // session is scoped: first suggest acquires, reset() releases (search UI closed).
+        if (engineHeld.compareAndSet(false, true)) MapProviders.acquireEngine("place_suggest")
         val session = suggestSession ?: searchManager.createSuggestSession().also { suggestSession = it }
         val options = SuggestOptions().setSuggestTypes(
             SuggestType.GEO.value or SuggestType.BIZ.value or SuggestType.TRANSIT.value
@@ -64,6 +73,7 @@ class YandexPlaceSuggest : PlaceSuggest {
 
     override fun reset() {
         suggestSession = null
+        if (engineHeld.compareAndSet(true, false)) MapProviders.releaseEngine("place_suggest")
     }
 
     private fun haversineMeters(a: Point, b: Point): Double {

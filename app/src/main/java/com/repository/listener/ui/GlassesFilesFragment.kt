@@ -54,7 +54,6 @@ class GlassesFilesFragment : Fragment() {
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var syncWatchdog: Runnable? = null
     private var isSyncing = false
-    private var isSideloadBusy = false
     private var isDeletingFromGlasses = false
 
     private val loadExecutor = Executors.newSingleThreadExecutor()
@@ -171,9 +170,6 @@ class GlassesFilesFragment : Fragment() {
                 isSyncing -> {
                     Toast.makeText(ctx, "Sync already in progress", Toast.LENGTH_SHORT).show()
                 }
-                isSideloadBusy -> {
-                    Toast.makeText(ctx, "Sideload in progress, try again in a bit", Toast.LENGTH_SHORT).show()
-                }
                 else -> {
                     // Optimistic UI: flip to syncing state immediately so the user sees feedback
                     // even if the first broadcast travels through a slow queue. If no progress
@@ -248,10 +244,7 @@ class GlassesFilesFragment : Fragment() {
         updateRefreshState()
         loadCatalogue()
 
-        // Auto-sync ONLY if sideloading is disabled
-        // When sideloading is enabled, user must manually press sync button
-        val sideloadEnabled = com.repository.listener.config.AppConfig.getSideloadEnabled(ctx)
-        if (isGlassesConnected && !isSyncing && !sideloadEnabled) {
+        if (isGlassesConnected && !isSyncing) {
             ctx.sendBroadcast(Intent(ListenerService.ACTION_START_GLASSES_SYNC).apply {
                 setPackage(ctx.packageName)
             })
@@ -277,7 +270,7 @@ class GlassesFilesFragment : Fragment() {
     private fun updateRefreshState() {
         // Enable regardless of BT state: the click handler triggers a BLE wake +
         // RFCOMM reconnect when disconnected, so the user can press it any time.
-        btnRefresh.isEnabled = !isSyncing && !isSideloadBusy
+        btnRefresh.isEnabled = !isSyncing
     }
 
     private fun updateSyncUI(state: String, message: String, current: Int, total: Int) {
@@ -286,18 +279,8 @@ class GlassesFilesFragment : Fragment() {
         syncWatchdog = null
 
         when (state) {
-            // --- legacy sideload states (preserved for that path) ---
-            "busy" -> {
-                isSyncing = false
-                isSideloadBusy = true
-                spinnerSync.visibility = View.GONE
-                progressSync.visibility = View.GONE
-                txtSyncStatus.text = message.ifEmpty { "Sideloading in progress" }
-                updateRefreshState()
-            }
             "idle" -> {
                 isSyncing = false
-                isSideloadBusy = false
                 spinnerSync.visibility = View.GONE
                 progressSync.visibility = View.GONE
                 updateRefreshState()
@@ -305,7 +288,6 @@ class GlassesFilesFragment : Fragment() {
             }
             "connecting", "listing" -> {
                 isSyncing = true
-                isSideloadBusy = false
                 txtSyncStatus.text = if (state == "connecting") "Connecting..." else "Listing files..."
                 spinnerSync.visibility = View.VISIBLE
                 progressSync.visibility = View.GONE
@@ -313,7 +295,6 @@ class GlassesFilesFragment : Fragment() {
             }
             "merging" -> {
                 isSyncing = true
-                isSideloadBusy = false
                 txtSyncStatus.text = message.ifEmpty { "Merging AR overlays..." }
                 spinnerSync.visibility = View.VISIBLE
                 progressSync.visibility = View.GONE
@@ -321,7 +302,6 @@ class GlassesFilesFragment : Fragment() {
             }
             "downloading" -> {
                 isSyncing = true
-                isSideloadBusy = false
                 spinnerSync.visibility = View.VISIBLE
                 if (total > 0) {
                     txtSyncStatus.text = "Downloading $current/$total..."
@@ -337,7 +317,6 @@ class GlassesFilesFragment : Fragment() {
             }
             "done" -> {
                 isSyncing = false
-                isSideloadBusy = false
                 spinnerSync.visibility = View.GONE
                 progressSync.visibility = View.GONE
                 val syncedCount = if (total > 0) total else current
@@ -348,7 +327,6 @@ class GlassesFilesFragment : Fragment() {
             }
             "failed" -> {
                 isSyncing = false
-                isSideloadBusy = false
                 spinnerSync.visibility = View.GONE
                 progressSync.visibility = View.GONE
                 txtSyncStatus.text = "Sync failed: ${message.ifEmpty { "unknown error" }}"
@@ -358,7 +336,6 @@ class GlassesFilesFragment : Fragment() {
             // --- new GlassesSyncClient FSM states (uppercase) ---
             "HANDSHAKING", "FETCHING_MANIFEST", "DIFFING", "OPENING_WIFI", "JOINING", "CLOSING" -> {
                 isSyncing = true
-                isSideloadBusy = false
                 txtSyncStatus.text = when (state) {
                     "HANDSHAKING" -> "Checking for changes..."
                     "FETCHING_MANIFEST" -> "Reading glasses catalogue..."
@@ -374,7 +351,6 @@ class GlassesFilesFragment : Fragment() {
             }
             "PULLING" -> {
                 isSyncing = true
-                isSideloadBusy = false
                 spinnerSync.visibility = View.VISIBLE
                 if (total > 0) {
                     txtSyncStatus.text = "Pulling ${current}/${total}..."
@@ -390,7 +366,6 @@ class GlassesFilesFragment : Fragment() {
             }
             "COMPLETE" -> {
                 isSyncing = false
-                isSideloadBusy = false
                 spinnerSync.visibility = View.GONE
                 progressSync.visibility = View.GONE
                 val synced = if (total > 0) total else current
@@ -403,7 +378,6 @@ class GlassesFilesFragment : Fragment() {
             }
             "ERROR" -> {
                 isSyncing = false
-                isSideloadBusy = false
                 spinnerSync.visibility = View.GONE
                 progressSync.visibility = View.GONE
                 val err = message.ifEmpty { "sync error" }
@@ -604,11 +578,11 @@ class GlassesFilesFragment : Fragment() {
         if (items.isEmpty()) {
             txtEmpty.visibility = View.VISIBLE
             recyclerCatalogue.visibility = View.GONE
-            if (!isSyncing && !isSideloadBusy) txtSyncStatus.text = "No files synced"
+            if (!isSyncing) txtSyncStatus.text = "No files synced"
         } else {
             txtEmpty.visibility = View.GONE
             recyclerCatalogue.visibility = View.VISIBLE
-            if (!isSyncing && !isSideloadBusy) {
+            if (!isSyncing) {
                 val total = images.size + videos.size + audio.size + other.size
                 txtSyncStatus.text = "$total files"
             }

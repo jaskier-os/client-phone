@@ -16,9 +16,9 @@ import com.repository.listener.R
 import com.repository.listener.config.AppConfig
 import com.repository.listener.service.ListenerService
 import com.repository.listener.util.LogCollector
-import com.rokid.cxr.Caps
-import com.rokid.cxr.client.extend.CxrApi
-import org.json.JSONArray
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 class GlassesSettingsActivity : AppCompatActivity() {
@@ -52,12 +52,6 @@ class GlassesSettingsActivity : AppCompatActivity() {
             "3 hours" to "180"
         )
 
-        val soundEffectOptions = listOf(
-            "Rhythm (balanced)" to "0",
-            "Loudness (noisy environments)" to "1",
-            "Podcast (voice optimized)" to "2"
-        )
-
         val notificationSoundOptions = listOf("On" to "true", "Off" to "false")
 
         val notificationDurationOptions = listOf(
@@ -73,10 +67,8 @@ class GlassesSettingsActivity : AppCompatActivity() {
         val brightness: Int,
         val screenTimeout: String,
         val powerTimeout: String,
-        val soundEffect: String,
         val notificationSound: String,
         val notificationDuration: String,
-        val ttsSpeed: String,
         val chatFontSize: String,
         val wakewordEnabled: Boolean
     )
@@ -85,11 +77,8 @@ class GlassesSettingsActivity : AppCompatActivity() {
     private lateinit var lblBrightness: TextView
     private lateinit var dropdownScreenTimeout: AutoCompleteTextView
     private lateinit var dropdownPowerTimeout: AutoCompleteTextView
-    private lateinit var dropdownSoundEffect: AutoCompleteTextView
     private lateinit var dropdownNotificationSound: AutoCompleteTextView
     private lateinit var dropdownNotificationDuration: AutoCompleteTextView
-    private lateinit var seekTtsSpeed: SeekBar
-    private lateinit var lblTtsSpeed: TextView
     private lateinit var seekChatFontSize: SeekBar
     private lateinit var lblChatFontSize: TextView
     private lateinit var swWakeword: SwitchCompat
@@ -105,11 +94,8 @@ class GlassesSettingsActivity : AppCompatActivity() {
         seekBrightness = findViewById(R.id.seekBrightness)
         dropdownScreenTimeout = findViewById(R.id.dropdownScreenTimeout)
         dropdownPowerTimeout = findViewById(R.id.dropdownPowerTimeout)
-        dropdownSoundEffect = findViewById(R.id.dropdownSoundEffect)
         dropdownNotificationSound = findViewById(R.id.dropdownNotificationSound)
         dropdownNotificationDuration = findViewById(R.id.dropdownNotificationDuration)
-        lblTtsSpeed = findViewById(R.id.lblTtsSpeed)
-        seekTtsSpeed = findViewById(R.id.seekTtsSpeed)
         seekChatFontSize = findViewById(R.id.seekChatFontSize)
         lblChatFontSize = findViewById(R.id.lblChatFontSize)
         swWakeword = findViewById(R.id.swWakeword)
@@ -140,15 +126,8 @@ class GlassesSettingsActivity : AppCompatActivity() {
         // Dropdowns
         setupDropdown(dropdownScreenTimeout, screenTimeoutOptions, AppConfig.getGlassesScreenTimeout(this))
         setupDropdown(dropdownPowerTimeout, powerTimeoutOptions, AppConfig.getGlassesPowerTimeout(this))
-        setupDropdown(dropdownSoundEffect, soundEffectOptions, AppConfig.getGlassesSoundEffect(this))
         setupDropdown(dropdownNotificationSound, notificationSoundOptions, AppConfig.getGlassesNotificationSound(this))
         setupDropdown(dropdownNotificationDuration, notificationDurationOptions, AppConfig.getGlassesNotificationDuration(this))
-
-        // TTS speed
-        val storedTts = AppConfig.getGlassesTtsSpeed(this)
-        val ttsValue = storedTts.toFloatOrNull() ?: 1.0f
-        seekTtsSpeed.progress = ttsValueToProgress(ttsValue)
-        lblTtsSpeed.text = "TTS speed: ${"%.1f".format(ttsValue)}"
 
         // Chat font size
         val storedChatFontSize = AppConfig.getGlassesChatFontSize(this)
@@ -169,14 +148,6 @@ class GlassesSettingsActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(seekBar: SeekBar) {}
         })
 
-        seekTtsSpeed.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
-                lblTtsSpeed.text = "TTS speed: ${"%.1f".format(ttsProgressToValue(progress))}"
-            }
-            override fun onStartTrackingTouch(seekBar: SeekBar) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar) {}
-        })
-
         seekChatFontSize.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
                 lblChatFontSize.text = "Chat font size: ${progressToChatFontSize(progress)}sp"
@@ -191,10 +162,8 @@ class GlassesSettingsActivity : AppCompatActivity() {
             brightness = seekBrightness.progress,
             screenTimeout = getDropdownValue(dropdownScreenTimeout, screenTimeoutOptions),
             powerTimeout = getDropdownValue(dropdownPowerTimeout, powerTimeoutOptions),
-            soundEffect = getDropdownValue(dropdownSoundEffect, soundEffectOptions),
             notificationSound = getDropdownValue(dropdownNotificationSound, notificationSoundOptions),
             notificationDuration = getDropdownValue(dropdownNotificationDuration, notificationDurationOptions),
-            ttsSpeed = "%.1f".format(ttsProgressToValue(seekTtsSpeed.progress)),
             chatFontSize = progressToChatFontSize(seekChatFontSize.progress).toString(),
             wakewordEnabled = swWakeword.isChecked
         )
@@ -204,28 +173,10 @@ class GlassesSettingsActivity : AppCompatActivity() {
         AppConfig.setGlassesBrightness(this, s.brightness)
         AppConfig.setGlassesScreenTimeout(this, s.screenTimeout)
         AppConfig.setGlassesPowerTimeout(this, s.powerTimeout)
-        AppConfig.setGlassesSoundEffect(this, s.soundEffect)
         AppConfig.setGlassesNotificationSound(this, s.notificationSound)
         AppConfig.setGlassesNotificationDuration(this, s.notificationDuration)
-        AppConfig.setGlassesTtsSpeed(this, s.ttsSpeed)
         AppConfig.setGlassesChatFontSize(this, s.chatFontSize)
         AppConfig.setGlassesWakewordEnabled(this, s.wakewordEnabled)
-    }
-
-    /** Send settings via CxrApi "Settings" channel (RKSettingsManager / Rokid OS framework). */
-    private fun sendSettingsUpdate(vararg pairs: Pair<String, String>) {
-        val caps = Caps()
-        caps.write("Settings_Update")
-        val json = JSONArray().apply {
-            pairs.forEach { (key, value) ->
-                put(JSONObject().apply {
-                    put("key", key)
-                    put("value", value)
-                })
-            }
-        }.toString()
-        caps.write(json)
-        CxrApi.getInstance().sendCustomCmd("Settings", caps)
     }
 
     /** Send settings to glasses listener via CH_SETTINGS (GlassesConfig.applySettings). */
@@ -261,8 +212,6 @@ class GlassesSettingsActivity : AppCompatActivity() {
     }
 
     private fun applyChanges(old: SettingsSnapshot, new: SettingsSnapshot) {
-        val cxr = CxrApi.getInstance()
-
         // Brightness is now part of the CH_SETTINGS JSON contract --
         // persist via AppConfig and fire a debounced full push to glasses.
         if (old.brightness != new.brightness) {
@@ -295,15 +244,6 @@ class GlassesSettingsActivity : AppCompatActivity() {
             }
         }
 
-        if (old.soundEffect != new.soundEffect && new.soundEffect.isNotEmpty()) {
-            try {
-                sendSettingsUpdate("settings_sound_effect" to new.soundEffect)
-                LogCollector.i(TAG, "Set sound effect: ${new.soundEffect}")
-            } catch (e: Exception) {
-                LogCollector.e(TAG, "Set sound effect failed: ${e.message}")
-            }
-        }
-
         if (old.notificationSound != new.notificationSound && new.notificationSound.isNotEmpty()) {
             try {
                 sendAppSettings("settings_msg_notification_sound_enabled" to new.notificationSound)
@@ -319,15 +259,6 @@ class GlassesSettingsActivity : AppCompatActivity() {
                 LogCollector.i(TAG, "Set notification duration: ${new.notificationDuration}s")
             } catch (e: Exception) {
                 LogCollector.e(TAG, "Set notification duration failed: ${e.message}")
-            }
-        }
-
-        if (old.ttsSpeed != new.ttsSpeed && new.ttsSpeed.isNotEmpty()) {
-            try {
-                sendSettingsUpdate("settings_local_tts_speed" to new.ttsSpeed)
-                LogCollector.i(TAG, "Set TTS speed: ${new.ttsSpeed}")
-            } catch (e: Exception) {
-                LogCollector.e(TAG, "Set TTS speed failed: ${e.message}")
             }
         }
 
@@ -347,15 +278,18 @@ class GlassesSettingsActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 LogCollector.e(TAG, "Set wakeword enabled failed: ${e.message}")
             }
-            // Rokid's built-in offline wakeword/assistant (settings_voice_control)
-            // must NEVER run -- only our pipeline does speech detection. Force it
-            // off on every change. "0" (any non-"open" value) disables it; never
-            // send "open". Idempotent and independent of our wakeword toggle.
-            try {
-                cxr.setVoiceCtrl("0")
-                LogCollector.i(TAG, "Forced Rokid voice control OFF (setVoiceCtrl=0)")
-            } catch (e: Exception) {
-                LogCollector.e(TAG, "Force setVoiceCtrl(0) failed: ${e.message}")
+            // Rokid's built-in offline wakeword/assistant must NEVER run -- only our
+            // pipeline does speech detection. Force it off on every change via the relay
+            // voice_ctrl_off handler (glasses drive the AssistantSuppressor + persist it).
+            ListenerService.phoneBtHostInstance?.let { svc ->
+                CoroutineScope(Dispatchers.Main).launch {
+                    try {
+                        svc.sendDeviceCommand("voice_ctrl_off")
+                        LogCollector.i(TAG, "Forced Rokid voice control OFF (voice_ctrl_off)")
+                    } catch (e: Exception) {
+                        LogCollector.e(TAG, "Force voice_ctrl_off failed: ${e.message}")
+                    }
+                }
             }
         }
     }
@@ -379,11 +313,6 @@ class GlassesSettingsActivity : AppCompatActivity() {
         val selected = dropdown.text.toString()
         return options.find { it.first == selected }?.second ?: options.first().second
     }
-
-    private fun ttsProgressToValue(progress: Int): Float = 0.5f + progress * 0.1f
-
-    private fun ttsValueToProgress(value: Float): Int =
-        ((value - 0.5f) / 0.1f).toInt().coerceIn(0, 15)
 
     private fun chatFontSizeToProgress(sizeInSp: Int): Int = (sizeInSp - 8).coerceIn(0, 16)
 

@@ -17,16 +17,6 @@ class ListenerApp : Application() {
     override fun onCreate() {
         super.onCreate()
         LogCollector.init(this)
-        // Load Rokid CXR native libs (libcaps.so + libmutils.so) eagerly.
-        // The SDK uses Caps.toString() (which calls native dump()) for debug
-        // logging inside CxrApi.sendCustomCmd. If any UI path constructs a
-        // Caps before GlassesGattClient's static init has run -- e.g., the
-        // GlassesSettingsFragment display-position slider -- the native is
-        // unbound and the activity crashes with UnsatisfiedLinkError.
-        // Loading here in Application.onCreate guarantees the libs are up
-        // before any fragment touches Caps.
-        try { System.loadLibrary("mutils") } catch (_: UnsatisfiedLinkError) {}
-        try { System.loadLibrary("caps") } catch (_: UnsatisfiedLinkError) {}
         // Resolve + init the active map provider from config (default yandex). With
         // Google selected and a blank MapKit key this still runs -- the Google
         // provider's init does no Yandex work.

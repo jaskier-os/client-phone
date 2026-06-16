@@ -17,6 +17,11 @@ object BleWakeEvent {
     const val TTS_PENDING: Byte          = 0x11
     const val NOTIFICATION_PENDING: Byte = 0x12
 
+    // phone -> glasses cold-start: ask bt-manager to startForegroundService the
+    // glasses ListenerService. Mirrors bt-manager BleWakeEvent.LAUNCH_LISTENER.
+    // Used when RFCOMM relay connect fails repeatedly (listener likely dead).
+    const val LAUNCH_LISTENER: Byte      = 0x07
+
     // glasses -> phone, telemetry. byte[1] of payload carries SoC% (0..100).
     const val BATTERY_LEVEL: Byte        = 0x30
 

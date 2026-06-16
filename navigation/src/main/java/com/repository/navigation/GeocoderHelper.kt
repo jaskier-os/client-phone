@@ -13,6 +13,7 @@ import com.yandex.mapkit.search.SearchOptions
 import com.yandex.mapkit.search.SearchType
 import com.yandex.mapkit.search.Session
 import com.yandex.mapkit.search.ToponymObjectMetadata
+import com.repository.navigation.provider.MapProviders
 import com.yandex.runtime.Error
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -40,10 +41,20 @@ object GeocoderHelper {
         val handler = Handler(Looper.getMainLooper())
         var session: Session? = null
 
+        // The SDK SearchManager needs the map engine running; hold it for this one-shot call
+        // (a geocode can be issued from IDLE, before any journey/map holds the engine). Released
+        // exactly once via [finish] no matter which terminal path runs.
+        MapProviders.acquireEngine("reverse_geocode")
+        val engineReleased = AtomicBoolean(false)
+        val finish = {
+            if (engineReleased.compareAndSet(false, true)) MapProviders.releaseEngine("reverse_geocode")
+        }
+
         val timeoutRunnable = Runnable {
             if (responded.compareAndSet(false, true)) {
                 Log.w(TAG, "Reverse geocode timed out for: (${point.latitude}, ${point.longitude})")
                 session?.let { activeSessions.remove(it) }
+                finish()
                 callback(null)
             }
         }
@@ -77,10 +88,12 @@ object GeocoderHelper {
                                     val fullAddress = address?.formattedAddress ?: name
                                     Log.i(TAG, "Reverse geocoded (${point.latitude}, ${point.longitude}) -> $name")
                                     session?.let { activeSessions.remove(it) }
+                                    finish()
                                     callback(ReverseGeocodeResult(name, city, postalCode, fullAddress))
                                 } else {
                                     Log.w(TAG, "No reverse geocoding result for: (${point.latitude}, ${point.longitude})")
                                     session?.let { activeSessions.remove(it) }
+                                    finish()
                                     callback(null)
                                 }
                             }
@@ -91,6 +104,7 @@ object GeocoderHelper {
                             if (responded.compareAndSet(false, true)) {
                                 Log.e(TAG, "Reverse geocode failed: $error")
                                 session?.let { activeSessions.remove(it) }
+                                finish()
                                 callback(null)
                             }
                         }
@@ -103,6 +117,7 @@ object GeocoderHelper {
             if (responded.compareAndSet(false, true)) {
                 Log.e(TAG, "Reverse geocode exception: ${e.message}")
                 session?.let { activeSessions.remove(it) }
+                finish()
                 callback(null)
             }
         }
@@ -113,10 +128,17 @@ object GeocoderHelper {
         val handler = Handler(Looper.getMainLooper())
         var session: Session? = null
 
+        MapProviders.acquireEngine("geocode")
+        val engineReleased = AtomicBoolean(false)
+        val finish = {
+            if (engineReleased.compareAndSet(false, true)) MapProviders.releaseEngine("geocode")
+        }
+
         val timeoutRunnable = Runnable {
             if (responded.compareAndSet(false, true)) {
                 Log.w(TAG, "Geocode timed out for: $address")
                 session?.let { activeSessions.remove(it) }
+                finish()
                 callback(null)
             }
         }
@@ -149,6 +171,7 @@ object GeocoderHelper {
                                     Log.w(TAG, "No geocoding result for: $address")
                                 }
                                 session?.let { activeSessions.remove(it) }
+                                finish()
                                 callback(point)
                             }
                         }
@@ -158,6 +181,7 @@ object GeocoderHelper {
                             if (responded.compareAndSet(false, true)) {
                                 Log.e(TAG, "Geocode failed for '$address': $error")
                                 session?.let { activeSessions.remove(it) }
+                                finish()
                                 callback(null)
                             }
                         }
@@ -170,6 +194,7 @@ object GeocoderHelper {
             if (responded.compareAndSet(false, true)) {
                 Log.e(TAG, "Geocode exception for '$address': ${e.message}")
                 session?.let { activeSessions.remove(it) }
+                finish()
                 callback(null)
             }
         }

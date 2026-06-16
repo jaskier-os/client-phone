@@ -37,6 +37,12 @@ class NavigationManager private constructor(context: Context) {
         private const val DEVIATION_THRESHOLD_M = 150.0
         private const val DENSIFY_SPACING_M = 10.0
         private const val REROUTE_COOLDOWN_MS = 10_000L
+        // Upper bound on a session-restore attempt. Guards against a silent location-fix hang
+        // leaving restoreInFlight stuck true (which would pin the map engine started forever).
+        // MUST stay >= the location engines' single-fix timeout (Google's SINGLE_FIX_TIMEOUT_MS)
+        // so a legitimately slow GPS cold-fix is not clipped mid-restore. The route rebuild runs
+        // after setState(ACTIVE), under the journey hold, so it is unaffected by this timeout.
+        private const val RESTORE_TIMEOUT_MS = 20_000L
         // Master switch: keep auto-reroute disabled while the deviation logic
         // is being tuned. Flip back to true to re-enable.
         private const val AUTO_REROUTE_ENABLED = false
@@ -76,7 +82,36 @@ class NavigationManager private constructor(context: Context) {
     // True between the start of restoreSession() and the point a session is
     // either restored (-> ACTIVE) or confirmed absent. Treated as NOT idle so a
     // provider switch can't race a session restore (iteration-1 review finding).
-    @Volatile private var restoreInFlight: Boolean = false
+    // Backing field + edge-triggered engine hold: a session restore runs a location fix +
+    // geocode/route BEFORE state becomes ACTIVE, so the SDK engine must be held for the whole
+    // restore window (state is still IDLE during it). Setting this true/false acquires/releases
+    // the engine on the edge, regardless of which of the several restore exit paths runs.
+    @Volatile private var restoreInFlightBacking: Boolean = false
+    private var restoreWatchdog: Job? = null
+    private var restoreInFlight: Boolean
+        get() = restoreInFlightBacking
+        set(value) {
+            if (value == restoreInFlightBacking) return
+            restoreInFlightBacking = value
+            if (value) {
+                MapProviders.acquireEngine("session_restore")
+                // Watchdog: requestSingleFix can hang silently (no GPS fix, no throw, callback
+                // never fires), which would pin restoreInFlight true forever and leak the map
+                // engine. Force-clear after a timeout so the engine is always released.
+                restoreWatchdog?.cancel()
+                restoreWatchdog = scope.launch {
+                    delay(RESTORE_TIMEOUT_MS)
+                    if (restoreInFlightBacking) {
+                        Log.w(TAG, "Session restore timed out after ${RESTORE_TIMEOUT_MS}ms -- clearing")
+                        restoreInFlight = false
+                    }
+                }
+            } else {
+                MapProviders.releaseEngine("session_restore")
+                restoreWatchdog?.cancel()
+                restoreWatchdog = null
+            }
+        }
 
     /** True while a programmatically-driven mock journey is active. */
     val isMockJourney: Boolean get() = locationEngine.mockActive
@@ -151,7 +186,15 @@ class NavigationManager private constructor(context: Context) {
     private var lastHeadingLng: Double = Double.NaN
 
     private fun setState(state: State) {
+        val prev = currentState
         currentState = state
+        // Hold the shared map engine for the whole journey (PLANNING/PREVIEW/ACTIVE) -- a journey
+        // can be prepared/started from the glasses or phone while the map tab is hidden, and its
+        // geocode/route/minimap work all need the SDK engine running. Release on return to IDLE.
+        val wasActive = prev != State.IDLE
+        val nowActive = state != State.IDLE
+        if (nowActive && !wasActive) MapProviders.acquireEngine("journey")
+        else if (!nowActive && wasActive) MapProviders.releaseEngine("journey")
         stateListener?.onStateChanged(state)
     }
 
@@ -244,7 +287,13 @@ class NavigationManager private constructor(context: Context) {
     ) {
         cachedFrom = from
         cachedTo = to
+        // Routing uses the native SDK engine. This can be called from the route-options screen
+        // while state is still IDLE (no journey holding the engine), so hold it for the query.
+        MapProviders.acquireEngine("route_alternatives")
+        val released = java.util.concurrent.atomic.AtomicBoolean(false)
+        val release = { if (released.compareAndSet(false, true)) MapProviders.releaseEngine("route_alternatives") }
         MapProviders.active.routing.buildRouteAlternatives(from, to, mode, waypoints, departureTime) { alternatives ->
+            release()
             stateListener?.onRouteAlternativesReady(mode, alternatives)
             callback(alternatives)
         }
@@ -676,7 +725,15 @@ class NavigationManager private constructor(context: Context) {
     }
 
     fun getAvailableMethods(from: Point, to: Point, callback: (List<TransportMethodInfo>) -> Unit) {
-        MapProviders.active.routing.queryAllModes(from, to, callback)
+        // Called from the AIDL NavigationService while state may be IDLE; hold the SDK engine
+        // for the query so the native routers are running.
+        MapProviders.acquireEngine("available_methods")
+        val released = java.util.concurrent.atomic.AtomicBoolean(false)
+        val release = { if (released.compareAndSet(false, true)) MapProviders.releaseEngine("available_methods") }
+        MapProviders.active.routing.queryAllModes(from, to) { methods ->
+            release()
+            callback(methods)
+        }
     }
 
     fun restoreSession(context: Context) {

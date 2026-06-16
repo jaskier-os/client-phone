@@ -20,7 +20,6 @@ import android.media.MediaPlayer
 import com.repository.listener.alarm.AlarmItem
 import com.repository.listener.alarm.AlarmStore
 import com.repository.listener.ui.folderNameFromWorkDir
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -43,6 +42,8 @@ import com.repository.listener.audio.WakeWordDetector
 import com.repository.listener.bt.GlassesHealthMonitor
 import com.repository.listener.bt.PhoneBtHost
 import com.repository.listener.bt.PhoneHidMouseBridge
+import com.repository.listener.bt.decodeGlassesMouseReport
+import com.repository.listener.bt.encodeStreamMouseReport
 import com.repository.listener.capture.AudioToolRecorder
 import com.repository.listener.capture.CameraCapturer
 import com.repository.listener.capture.LocationProvider
@@ -60,8 +61,6 @@ import com.repository.listener.network.TranscriberStreamClient
 import com.repository.listener.network.WeatherScheduler
 import com.repository.listener.network.WeatherWorker
 import com.repository.listener.audio.SpeechPositionTracker
-import com.repository.listener.apk.ApkRelayServer
-import com.repository.listener.apk.ApkSideloadManager
 import com.repository.listener.adb.AdbResultWriter
 import com.repository.listener.sync.GlassesSyncClient
 import com.repository.navigation.NavigationManager
@@ -78,11 +77,6 @@ import com.repository.listener.util.AiContextBuilder
 import com.repository.listener.util.LanguageUtils
 import com.repository.listener.util.LogCollector
 import com.repository.listener.util.ScreenStateReceiver
-import com.rokid.cxr.client.extend.CxrApi
-import com.rokid.cxr.client.extend.callbacks.GlassInfoResultCallback
-import com.rokid.cxr.client.extend.infos.GlassInfo
-import com.rokid.cxr.client.extend.listeners.BrightnessUpdateListener
-import com.rokid.cxr.client.utils.ValueUtil
 import java.io.File
 import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicInteger
@@ -143,7 +137,6 @@ class ListenerService : LifecycleService(),
         const val ACTION_GLASSES_RETRY_COUNTDOWN = "com.repository.listener.GLASSES_RETRY_COUNTDOWN"
         const val ACTION_GLASSES_BATTERY = "com.repository.listener.GLASSES_BATTERY"
         const val ACTION_RECORDING_STATE_UPDATED = "com.repository.listener.RECORDING_STATE_UPDATED"
-        const val ACTION_APK_RELAY_STATUS = "com.repository.listener.APK_RELAY_STATUS"
         const val EXTRA_RETRY_SECONDS = "retry_seconds"
         const val EXTRA_GLASSES_CONNECTED = "glasses_connected"
         const val EXTRA_GLASSES_CONNECTING = "glasses_connecting"
@@ -155,10 +148,6 @@ class ListenerService : LifecycleService(),
         const val EXTRA_RX_KBPS = "rx_kbps"
         const val EXTRA_TX_TOTAL = "tx_total"
         const val EXTRA_RX_TOTAL = "rx_total"
-        const val EXTRA_RELAY_RUNNING = "relay_running"
-        const val EXTRA_RELAY_URL = "relay_url"
-        const val EXTRA_RELAY_LAST_UPLOAD = "relay_last_upload"
-        const val EXTRA_RELAY_INSTALL_STATUS = "relay_install_status"
 
         const val ACTION_ADB_DISPATCH = "com.repository.listener.ADB_DISPATCH"
 
@@ -682,20 +671,8 @@ class ListenerService : LifecycleService(),
         }
     }
 
-    // Wake + WiFi locks for screen-off survival
+    // Wake lock for screen-off survival
     private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
-
-    // APK sideloading
-    private var apkSideloadManager: ApkSideloadManager? = null
-    private var apkRelayServer: ApkRelayServer? = null
-
-    private val sideloadingReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            val enabled = intent.getBooleanExtra(GlassesFragment.EXTRA_SIDELOADING_ENABLED, false)
-            if (enabled) startSideloading() else stopSideloading()
-        }
-    }
 
     // File sync -- owns the glasses -> phone sync state machine.
     private lateinit var glassesSyncClient: GlassesSyncClient
@@ -2721,12 +2698,6 @@ class ListenerService : LifecycleService(),
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Listener::BtService")
         wakeLock?.acquire()
 
-        // WiFi lock -- keeps WiFi alive for sideload HTTP server
-        @Suppress("DEPRECATION")
-        val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Listener::HttpServer")
-        wifiLock?.acquire()
-
         // Initialize audio components
         audioRecorder = AudioRecorder()
         audioRecorder.setChunkListener(this)
@@ -2762,9 +2733,7 @@ class ListenerService : LifecycleService(),
 
         // Start RFCOMM audio server for direct glasses audio (bypasses CXR-S latency)
         startBtAudioServer()
-        if (AppConfig.getSideloadEnabled(this)) {
-            startGlassesAudioStreamServer()
-        }
+        startGlassesAudioStreamServer()
 
         // Initialize network components
         val orchestratorUrl = AppConfig.getOrchestratorUrl(this)
@@ -2789,8 +2758,12 @@ class ListenerService : LifecycleService(),
         // Initialize capture components
         screenCapturer = ScreenCapturer(this)
         cameraCapturer = CameraCapturer(this, this)
-        // Process-level map start (Yandex pumps MapKitFactory.onStart here; Google is a no-op).
-        MapProviders.active.onProcessStart()
+        // The map SDK engine is NOT started here anymore. It is reference-counted via
+        // MapProviders.acquireEngine/releaseEngine and started only while a consumer needs it
+        // (visible map, active/preparing journey, minimap renderer, one-shot geocode/search/
+        // suggest). Keeping the Yandex engine running process-wide kept its background threads
+        // alive even when nothing map-related was on screen, and crashed the process on this
+        // hardware (YMK_#Global SIGTRAP) -- which reset the in-memory glasses-connected flag.
         locationProvider = LocationProvider(this)
         locationProvider.startBackgroundUpdates()
         audioToolRecorder = AudioToolRecorder(this)
@@ -3230,12 +3203,6 @@ class ListenerService : LifecycleService(),
             Context.RECEIVER_NOT_EXPORTED
         )
 
-        // Register sideloading toggle receiver
-        registerReceiver(
-            sideloadingReceiver,
-            IntentFilter(GlassesFragment.ACTION_TOGGLE_SIDELOADING),
-            Context.RECEIVER_NOT_EXPORTED
-        )
         registerReceiver(
             object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context, intent: Intent) {
@@ -3634,14 +3601,14 @@ class ListenerService : LifecycleService(),
                         opusDecoder = null
                         btAudioClientSocket = socket
                         LogCollector.i(TAG, "BT audio client connected: ${socket.remoteDevice?.name}")
-                        // NOTE: the audio accept path must NOT drive status/relay (CXR-M)
-                        // channel reconnection. Kicking wakeAndReconnect()/resetConnectionState()/
-                        // reconnectFromCache() here caused radio churn on the same ACL link that
-                        // knocked over the freshly-accepted audio socket (read -> -1 on both ends),
-                        // producing a tight re-accept storm where 0 audio bytes ever flowed.
-                        // The status/relay channel has its own independent reconnect triggers
-                        // (BLE wake events, bonding, CXR-M connect, every outbound send), so it
-                        // recovers on its own after a glasses reboot without being driven here.
+                        // NOTE: the audio accept path must NOT drive status/relay channel
+                        // reconnection. Kicking the relay reconnect here caused radio churn on
+                        // the same ACL link that knocked over the freshly-accepted audio socket
+                        // (read -> -1 on both ends), producing a tight re-accept storm where 0
+                        // audio bytes ever flowed. The status/relay channel has its own
+                        // independent reconnect triggers (BLE wake events, bonding, the 5s
+                        // watchdog, every outbound send), so it recovers on its own after a
+                        // glasses reboot without being driven here.
                         val input = socket.inputStream
 
                         // Drain stale data in kernel BT buffer (accumulated before phone started reading)
@@ -5431,7 +5398,8 @@ class ListenerService : LifecycleService(),
         when (type) {
             "status" -> {
                 val data = JSONObject().apply {
-                    put("glasses_connected", phoneBtHost.isConnected)
+                    put("glasses_connected", phoneBtHost.isReachable)
+                    put("glasses_phase", phoneBtHost.glassesConnectionPhase())
                     put("service_state", state.name)
                     put("orchestrator_connected", orchestratorClient.isConnected)
                 }
@@ -5773,51 +5741,6 @@ class ListenerService : LifecycleService(),
                     "not supported after filesync migration; use the WiFi P2P pull script against the glasses HTTP server (port 8848)")
             }
 
-            "sideload_apk" -> {
-                if (!phoneBtHost.isConnected) {
-                    AdbResultWriter.writeError(this, commandId, type,
-                        "Glasses not connected via Bluetooth")
-                    return
-                }
-                val params = try { JSONObject(paramsStr) } catch (_: Exception) { JSONObject() }
-                val apkPath = params.optString("path", "")
-                if (apkPath.isEmpty()) {
-                    AdbResultWriter.writeError(this, commandId, type,
-                        "Missing 'path' param (absolute path to APK on phone)")
-                    return
-                }
-                val apkFile = java.io.File(apkPath)
-                if (!apkFile.exists()) {
-                    AdbResultWriter.writeError(this, commandId, type,
-                        "APK not found: $apkPath")
-                    return
-                }
-                LogCollector.i(TAG, "ADB sideload: ${apkFile.absolutePath} (${apkFile.length()} bytes)")
-
-                val manager = apkSideloadManager ?: run {
-                    val mgr = ApkSideloadManager(
-                        context = this,
-                        getConnectionState = { phoneBtHost.bluetoothHelper.connectionState },
-                        log = { msg -> LogCollector.i("ApkSideload", msg) },
-                        statusCallback = { _, _, _, installStatus ->
-                            if (installStatus != null) {
-                                val success = installStatus.contains("success", ignoreCase = true)
-                                if (success) {
-                                    AdbResultWriter.writeSuccess(this, commandId, type,
-                                        JSONObject().put("message", installStatus))
-                                } else {
-                                    AdbResultWriter.writeError(this, commandId, type, installStatus)
-                                }
-                            }
-                        }
-                    )
-                    apkSideloadManager = mgr
-                    mgr
-                }
-                manager.uploadApkFile(apkFile)
-                LogCollector.i(TAG, "APK sideload initiated for $commandId")
-            }
-
             "start_mouse" -> {
                 if (!phoneBtHost.isConnected) {
                     AdbResultWriter.writeError(this, commandId, type, "Glasses not connected")
@@ -5825,25 +5748,30 @@ class ListenerService : LifecycleService(),
                 }
                 val mouseParams = try { JSONObject(paramsStr) } catch (_: Exception) { JSONObject() }
                 val deviceAddress = mouseParams.optString("device_address", "")
-                val targetDevice = if (deviceAddress.isNotEmpty()) {
-                    android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(deviceAddress)
-                } else null
-                if (targetDevice == null) {
-                    AdbResultWriter.writeError(this, commandId, type, "No target device address")
-                    return
-                }
-                // Stop previous bridge if any
-                phoneHidMouse?.stop()
-                phoneHidMouse = PhoneHidMouseBridge(this).apply {
-                    listener = object : PhoneHidMouseBridge.Listener {
-                        override fun onRegistered(success: Boolean) { broadcastMouseHidStatus() }
-                        override fun onConnected(device: android.bluetooth.BluetoothDevice) { broadcastMouseHidStatus() }
-                        override fun onDisconnected() { broadcastMouseHidStatus() }
+                // When a video-stream mouse channel is live, glasses input is routed to the
+                // PC over the stream -- no Bluetooth-HID target needed. Only require/create the
+                // HID bridge when there is no active stream (standalone HID mode).
+                if (mouseEventListener == null) {
+                    val targetDevice = if (deviceAddress.isNotEmpty()) {
+                        android.bluetooth.BluetoothAdapter.getDefaultAdapter()?.getRemoteDevice(deviceAddress)
+                    } else null
+                    if (targetDevice == null) {
+                        AdbResultWriter.writeError(this, commandId, type, "No target device address")
+                        return
                     }
-                    start(targetDevice)
+                    // Stop previous bridge if any
+                    phoneHidMouse?.stop()
+                    phoneHidMouse = PhoneHidMouseBridge(this).apply {
+                        listener = object : PhoneHidMouseBridge.Listener {
+                            override fun onRegistered(success: Boolean) { broadcastMouseHidStatus() }
+                            override fun onConnected(device: android.bluetooth.BluetoothDevice) { broadcastMouseHidStatus() }
+                            override fun onDisconnected() { broadcastMouseHidStatus() }
+                        }
+                        start(targetDevice)
+                    }
                 }
-                // Wire RFCOMM mouse reports from glasses to HID output
-                phoneBtHost.onMouseReport = { report -> phoneHidMouse?.sendReport(report) }
+                // Route RFCOMM mouse reports: to the stream when streaming, else to BT-HID.
+                wireGlassesMouseRouting()
                 // Forward start_mouse to glasses
                 phoneBtHost.sendCommand(type, commandId, paramsStr)
                 AdbResultWriter.writeSuccess(this, commandId, type, JSONObject().put("message", "$type sent"))
@@ -6496,11 +6424,7 @@ class ListenerService : LifecycleService(),
                     put("bottom_margin_px", bottomMargin)
                 })
 
-                // Send to Rokid OS (RKSettingsManager)
-                try { phoneBtHost.sendSettingsUpdate("settings_screen_ui_bottom_margin" to bottomMargin.toString()) }
-                catch (e: Exception) { LogCollector.e(TAG, "Failed sendSettingsUpdate: ${e.message}") }
-
-                // Send to glasses app (CH_SETTINGS)
+                // Send to glasses app (CH_SETTINGS -- the only live settings channel)
                 try { phoneBtHost.sendSettings(JSONObject().apply {
                     put("settings_screen_ui_bottom_margin", bottomMargin.toString())
                 }.toString()) }
@@ -9234,32 +9158,23 @@ class ListenerService : LifecycleService(),
             LogCollector.w(TAG, "Translation state restore failed: ${e.message}")
         }
 
-        // Load brightness from glasses and sync time
-        try {
-            val cxr = CxrApi.getInstance()
-
-            cxr.getGlassInfo(object : GlassInfoResultCallback {
-                override fun onGlassInfoResult(status: ValueUtil.CxrStatus?, glassInfo: GlassInfo?) {
-                    if (glassInfo != null) {
-                        val brightness = glassInfo.brightness
-                        LogCollector.i(TAG, "Glasses info: brightness=$brightness")
-                        AppConfig.setGlassesBrightness(this@ListenerService, brightness)
-                    } else {
-                        LogCollector.w(TAG, "getGlassInfo returned null (status=$status)")
-                    }
+        // Sync phone time/timezone to glasses over the relay. The glasses-side
+        // set_time handler applies the wall clock via root and re-applies on boot.
+        serviceScope.launch {
+            try {
+                val params = JSONObject().apply {
+                    put("epochMs", System.currentTimeMillis())
+                    put("tz", java.util.TimeZone.getDefault().id)
                 }
-            })
-
-            // Register listeners to keep cached values updated
-            cxr.setBrightnessUpdateListener(BrightnessUpdateListener { brightness ->
-                LogCollector.d(TAG, "Glasses brightness updated: $brightness")
-                AppConfig.setGlassesBrightness(this@ListenerService, brightness)
-            })
-            // Sync phone time/timezone to glasses
-            cxr.setGlassTime()
-            LogCollector.i(TAG, "Synced time to glasses")
-        } catch (e: Exception) {
-            LogCollector.e(TAG, "Failed to load glasses info or sync time: ${e.message}")
+                val resp = phoneBtHost.sendDeviceCommand("set_time", params.toString())
+                if (resp != null) {
+                    LogCollector.i(TAG, "Synced time to glasses (set_time)")
+                } else {
+                    LogCollector.w(TAG, "set_time command got no reply (timeout)")
+                }
+            } catch (e: Exception) {
+                LogCollector.e(TAG, "Failed to sync time to glasses: ${e.message}")
+            }
         }
 
         // Update device-identity mirrors (reachability state + ACTION_GLASSES_STATE
@@ -9283,11 +9198,6 @@ class ListenerService : LifecycleService(),
 
         // Start throughput tracking
         startThroughputTracking()
-
-        // Start sideloading if enabled
-        if (AppConfig.getSideloadEnabled(this)) {
-            startSideloading()
-        }
 
         // Push wall-clock + timezone to glasses. Bug 8.
         try {
@@ -9382,9 +9292,6 @@ class ListenerService : LifecycleService(),
 
         // Stop throughput tracking
         stopThroughputTracking()
-
-        // Stop sideloading
-        stopSideloading()
     }
 
     // --- ScreenStateReceiver.ScreenStateListener ---
@@ -9936,97 +9843,6 @@ class ListenerService : LifecycleService(),
         throughputHandler.removeCallbacks(throughputRunnable)
     }
 
-    // --- APK Sideloading ---
-
-    private fun startSideloading() {
-        if (apkRelayServer != null) return
-        LogCollector.i(TAG, "Starting APK sideloading")
-
-        val manager = ApkSideloadManager(
-            context = this,
-            getConnectionState = { phoneBtHost.bluetoothHelper.connectionState },
-            log = { msg -> LogCollector.i("ApkSideload", msg) },
-            statusCallback = { running, url, lastUpload, installStatus ->
-                sendBroadcast(Intent(ACTION_APK_RELAY_STATUS).apply {
-                    setPackage(packageName)
-                    putExtra(EXTRA_RELAY_RUNNING, running)
-                    putExtra(EXTRA_RELAY_URL, url)
-                    putExtra(EXTRA_RELAY_LAST_UPLOAD, lastUpload)
-                    putExtra(EXTRA_RELAY_INSTALL_STATUS, installStatus)
-                })
-            }
-        )
-        apkSideloadManager = manager
-
-        val server = ApkRelayServer(
-            port = 5030,
-            cacheDir = cacheDir,
-            onApkReceived = { file, onComplete ->
-                if (glassesSyncClient.isSyncing()) {
-                    LogCollector.i(TAG, "APK upload deferred: file sync in progress (cached for /retry)")
-                    onComplete?.invoke(false, "File sync in progress, cached for /retry")
-                } else {
-                    manager.uploadApkFile(file, onComplete)
-                }
-            },
-            log = { msg -> LogCollector.i("ApkRelay", msg) },
-            getConnectionState = { phoneBtHost.bluetoothHelper.connectionState },
-            onHotspotToggle = { enabled, callback ->
-                if (enabled) {
-                    phoneBtHost.enableHotspot { info ->
-                        if (info != null) {
-                            callback("""{"enabled":true,"ssid":"${info.ssid}","password":"${info.password}","ip":"${info.ip}","securityType":${info.securityType}}""")
-                        } else {
-                            callback("""{"error":"hotspot enable failed"}""")
-                        }
-                    }
-                } else {
-                    phoneBtHost.disableHotspot()
-                    callback("""{"enabled":false}""")
-                }
-            }
-        )
-        server.start()
-        apkRelayServer = server
-
-        val phoneIp = getLocalIpAddress()
-        val url = "http://$phoneIp:5030"
-        LogCollector.i(TAG, "Relay server started at $url")
-
-        sendBroadcast(Intent(ACTION_APK_RELAY_STATUS).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_RELAY_RUNNING, true)
-            putExtra(EXTRA_RELAY_URL, url)
-        })
-    }
-
-    private fun stopSideloading() {
-        apkRelayServer?.stop()
-        apkRelayServer = null
-        apkSideloadManager?.cleanup()
-        apkSideloadManager = null
-
-        sendBroadcast(Intent(ACTION_APK_RELAY_STATUS).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_RELAY_RUNNING, false)
-        })
-    }
-
-    private fun getLocalIpAddress(): String {
-        try {
-            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "127.0.0.1"
-            for (iface in interfaces) {
-                if (iface.isLoopback || !iface.isUp) continue
-                for (addr in iface.inetAddresses) {
-                    if (addr is java.net.Inet4Address && !addr.isLoopbackAddress) {
-                        return addr.hostAddress ?: "127.0.0.1"
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-        return "127.0.0.1"
-    }
-
     // --- Mouse HID status ---
 
     private fun broadcastMouseHidStatus() {
@@ -10036,6 +9852,35 @@ class ListenerService : LifecycleService(),
             putExtra(EXTRA_MOUSE_HID_DEVICE_NAME, phoneHidMouse?.connectedDeviceName ?: "")
         })
     }
+
+    // Single state-driven sink for glasses RFCOMM mouse reports. When a video-stream
+    // mouse channel is live (mouseEventListener != null) the report is transcoded to the
+    // 7-byte stream frame and driven to the PC over the stream; otherwise it falls through
+    // to the Bluetooth-HID bridge. Reading mouseEventListener per report makes streams
+    // starting/ending mid-session switch the output automatically, in both directions.
+    private fun wireGlassesMouseRouting() {
+        lastMouseRoute = ""
+        phoneBtHost.onMouseReport = { report ->
+            val streamSink = mouseEventListener
+            if (streamSink != null) {
+                val m = decodeGlassesMouseReport(report)
+                streamSink.invoke(encodeStreamMouseReport(m.dx, m.dy, m.buttons, m.scroll))
+                if (lastMouseRoute != "stream") {
+                    lastMouseRoute = "stream"
+                    LogCollector.i(TAG, "Glasses mouse routing -> video stream")
+                }
+            } else {
+                phoneHidMouse?.sendReport(report)
+                if (lastMouseRoute != "hid") {
+                    lastMouseRoute = "hid"
+                    LogCollector.i(TAG, "Glasses mouse routing -> BT-HID")
+                }
+            }
+        }
+    }
+
+    // Tracks the last route taken by the glasses mouse so a switch (stream<->hid) is logged once.
+    private var lastMouseRoute: String = ""
 
     // --- Lifecycle ---
 
@@ -10067,8 +9912,6 @@ class ListenerService : LifecycleService(),
 
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
-        wifiLock?.let { if (it.isHeld) it.release() }
-        wifiLock = null
 
         audioRecorder.stop()
         wakeWordDetector.release()
@@ -10093,10 +9936,8 @@ class ListenerService : LifecycleService(),
         overlay.release()
         healthMonitor.stop()
         stopThroughputTracking()
-        stopSideloading()
         unregisterReceiver(screenStateReceiver)
         unregisterReceiver(settingsReceiver)
-        unregisterReceiver(sideloadingReceiver)
         unregisterReceiver(syncReceiver)
         unregisterReceiver(deleteReceiver)
         unregisterReceiver(streamReceiver)

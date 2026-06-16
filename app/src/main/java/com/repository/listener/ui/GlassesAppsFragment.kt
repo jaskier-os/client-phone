@@ -307,8 +307,19 @@ class GlassesAppsFragment : Fragment() {
         }
         tileMouse.setOnClickListener {
             // stopMouse is phone-side cleanup (HID bridge) -- no glasses ping needed.
-            // Only showMouseConfigDialog needs the gate (it sends start_mouse to glasses).
-            if (mouseActive) stopMouse() else gateTileLaunch { showMouseConfigDialog() }
+            // Only the enable path needs the gate (it sends start_mouse to glasses).
+            if (mouseActive) {
+                stopMouse()
+            } else if (ListenerService.mouseEventListener != null) {
+                // A video-stream mouse channel is live: route glasses input to the PC over
+                // the stream -- no Bluetooth-HID target, so skip the PC picker dialog.
+                val ctx = requireContext()
+                gateTileLaunch {
+                    startMouse(AppConfig.getMouseSensitivityX(ctx), AppConfig.getMouseSensitivityY(ctx), "")
+                }
+            } else {
+                gateTileLaunch { showMouseConfigDialog() }
+            }
         }
         tileLoneMode.setOnClickListener { gateTileLaunch { showLoneModeDialog() } }
         tileCopilot.setOnClickListener {
@@ -814,7 +825,11 @@ class GlassesAppsFragment : Fragment() {
         if (mouseActive) {
             tileMouse.strokeWidth = (2 * resources.displayMetrics.density).toInt()
             tileMouse.strokeColor = requireContext().getColor(R.color.gbx_orange)
-            txtMouseStatus.text = if (mouseHidConnected) "PC: $mouseHidDeviceName" else "Waiting for PC..."
+            txtMouseStatus.text = when {
+                ListenerService.mouseEventListener != null -> "PC (stream)"
+                mouseHidConnected -> "PC: $mouseHidDeviceName"
+                else -> "Waiting for PC..."
+            }
             txtMouseStatus.visibility = View.VISIBLE
         } else {
             tileMouse.strokeWidth = 0

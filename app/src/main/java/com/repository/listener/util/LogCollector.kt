@@ -180,8 +180,8 @@ object LogCollector {
         "AudioViewer"
     )
 
-    /** Tags for APK sideloading and file sync. */
-    val SIDELOAD_TAGS = setOf("ApkRelay", "ApkSideload", "GlassesFileSync")
+    /** Tags for glasses file sync. */
+    val FILESYNC_TAGS = setOf("GlassesFileSync")
 
     /** Tags for voice input pipeline components. */
     val VOICE_TAGS = setOf(

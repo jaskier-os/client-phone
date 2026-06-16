@@ -202,15 +202,15 @@
             android:layout_marginTop="24dp">
 
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnViewSideloaderLogs"
+                android:id="@+id/btnViewFileSyncLogs"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:text="Sideloader Logs"
+                android:text="File Sync Logs"
                 style="@style/Widget.Material3.Button.TonalButton" />
 
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnShareSideloaderLogs"
+                android:id="@+id/btnShareFileSyncLogs"
                 android:layout_width="48dp"
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"

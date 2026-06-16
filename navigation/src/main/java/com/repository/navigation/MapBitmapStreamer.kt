@@ -19,6 +19,7 @@ import com.repository.navigation.model.TransitSection
 import com.repository.navigation.provider.GeoFix
 import com.repository.navigation.provider.GeoFixListener
 import com.repository.navigation.provider.LocationEngine
+import com.repository.navigation.provider.MapProviders
 import com.repository.navigation.provider.MinimapImageSource
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
@@ -261,6 +262,10 @@ class MapBitmapStreamer(
         if (active) return
         active = true
 
+        // The minimap renders via the SDK engine (Yandex offscreen map window), so hold it for
+        // the streamer's lifetime. Refcounted: harmless that a journey usually holds it too.
+        MapProviders.acquireEngine("minimap_streamer")
+
         locationEngine.subscribe(locationListener)
 
         val sm = context.getSystemService(Context.SENSOR_SERVICE) as? SensorManager
@@ -295,6 +300,7 @@ class MapBitmapStreamer(
     }
 
     fun stop() {
+        if (!active) return
         active = false
         handler.removeCallbacks(captureRunnable)
         handler.removeCallbacks(arrowRunnable)
@@ -308,6 +314,7 @@ class MapBitmapStreamer(
         mapSendInFlight.set(false)
         lastCapturedLat = null
         lastCapturedLng = null
+        MapProviders.releaseEngine("minimap_streamer")
         Log.i(TAG, "stop")
     }
 

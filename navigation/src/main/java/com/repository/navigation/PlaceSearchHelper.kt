@@ -13,6 +13,7 @@ import com.yandex.mapkit.search.SearchManagerType
 import com.yandex.mapkit.search.SearchOptions
 import com.yandex.mapkit.search.SearchType
 import com.yandex.mapkit.search.Session
+import com.repository.navigation.provider.MapProviders
 import com.yandex.runtime.Error
 import org.json.JSONArray
 import org.json.JSONObject
@@ -45,10 +46,17 @@ object PlaceSearchHelper {
         val handler = Handler(Looper.getMainLooper())
         var session: Session? = null
 
+        MapProviders.acquireEngine("place_search")
+        val engineReleased = AtomicBoolean(false)
+        val finish = {
+            if (engineReleased.compareAndSet(false, true)) MapProviders.releaseEngine("place_search")
+        }
+
         val timeoutRunnable = Runnable {
             if (responded.compareAndSet(false, true)) {
                 Log.w(TAG, "Place search timed out for: $query")
                 session?.let { activeSessions.remove(it) }
+                finish()
                 callback(JSONObject().put("places", JSONArray()).put("error", "Search timed out"))
             }
         }
@@ -101,6 +109,7 @@ object PlaceSearchHelper {
                                 placeList.forEach { places.put(it) }
                                 Log.i(TAG, "Found ${places.length()} places for '$query'")
                                 session?.let { activeSessions.remove(it) }
+                                finish()
                                 callback(JSONObject().put("places", places))
                             }
                         }
@@ -110,6 +119,7 @@ object PlaceSearchHelper {
                             if (responded.compareAndSet(false, true)) {
                                 Log.e(TAG, "Place search failed for '$query': $error")
                                 session?.let { activeSessions.remove(it) }
+                                finish()
                                 callback(JSONObject().put("places", JSONArray()).put("error", "Search failed: $error"))
                             }
                         }
@@ -122,6 +132,7 @@ object PlaceSearchHelper {
             if (responded.compareAndSet(false, true)) {
                 Log.e(TAG, "Place search exception for '$query': ${e.message}")
                 session?.let { activeSessions.remove(it) }
+                finish()
                 callback(JSONObject().put("places", JSONArray()).put("error", "Exception: ${e.message}"))
             }
         }

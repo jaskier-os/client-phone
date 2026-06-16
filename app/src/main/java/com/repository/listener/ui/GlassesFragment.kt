@@ -12,11 +12,6 @@ import com.repository.listener.R
 
 class GlassesFragment : Fragment() {
 
-    companion object {
-        const val ACTION_TOGGLE_SIDELOADING = "com.repository.listener.TOGGLE_SIDELOADING"
-        const val EXTRA_SIDELOADING_ENABLED = "sideloading_enabled"
-    }
-
     override fun onCreateView(
         inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?
     ): View {

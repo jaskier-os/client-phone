@@ -11,10 +11,9 @@ import androidx.core.content.ContextCompat
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.repository.listener.R
 import com.repository.listener.util.LogCollector
-import com.rokid.cxr.client.extend.CxrApi
-import com.rokid.cxr.client.extend.callbacks.GlassInfoResultCallback
-import com.rokid.cxr.client.extend.infos.GlassInfo
-import com.rokid.cxr.client.utils.ValueUtil
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class GlassesInfoDialog(private val context: Context) {
 
@@ -59,40 +58,30 @@ class GlassesInfoDialog(private val context: Context) {
             permissionsContainer.addView(tv)
         }
 
-        // Try to get glasses info via CxrApi
-        try {
-            CxrApi.getInstance().getGlassInfo(object : GlassInfoResultCallback {
-                override fun onGlassInfoResult(status: ValueUtil.CxrStatus?, glassInfo: GlassInfo?) {
-                    if (glassInfo != null) {
-                        txtBattery.post { txtBattery.text = "Battery: ${glassInfo.batteryLevel}%" }
-                        txtSerial.post { txtSerial.text = "Serial: ${glassInfo.deviceId ?: "--"}" }
-                        txtFirmware.post { txtFirmware.text = "Firmware: ${glassInfo.systemVersion ?: "--"}" }
+        // Get glasses info over the relay (get_glass_info), which replies with a JSON
+        // object {model,serial,firmware,androidVersion,battery,mac,name}.
+        val host = com.repository.listener.service.ListenerService.phoneBtHostInstance
+        if (host != null) {
+            CoroutineScope(Dispatchers.Main).launch {
+                try {
+                    val resp = host.sendDeviceCommand("get_glass_info")
+                    if (resp != null) {
+                        val info = org.json.JSONObject(resp)
+                        if (info.has("battery")) txtBattery.text = "Battery: ${info.optInt("battery")}%"
+                        if (info.has("serial")) txtSerial.text = "Serial: ${info.optString("serial", "--")}"
+                        if (info.has("firmware")) txtFirmware.text = "Firmware: ${info.optString("firmware", "--")}"
+                    } else {
+                        LogCollector.w(TAG, "get_glass_info got no reply (timeout)")
                     }
+                } catch (e: Exception) {
+                    LogCollector.e(TAG, "Failed to get glass info: ${e.message}")
                 }
-            })
-        } catch (e: Exception) {
-            LogCollector.e(TAG, "Failed to get glass info: ${e.message}")
+            }
         }
 
-        // Device info: try BluetoothController reflection, fall back to AppConfig
+        // Device info from AppConfig stored values
         var mac: String? = null
         var deviceName: String? = null
-        try {
-            val btCtrl = com.rokid.cxr.client.controllers.BluetoothController.getInstance()
-            val pField = btCtrl.javaClass.getDeclaredField("p") // classic MAC
-            pField.isAccessible = true
-            mac = pField.get(btCtrl) as? String
-
-            val kField = btCtrl.javaClass.getDeclaredField("k") // classic BluetoothDevice
-            kField.isAccessible = true
-            val device = kField.get(btCtrl) as? android.bluetooth.BluetoothDevice
-            if (device != null) {
-                @Suppress("MissingPermission")
-                deviceName = device.name
-            }
-        } catch (e: Exception) {
-            LogCollector.e(TAG, "Failed to get BT controller info: ${e.message}")
-        }
 
         // Fallback to AppConfig / BluetoothHelper stored values
         if (mac.isNullOrEmpty()) {

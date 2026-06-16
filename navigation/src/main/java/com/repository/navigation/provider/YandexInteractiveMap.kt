@@ -41,6 +41,7 @@ class YandexInteractiveMap(
 ) : InteractiveMap {
 
     private var mapView: MapView? = null
+    private var engineHeld = false
     private var userLocationLayer: UserLocationLayer? = null
     private var userLocationView: UserLocationView? = null
     private var compassHeading = 0f
@@ -99,7 +100,11 @@ class YandexInteractiveMap(
     override fun onCreate(savedInstanceState: android.os.Bundle?) {}
 
     override fun onStart() {
-        MapKitFactory.getInstance().onStart()
+        // Hold the shared engine for the lifetime of this visible map view (refcounted, so it
+        // coexists with a journey/minimap holding it too). mapView.onStart still needs the
+        // engine running, which acquireEngine guarantees synchronously on the main thread.
+        MapProviders.acquireEngine("interactive_map")
+        engineHeld = true
         mapView?.onStart()
     }
 
@@ -109,12 +114,20 @@ class YandexInteractiveMap(
 
     override fun onStop() {
         mapView?.onStop()
-        MapKitFactory.getInstance().onStop()
+        if (engineHeld) {
+            engineHeld = false
+            MapProviders.releaseEngine("interactive_map")
+        }
     }
 
     override fun onLowMemory() {}
 
     override fun onDestroy() {
+        // Safety net: if onStop was somehow skipped, don't leak the engine ref.
+        if (engineHeld) {
+            engineHeld = false
+            MapProviders.releaseEngine("interactive_map")
+        }
         locationEngine.unsubscribe(geoFixListener)
         clearRoute()
         clearDestination()

@@ -138,9 +138,6 @@ dependencies {
     // WebRTC for audio streaming
     implementation("io.getstream:stream-webrtc-android:1.3.7")
 
-    // Rokid CXR-M (phone-side glasses BT relay)
-    implementation("com.rokid.cxr:client-m:1.0.8")
-
     // Azure Cognitive Services Speech SDK (translation provider option)
     implementation("com.microsoft.cognitiveservices.speech:client-sdk:1.40.0")
 

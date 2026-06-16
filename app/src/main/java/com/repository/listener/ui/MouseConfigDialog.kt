@@ -23,6 +23,20 @@ import com.repository.listener.config.AppConfig
 @SuppressLint("MissingPermission")
 class MouseConfigDialog : BottomSheetDialogFragment() {
 
+    companion object {
+        // Sensitivity is a single user-facing multiplier (slider 0.1..5.0, step 0.1, default 1.0).
+        // 1.0 maps to BASE_SENSITIVITY_X horizontal; vertical is derived as horizontal * VERTICAL_RATIO.
+        private const val SENS_MIN = 0.1f
+        private const val SENS_MAX = 5.0f
+        private const val BASE_SENSITIVITY_X = 1800f
+        private const val VERTICAL_RATIO = 2.3f
+
+        private fun roundToStep(value: Float): Float =
+            (Math.round(value * 10f) / 10f).coerceIn(SENS_MIN, SENS_MAX)
+
+        private fun formatMult(value: Float): String = "%.1f".format(value)
+    }
+
     interface Listener {
         fun onMouseDeviceSelected(sensitivityX: Int, sensitivityY: Int, device: BluetoothDevice)
     }
@@ -50,24 +64,20 @@ class MouseConfigDialog : BottomSheetDialogFragment() {
         super.onViewCreated(view, savedInstanceState)
         val ctx = requireContext()
 
-        val sliderX = view.findViewById<Slider>(R.id.sliderSensitivityX)
-        val sliderY = view.findViewById<Slider>(R.id.sliderSensitivityY)
-        val labelX = view.findViewById<TextView>(R.id.labelSensitivityX)
-        val labelY = view.findViewById<TextView>(R.id.labelSensitivityY)
+        val slider = view.findViewById<Slider>(R.id.sliderSensitivity)
+        val label = view.findViewById<TextView>(R.id.labelSensitivity)
         progressScanning = view.findViewById(R.id.progressScanning)
 
-        val savedX = AppConfig.getMouseSensitivityX(ctx).toFloat().coerceIn(500f, 5000f)
-        val savedY = AppConfig.getMouseSensitivityY(ctx).toFloat().coerceIn(500f, 5000f)
-        sliderX.value = savedX
-        sliderY.value = savedY
-        labelX.text = "Horizontal sensitivity: ${savedX.toInt()}"
-        labelY.text = "Vertical sensitivity: ${savedY.toInt()}"
+        // Single sensitivity multiplier: 1.0 == BASE_SENSITIVITY_X (1800) horizontal; vertical is
+        // derived as horizontal * VERTICAL_RATIO. The stored config stays as raw X/Y ints, so
+        // recover the multiplier from the saved X.
+        val savedMult = (AppConfig.getMouseSensitivityX(ctx).toFloat() / BASE_SENSITIVITY_X)
+            .coerceIn(SENS_MIN, SENS_MAX)
+        slider.value = roundToStep(savedMult)
+        label.text = "Sensitivity: ${formatMult(slider.value)}"
 
-        sliderX.addOnChangeListener { _, value, _ ->
-            labelX.text = "Horizontal sensitivity: ${value.toInt()}"
-        }
-        sliderY.addOnChangeListener { _, value, _ ->
-            labelY.text = "Vertical sensitivity: ${value.toInt()}"
+        slider.addOnChangeListener { _, value, _ ->
+            label.text = "Sensitivity: ${formatMult(value)}"
         }
 
         val recycler = view.findViewById<RecyclerView>(R.id.recyclerDevices)
@@ -151,10 +161,10 @@ class MouseConfigDialog : BottomSheetDialogFragment() {
     private fun onDeviceTapped(device: BluetoothDevice) {
         stopDiscovery()
         val ctx = requireContext()
-        val sliderX = requireView().findViewById<Slider>(R.id.sliderSensitivityX)
-        val sliderY = requireView().findViewById<Slider>(R.id.sliderSensitivityY)
-        val sensX = sliderX.value.toInt()
-        val sensY = sliderY.value.toInt()
+        val mult = requireView().findViewById<Slider>(R.id.sliderSensitivity).value
+        // 1.0 -> 1800 horizontal; vertical = horizontal * 2.3.
+        val sensX = (mult * BASE_SENSITIVITY_X).toInt()
+        val sensY = (mult * BASE_SENSITIVITY_X * VERTICAL_RATIO).toInt()
         AppConfig.setMouseSensitivityX(ctx, sensX)
         AppConfig.setMouseSensitivityY(ctx, sensY)
 

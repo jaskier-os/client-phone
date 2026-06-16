@@ -24,13 +24,20 @@ import android.view.ViewGroup
 import android.widget.ImageButton
 import android.widget.TextView
 import android.widget.Toast
+import android.view.animation.AccelerateInterpolator
 import android.view.animation.AnimationUtils
+import android.view.animation.DecelerateInterpolator
 import android.widget.ImageView
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.fragment.app.Fragment
 import com.repository.listener.R
+import com.repository.listener.bt.encodeStreamMouseReport
+import com.repository.listener.bt.encodeAbsoluteMouseReport
+import com.repository.listener.bt.STREAM_MOUSE_ABS_MAX
 import com.repository.listener.config.AppConfig
+import java.util.UUID
+import org.json.JSONObject
 import com.repository.listener.network.Protocol
 import com.repository.listener.service.ListenerService
 import com.repository.listener.util.LogCollector
@@ -40,6 +47,10 @@ class DesktopFragment : Fragment() {
 
     companion object {
         private const val TAG = "DesktopFragment"
+        // Stream mode moves the cursor across a whole PC desktop on the phone screen, so the
+        // glasses head-tracking sensitivity is doubled relative to the configured base.
+        private const val STREAM_SENSITIVITY_MULTIPLIER = 2
+        private const val INPUT_ROW_ANIM_MS = 180L
 private const val OVERLAY_AUTO_HIDE_MS = 3_000L
         private const val COLOR_GREEN = 0xFF00AA00.toInt()
         private const val COLOR_RED = 0xFFfb4934.toInt()
@@ -52,6 +63,9 @@ private const val OVERLAY_AUTO_HIDE_MS = 3_000L
     private enum class StreamState { DISCONNECTED, IDLE, REQUESTING, STREAMING }
     private enum class AudioRelayState { IDLE, CONNECTING, ACTIVE, ERROR }
 
+    // Pointer input source while streaming. Mutually exclusive.
+    enum class InputMode { NONE, HID, GLASSES, FINGER }
+
     private lateinit var surfaceVideo: TextureView
     private lateinit var txtEmptyState: TextView
     private lateinit var controlOverlay: View
@@ -61,8 +75,17 @@ private const val OVERLAY_AUTO_HIDE_MS = 3_000L
 private lateinit var monitorSwitcher: View
     private lateinit var btnMonitor: ImageButton
     private lateinit var txtMonitorBadge: TextView
+    private lateinit var inputModeRow: View
+    private lateinit var btnModeHid: TextView
+    private lateinit var btnModeGlasses: TextView
+    private lateinit var btnModeFinger: TextView
+    private var inputMode = InputMode.NONE
+    private var glassesMouseCommandId: String? = null
 
     private val handler = Handler(Looper.getMainLooper())
+    // Application context cached while attached, so teardown dispatches (e.g. stop_mouse on
+    // fragment destroy) still work even when context/requireContext is no longer available.
+    private var appContext: Context? = null
     private var streamState = StreamState.DISCONNECTED
     private var orchestratorConnected = false
     private var surfaceReady = false
@@ -165,6 +188,7 @@ private var currentMonitor = 0
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
+        appContext = view.context.applicationContext
         surfaceVideo = view.findViewById(R.id.surfaceVideo)
         txtEmptyState = view.findViewById(R.id.txtEmptyState)
         controlOverlay = view.findViewById(R.id.controlOverlay)
@@ -174,6 +198,10 @@ private var currentMonitor = 0
 monitorSwitcher = view.findViewById(R.id.monitorSwitcher)
         btnMonitor = view.findViewById(R.id.btnMonitor)
         txtMonitorBadge = view.findViewById(R.id.txtMonitorBadge)
+        inputModeRow = view.findViewById(R.id.inputModeRow)
+        btnModeHid = view.findViewById(R.id.btnModeHid)
+        btnModeGlasses = view.findViewById(R.id.btnModeGlasses)
+        btnModeFinger = view.findViewById(R.id.btnModeFinger)
         btnAudio = view.findViewById(R.id.btnAudio)
         btnKeyboard = view.findViewById(R.id.btnKeyboard)
         progressLoading = view.findViewById(R.id.progressLoading)
@@ -227,7 +255,7 @@ monitorSwitcher = view.findViewById(R.id.monitorSwitcher)
         super.onDestroyView()
         stopStream()
         stopPointerPolling()
-        disableMouseRelay()
+        resetInputMode()
         inputManager?.unregisterInputDeviceListener(inputDeviceListener)
     }
 
@@ -250,7 +278,21 @@ monitorSwitcher = view.findViewById(R.id.monitorSwitcher)
     private val pointerPollRunnable = object : Runnable {
         override fun run() {
             checkPointerDevices()
+            reconcileGlassesMode()
             if (pointerPolling) handler.postDelayed(this, 2000)
+        }
+    }
+
+    // If the glasses BT link drops while GLASSES mode is active, fall back to FINGER so the
+    // user keeps control instead of being stuck on a dead input source.
+    private fun reconcileGlassesMode() {
+        if (inputMode == InputMode.GLASSES && streamState == StreamState.STREAMING
+            && !ListenerService.glassesConnected) {
+            LogCollector.i(TAG, "Glasses link dropped while in GLASSES mode -- falling back to FINGER")
+            setInputMode(InputMode.FINGER)
+        } else if (inputModeRow.visibility == View.VISIBLE) {
+            // Keep the footer's enabled/disabled states fresh while it's open.
+            updateInputModeRow()
         }
     }
 
@@ -272,7 +314,8 @@ monitorSwitcher = view.findViewById(R.id.monitorSwitcher)
     }
 
     private fun checkPointerDevices() {
-        if (mouseRelayActive) return
+        // Note: do NOT early-return while mouseRelayActive -- we must still detect pointer
+        // REMOVAL while HID mode is live so we can fall back instead of holding dead capture.
         val hasPointer = InputDevice.getDeviceIds().any { id ->
             val device = InputDevice.getDevice(id)
             device != null && !device.isVirtual
@@ -281,16 +324,131 @@ monitorSwitcher = view.findViewById(R.id.monitorSwitcher)
         if (hasPointer != pointerDeviceConnected) {
             pointerDeviceConnected = hasPointer
             LogCollector.i(TAG, "Pointer device ${if (hasPointer) "connected" else "disconnected"}")
-            updateMouseButton()
-            if (hasPointer && streamState == StreamState.STREAMING) {
-                enableMouseRelay()
+            when {
+                // Pointer vanished while in HID mode: tear the relay down and fall back to finger.
+                !hasPointer && inputMode == InputMode.HID && streamState == StreamState.STREAMING ->
+                    setInputMode(InputMode.FINGER)
+                // Pointer appeared while streaming with no mode chosen yet: adopt HID.
+                // Don't auto-steal an active FINGER/GLASSES choice the user made.
+                hasPointer && streamState == StreamState.STREAMING && inputMode == InputMode.NONE ->
+                    setInputMode(InputMode.HID)
+                else -> {
+                    updateMouseButton()
+                    updateInputModeRow()
+                }
             }
         }
     }
 
     private fun updateMouseButton() {
-        btnMouse.visibility = if (pointerDeviceConnected && streamState == StreamState.STREAMING) View.VISIBLE else View.GONE
-        btnMouse.alpha = if (mouseRelayActive) 1f else 0.4f
+        btnMouse.visibility = if (streamState == StreamState.STREAMING) View.VISIBLE else View.GONE
+        btnMouse.alpha = if (inputMode != InputMode.NONE) 1f else 0.4f
+    }
+
+    // -- Input-mode picker (footer row) --
+
+    private fun updateInputModeRow() {
+        styleModeButton(btnModeHid, enabled = pointerDeviceConnected, active = inputMode == InputMode.HID)
+        styleModeButton(btnModeGlasses, enabled = ListenerService.glassesConnected, active = inputMode == InputMode.GLASSES)
+        styleModeButton(btnModeFinger, enabled = true, active = inputMode == InputMode.FINGER)
+    }
+
+    private fun styleModeButton(btn: TextView, enabled: Boolean, active: Boolean) {
+        btn.isEnabled = enabled
+        btn.alpha = when {
+            !enabled -> 0.4f
+            active -> 1f
+            else -> 0.7f
+        }
+        btn.setTextColor(
+            resources.getColor(if (active) R.color.gbx_orange else R.color.gbx_fg, null)
+        )
+    }
+
+    private fun setInputMode(mode: InputMode) {
+        // Toggle off if re-selecting the current mode.
+        val target = if (mode == inputMode) InputMode.NONE else mode
+
+        // Guard: can't enter HID without a pointer, or GLASSES without a BT link.
+        if (target == InputMode.HID && !pointerDeviceConnected) { updateInputModeRow(); return }
+        if (target == InputMode.GLASSES && !ListenerService.glassesConnected) { updateInputModeRow(); return }
+
+        // Tear down the current mode.
+        when (inputMode) {
+            InputMode.HID -> disableMouseRelay()
+            InputMode.GLASSES -> stopGlassesMouse()
+            else -> {}
+        }
+
+        inputMode = target
+
+        // Set up the new mode.
+        when (target) {
+            InputMode.HID -> enableMouseRelay()
+            InputMode.GLASSES -> startGlassesMouse()
+            else -> {}
+        }
+
+        LogCollector.i(TAG, "Input mode -> $target")
+        updateMouseButton()
+        updateInputModeRow()
+    }
+
+    private fun resetInputMode() {
+        when (inputMode) {
+            InputMode.HID -> disableMouseRelay()
+            InputMode.GLASSES -> stopGlassesMouse()
+            else -> {}
+        }
+        // Ensure capture is released even if state drifted.
+        if (mouseRelayActive) disableMouseRelay()
+        inputMode = InputMode.NONE
+        if (::inputModeRow.isInitialized) inputModeRow.visibility = View.GONE
+    }
+
+    private fun startGlassesMouse() {
+        if (!isAdded) return
+        val ctx = requireContext()
+        val params = JSONObject().apply {
+            // Double the sensitivity in video-streaming mode -- the cursor travels across a full
+            // PC desktop shown on the phone, so it needs to move faster than the standalone case.
+            put("sensitivity_x", AppConfig.getMouseSensitivityX(ctx) * STREAM_SENSITIVITY_MULTIPLIER)
+            put("sensitivity_y", AppConfig.getMouseSensitivityY(ctx) * STREAM_SENSITIVITY_MULTIPLIER)
+            // Empty device_address -> service routes to the active stream mouse channel.
+            put("device_address", "")
+            // Stream mode: the user explicitly chose "Glasses" in the on-stream footer, so
+            // head-tracking must begin immediately (no on-glasses tap to toggle it), and the
+            // glasses must NOT spin up their standalone BLE-HID mouse activity -- reports go
+            // glasses RFCOMM -> phone -> stream, not via the glasses' own BLE-HID device.
+            put("stream_mode", true)
+        }
+        val commandId = "desktop_mouse_${UUID.randomUUID().toString().take(8)}"
+        glassesMouseCommandId = commandId
+        val intent = Intent(ctx, ListenerService::class.java).apply {
+            action = ListenerService.ACTION_ADB_DISPATCH
+            putExtra("command_id", commandId)
+            putExtra("type", "start_mouse")
+            putExtra("params", params.toString())
+        }
+        ctx.startService(intent)
+        LogCollector.i(TAG, "start_mouse (glasses, stream) sent id=$commandId")
+    }
+
+    private fun stopGlassesMouse() {
+        // Use application context so the stop still dispatches even when the fragment is
+        // being destroyed (onDestroyView -> resetInputMode), otherwise the glasses would
+        // keep capturing mouse input after the user leaves the stream.
+        val ctx = context?.applicationContext ?: appContext ?: return
+        val commandId = "desktop_mouse_${UUID.randomUUID().toString().take(8)}"
+        glassesMouseCommandId = null
+        val intent = Intent(ctx, ListenerService::class.java).apply {
+            action = ListenerService.ACTION_ADB_DISPATCH
+            putExtra("command_id", commandId)
+            putExtra("type", "stop_mouse")
+            putExtra("params", "{}")
+        }
+        ctx.startService(intent)
+        LogCollector.i(TAG, "stop_mouse (glasses) sent id=$commandId")
     }
 
     // -- Pointer capture (mouse relay) --
@@ -402,16 +560,7 @@ monitorSwitcher = view.findViewById(R.id.monitorSwitcher)
             mouseLastStatsTime = now
         }
 
-        val clampedDx = dx.coerceIn(-32768, 32767)
-        val clampedDy = dy.coerceIn(-32768, 32767)
-        val buf = ByteArray(7)
-        buf[0] = 0x02
-        buf[1] = (clampedDx shr 8).toByte()
-        buf[2] = clampedDx.toByte()
-        buf[3] = (clampedDy shr 8).toByte()
-        buf[4] = clampedDy.toByte()
-        buf[5] = btn.toByte()
-        buf[6] = scroll.coerceIn(-128, 127).toByte()
+        val buf = encodeStreamMouseReport(dx, dy, btn, scroll)
         ListenerService.mouseEventListener?.invoke(buf)
     }
 
@@ -577,8 +726,19 @@ monitorSwitcher = view.findViewById(R.id.monitorSwitcher)
         }
 
         btnMouse.setOnClickListener {
-            if (mouseRelayActive) disableMouseRelay() else enableMouseRelay()
+            val show = inputModeRow.visibility != View.VISIBLE
+            if (show) {
+                updateInputModeRow()
+                showInputModeRow()
+                scheduleOverlayHide()
+            } else {
+                hideInputModeRow()
+            }
         }
+
+        btnModeHid.setOnClickListener { setInputMode(InputMode.HID) }
+        btnModeGlasses.setOnClickListener { setInputMode(InputMode.GLASSES) }
+        btnModeFinger.setOnClickListener { setInputMode(InputMode.FINGER) }
 
 btnMonitor.setOnClickListener {
             if (monitorCount <= 1) return@setOnClickListener
@@ -635,6 +795,10 @@ btnMonitor.setOnClickListener {
         })
 
         var pointerCountMax = 0
+        var downX = 0f
+        var downY = 0f
+        var downTime = 0L
+        var movedBeyondSlop = false
         surfaceVideo.setOnTouchListener { _, event ->
             if (streamState != StreamState.STREAMING) return@setOnTouchListener false
 
@@ -645,7 +809,11 @@ btnMonitor.setOnClickListener {
                     pointerCountMax = 1
                     lastTouchX = event.x
                     lastTouchY = event.y
+                    downX = event.x
+                    downY = event.y
+                    downTime = event.eventTime
                     isDragging = false
+                    movedBeyondSlop = false
                 }
                 MotionEvent.ACTION_POINTER_DOWN -> {
                     pointerCountMax = maxOf(pointerCountMax, event.pointerCount)
@@ -664,18 +832,65 @@ btnMonitor.setOnClickListener {
                             applyTransform()
                         }
                     }
+                    val tdx = event.x - downX
+                    val tdy = event.y - downY
+                    if ((tdx * tdx + tdy * tdy) > 25) movedBeyondSlop = true
                     lastTouchX = event.x
                     lastTouchY = event.y
                 }
+                MotionEvent.ACTION_CANCEL -> {
+                    // Gesture stolen (e.g. system nav) -- abandon any pending tap, send nothing.
+                    isDragging = false
+                    movedBeyondSlop = true
+                }
                 MotionEvent.ACTION_UP -> {
-                    if (pointerCountMax == 1 && !isDragging) {
-                        controlOverlay.visibility = if (controlOverlay.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                    val isTap = !movedBeyondSlop && !isDragging &&
+                        (event.eventTime - downTime) < 300 &&
+                        !(scaleGestureDetector?.isInProgress == true)
+                    if (inputMode == InputMode.FINGER && isTap) {
+                        // Jump-and-click: left for single tap, right for two-finger tap.
+                        val right = pointerCountMax == 2
+                        sendFingerClick(downX, downY, right)
+                    } else if (pointerCountMax == 1 && !isDragging) {
+                        // Overlay toggle is reserved for non-finger taps (or finger taps that
+                        // weren't consumed as a click, e.g. while zooming).
+                        val visible = controlOverlay.visibility == View.VISIBLE
+                        controlOverlay.visibility = if (visible) View.GONE else View.VISIBLE
+                        if (visible) hideInputModeRow()
                         scheduleOverlayHide()
                     }
                 }
             }
             true
         }
+    }
+
+    // Maps a tap in surfaceVideo view px to PC-normalized absolute coords and sends a
+    // press + release (so the desktop edge-triggers a click) via the stream mouse sink.
+    private fun sendFingerClick(viewX: Float, viewY: Float, rightButton: Boolean) {
+        if (ListenerService.mouseEventListener == null) return
+        val w = surfaceVideo.width.toFloat()
+        val h = surfaceVideo.height.toFloat()
+        if (w <= 0f || h <= 0f) return
+
+        // Invert the committed (target) transform, not the in-flight display* values.
+        val contentX = (viewX - panX) / scaleFactor
+        val contentY = (viewY - panY) / scaleFactor
+        val normXf = (contentX / w).coerceIn(0f, 1f)
+        val normYf = (contentY / h).coerceIn(0f, 1f)
+        val normX = (normXf * STREAM_MOUSE_ABS_MAX).toInt()
+        val normY = (normYf * STREAM_MOUSE_ABS_MAX).toInt()
+        val btn = if (rightButton) 0x02 else 0x01
+
+        // Send press then release back-to-back. The desktop edge-triggers buttons per
+        // report (two separate syn()s), so an immediate release still registers a click --
+        // and avoids leaving a button held if the stream tears down between the two reports.
+        val press = encodeAbsoluteMouseReport(currentMonitor, normX, normY, btn)
+        val release = encodeAbsoluteMouseReport(currentMonitor, normX, normY, 0x00)
+        val sink = ListenerService.mouseEventListener ?: return
+        sink.invoke(press)
+        sink.invoke(release)
+        LogCollector.i(TAG, "finger click monitor=$currentMonitor norm=($normX,$normY) right=$rightButton")
     }
 
     private fun applyTransform() {
@@ -742,11 +957,69 @@ btnMonitor.setOnClickListener {
             val runnable = Runnable {
                 if (streamState == StreamState.STREAMING) {
                     controlOverlay.visibility = View.GONE
+                    hideInputModeRow()
                 }
             }
             overlayHideRunnable = runnable
             handler.postDelayed(runnable, OVERLAY_AUTO_HIDE_MS)
         }
+    }
+
+    // -- Input-mode footer slide animation --
+    //
+    // Driven by a manual per-frame tween (postOnAnimation) instead of ViewPropertyAnimator, so it
+    // animates even when the device has the global animator duration scale set to 0 (animations
+    // off in Developer Options), which would otherwise make .animate() snap instantly.
+
+    private var inputRowAnimRunnable: Runnable? = null
+    private val decelerate = DecelerateInterpolator()
+    private val accelerate = AccelerateInterpolator()
+
+    private fun rowDrop(): Float = inputModeRow.height.takeIf { it > 0 }?.toFloat() ?: 96f
+
+    /** Slide the footer up + fade in. */
+    private fun showInputModeRow() {
+        if (!::inputModeRow.isInitialized) return
+        val startY = if (inputModeRow.visibility != View.VISIBLE) rowDrop() else inputModeRow.translationY
+        inputModeRow.visibility = View.VISIBLE
+        tweenInputRow(fromY = startY, toY = 0f, fromA = inputModeRow.alpha, toA = 1f,
+            interp = decelerate, endVisible = true)
+    }
+
+    /** Slide the footer down + fade out, then GONE. */
+    private fun hideInputModeRow() {
+        if (!::inputModeRow.isInitialized) return
+        if (inputModeRow.visibility != View.VISIBLE) return
+        tweenInputRow(fromY = inputModeRow.translationY, toY = rowDrop(), fromA = inputModeRow.alpha, toA = 0f,
+            interp = accelerate, endVisible = false)
+    }
+
+    private fun tweenInputRow(
+        fromY: Float, toY: Float, fromA: Float, toA: Float,
+        interp: android.view.animation.Interpolator, endVisible: Boolean
+    ) {
+        inputRowAnimRunnable?.let { inputModeRow.removeCallbacks(it) }
+        val start = System.currentTimeMillis()
+        val runnable = object : Runnable {
+            override fun run() {
+                val t = ((System.currentTimeMillis() - start).toFloat() / INPUT_ROW_ANIM_MS).coerceIn(0f, 1f)
+                val f = interp.getInterpolation(t)
+                inputModeRow.translationY = fromY + (toY - fromY) * f
+                inputModeRow.alpha = fromA + (toA - fromA) * f
+                if (t < 1f) {
+                    inputModeRow.postOnAnimation(this)
+                } else {
+                    inputRowAnimRunnable = null
+                    if (!endVisible) {
+                        inputModeRow.visibility = View.GONE
+                        inputModeRow.translationY = 0f
+                        inputModeRow.alpha = 1f
+                    }
+                }
+            }
+        }
+        inputRowAnimRunnable = runnable
+        inputModeRow.postOnAnimation(runnable)
     }
 
     // -- Streaming chrome (tabs, overlay) --
@@ -893,7 +1166,7 @@ btnMonitor.setOnClickListener {
                 monitorCount = 1
                 updateMonitorSwitcher()
                 stopPointerPolling()
-                disableMouseRelay()
+                resetInputMode()
                 audioRelayActive = false
                 updateAudioRelayState(AudioRelayState.IDLE)
                 cancelStreamRequestTimeout()
@@ -916,7 +1189,7 @@ btnMonitor.setOnClickListener {
                 monitorCount = 1
                 updateMonitorSwitcher()
                 stopPointerPolling()
-                disableMouseRelay()
+                resetInputMode()
                 audioRelayActive = ListenerService.audioRelayActive
                 updateAudioRelayState(if (audioRelayActive) AudioRelayState.ACTIVE else AudioRelayState.IDLE)
                 cancelStreamRequestTimeout()
@@ -943,8 +1216,9 @@ btnMonitor.setOnClickListener {
                 btnStream.isEnabled = true
                 btnStream.alpha = 1f
                 updateMonitorSwitcher()
-                if (pointerDeviceConnected && !mouseRelayActive) {
-                    enableMouseRelay()
+                // Auto-pick: HID when a pointer is present, otherwise finger. Never glasses.
+                if (inputMode == InputMode.NONE) {
+                    setInputMode(if (pointerDeviceConnected) InputMode.HID else InputMode.FINGER)
                 }
                 startPointerPolling()
                 cancelStreamRequestTimeout()

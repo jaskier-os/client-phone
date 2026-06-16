@@ -18,41 +18,23 @@
         android:paddingTop="16dp"
         android:paddingBottom="16dp" />
 
-    <!-- Horizontal Sensitivity -->
+    <!-- Sensitivity (single multiplier; vertical is derived as horizontal * 2.3) -->
     <TextView
-        android:id="@+id/labelSensitivityX"
+        android:id="@+id/labelSensitivity"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:text="Horizontal sensitivity: 1800"
+        android:text="Sensitivity: 1.0"
         android:textColor="@color/gbx_gray"
         android:textSize="13sp" />
 
     <com.google.android.material.slider.Slider
-        android:id="@+id/sliderSensitivityX"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="12dp"
-        android:valueFrom="500"
-        android:valueTo="5000"
-        android:stepSize="100" />
-
-    <!-- Vertical Sensitivity -->
-    <TextView
-        android:id="@+id/labelSensitivityY"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="Vertical sensitivity: 4200"
-        android:textColor="@color/gbx_gray"
-        android:textSize="13sp" />
-
-    <com.google.android.material.slider.Slider
-        android:id="@+id/sliderSensitivityY"
+        android:id="@+id/sliderSensitivity"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginBottom="16dp"
-        android:valueFrom="500"
-        android:valueTo="5000"
-        android:stepSize="100" />
+        android:valueFrom="0.1"
+        android:valueTo="5.0"
+        android:stepSize="0.1" />
 
     <!-- Device picker section -->
     <View

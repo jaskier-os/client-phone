@@ -32,12 +32,73 @@
         android:src="@drawable/ic_spinner"
         android:visibility="gone" />
 
+    <!-- Bottom panel wrapper: input-mode row stacked above the control bar -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical">
+
+    <!-- Input-mode picker row (shown when the mouse button is tapped while streaming) -->
+    <LinearLayout
+        android:id="@+id/inputModeRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:background="@color/gbx_overlay"
+        android:paddingVertical="8dp"
+        android:paddingHorizontal="12dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/btnModeHid"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:gravity="center"
+            android:paddingVertical="8dp"
+            android:text="External mouse"
+            android:textColor="@color/gbx_fg"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:background="?attr/selectableItemBackground" />
+
+        <TextView
+            android:id="@+id/btnModeGlasses"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="6dp"
+            android:gravity="center"
+            android:paddingVertical="8dp"
+            android:text="Glasses"
+            android:textColor="@color/gbx_fg"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:background="?attr/selectableItemBackground" />
+
+        <TextView
+            android:id="@+id/btnModeFinger"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:paddingVertical="8dp"
+            android:text="Touch"
+            android:textColor="@color/gbx_fg"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:background="?attr/selectableItemBackground" />
+
+    </LinearLayout>
+
     <!-- Compact translucent bottom panel -->
     <LinearLayout
         android:id="@+id/controlOverlay"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_gravity="bottom"
         android:orientation="horizontal"
         android:gravity="center_vertical"
         android:background="@color/gbx_overlay"
@@ -174,6 +235,8 @@
                 android:src="@drawable/ic_spinner"
                 android:visibility="gone" />
         </FrameLayout>
+
+    </LinearLayout>
 
     </LinearLayout>
 

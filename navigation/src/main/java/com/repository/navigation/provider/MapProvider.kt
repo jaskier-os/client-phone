@@ -43,7 +43,17 @@ interface MapProvider {
     /** Perform any SDK init (key + factory). Idempotent. */
     fun init(context: Context)
 
-    /** Process-level lifecycle. Yandex pumps MapKitFactory.onStart/onStop here. */
+    /**
+     * Process-level engine lifecycle. Yandex pumps MapKitFactory.onStart/onStop here.
+     *
+     * These must NOT be called directly by feature code -- the engine is shared by many
+     * consumers (the interactive map, an active/preparing journey, the minimap renderer,
+     * and one-shot geocode/search/suggest/route calls). Drive it through the reference
+     * counter in [MapProviders.acquireEngine]/[MapProviders.releaseEngine] instead so the
+     * engine is started on the first consumer and stopped only after the last one releases.
+     * Leaving the engine started while nothing needs it keeps the SDK's background threads
+     * alive and has been observed to crash the process on this hardware.
+     */
     fun onProcessStart()
     fun onProcessStop()
 

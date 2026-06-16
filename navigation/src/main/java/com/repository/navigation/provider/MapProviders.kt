@@ -1,6 +1,8 @@
 package com.repository.navigation.provider
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.annotation.VisibleForTesting
 import com.repository.navigation.BuildConfig
@@ -22,6 +24,76 @@ object MapProviders {
 
     /** The active provider. Defaults to Yandex before resolve() runs. */
     val active: MapProvider get() = current
+
+    // --- Reference-counted engine lifecycle ---
+    //
+    // The map SDK engine (Yandex MapKitFactory.onStart/onStop) is shared by every consumer:
+    // the interactive map view, an active/preparing journey, the minimap renderer, and
+    // one-shot geocode/search/suggest/route calls. We start it on the first acquire and stop
+    // it only after the last release, so the SDK's background threads are not kept alive (and
+    // able to crash the process) when nothing map-related is happening.
+    //
+    // All counter mutation and onProcessStart/onProcessStop calls happen on the main thread,
+    // which the Yandex SDK requires. A short grace delay before the actual stop absorbs brief
+    // gaps between two consumers (e.g. the map view stopping just as a journey starts) so the
+    // engine is not thrashed off/on.
+    private const val ENGINE_STOP_GRACE_MS = 4000L
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var engineRefCount = 0
+    private var engineStarted = false
+    private val engineStopRunnable = Runnable { stopEngineNow() }
+
+    /**
+     * Acquire the shared map engine for a consumer. Idempotent per-consumer is NOT enforced --
+     * each acquire must be balanced by exactly one [releaseEngine]. Safe to call from any
+     * thread; the work is marshalled to the main thread.
+     */
+    fun acquireEngine(reason: String) {
+        runOnMain {
+            engineRefCount++
+            Log.d(TAG, "acquireEngine($reason) -> count=$engineRefCount")
+            mainHandler.removeCallbacks(engineStopRunnable)
+            if (!engineStarted) {
+                val p = current
+                if (p.requiresProcessMapStart) {
+                    p.onProcessStart()
+                    Log.i(TAG, "map engine started (first consumer: $reason)")
+                }
+                engineStarted = true
+            }
+        }
+    }
+
+    /** Release a previously [acquireEngine]'d consumer. Stops the engine (after a grace delay) on 0. */
+    fun releaseEngine(reason: String) {
+        runOnMain {
+            if (engineRefCount == 0) {
+                Log.w(TAG, "releaseEngine($reason) with count already 0 -- ignoring (unbalanced release)")
+                return@runOnMain
+            }
+            engineRefCount--
+            Log.d(TAG, "releaseEngine($reason) -> count=$engineRefCount")
+            if (engineRefCount == 0 && engineStarted) {
+                mainHandler.removeCallbacks(engineStopRunnable)
+                mainHandler.postDelayed(engineStopRunnable, ENGINE_STOP_GRACE_MS)
+            }
+        }
+    }
+
+    private fun stopEngineNow() {
+        if (engineRefCount != 0 || !engineStarted) return
+        val p = current
+        if (p.requiresProcessMapStart) {
+            p.onProcessStop()
+            Log.i(TAG, "map engine stopped (no consumers)")
+        }
+        engineStarted = false
+    }
+
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) block()
+        else mainHandler.post(block)
+    }
 
     /**
      * Resolve and init the active provider from [providerId]
@@ -47,11 +119,19 @@ object MapProviders {
         val old = current
         val next = pick(providerId)
         if (next.id == old.id) return old.id
-        if (old.requiresProcessMapStart) old.onProcessStop()
+        // Transfer the engine running-state across the switch: if consumers currently hold the
+        // engine under the old provider, stop the old engine and start the new one so the
+        // refcount stays valid against the now-active provider. switchTo is only called while
+        // IDLE (no journey), but the map view or a one-shot call could still hold a ref.
+        val wasStarted = engineStarted
+        if (wasStarted && old.requiresProcessMapStart) old.onProcessStop()
         current = next
         next.init(context.applicationContext)
-        if (next.requiresProcessMapStart) next.onProcessStart()
-        Log.i(TAG, "switched provider ${old.id} -> ${next.id}")
+        if (wasStarted) {
+            if (next.requiresProcessMapStart) next.onProcessStart()
+            engineStarted = next.requiresProcessMapStart
+        }
+        Log.i(TAG, "switched provider ${old.id} -> ${next.id} (engineWasStarted=$wasStarted, count=$engineRefCount)")
         return next.id
     }
 

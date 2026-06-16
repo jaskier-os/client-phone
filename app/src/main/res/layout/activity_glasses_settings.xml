@@ -217,51 +217,6 @@
 
             </com.google.android.material.card.MaterialCardView>
 
-            <!-- Audio -->
-            <com.google.android.material.card.MaterialCardView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                app:cardBackgroundColor="@color/gbx_bg1"
-                app:cardCornerRadius="12dp"
-                app:cardElevation="0dp">
-
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    android:padding="16dp">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Audio"
-                        android:textColor="@color/gbx_orange"
-                        android:textSize="16sp"
-                        android:textStyle="bold"
-                        android:layout_marginBottom="16dp" />
-
-                    <com.google.android.material.textfield.TextInputLayout
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        app:helperText="Audio equalizer preset"
-                        style="@style/Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
-
-                        <AutoCompleteTextView
-                            android:id="@+id/dropdownSoundEffect"
-                            android:layout_width="match_parent"
-                            android:layout_height="wrap_content"
-                            android:hint="Sound effect"
-                            android:inputType="none" />
-
-                    </com.google.android.material.textfield.TextInputLayout>
-
-                </LinearLayout>
-
-            </com.google.android.material.card.MaterialCardView>
-
-            <!-- Interaction -->
-
             <!-- Notifications -->
             <com.google.android.material.card.MaterialCardView
                 android:layout_width="match_parent"
@@ -316,50 +271,6 @@
                             android:inputType="none" />
 
                     </com.google.android.material.textfield.TextInputLayout>
-
-                </LinearLayout>
-
-            </com.google.android.material.card.MaterialCardView>
-
-            <!-- TTS -->
-            <com.google.android.material.card.MaterialCardView
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="16dp"
-                app:cardBackgroundColor="@color/gbx_bg1"
-                app:cardCornerRadius="12dp"
-                app:cardElevation="0dp">
-
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    android:padding="16dp">
-
-                    <TextView
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="TTS"
-                        android:textColor="@color/gbx_orange"
-                        android:textSize="16sp"
-                        android:textStyle="bold"
-                        android:layout_marginBottom="16dp" />
-
-                    <TextView
-                        android:id="@+id/lblTtsSpeed"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="TTS speed: 1.0"
-                        android:textColor="@color/gbx_fg"
-                        android:textSize="14sp" />
-
-                    <SeekBar
-                        android:id="@+id/seekTtsSpeed"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:max="15"
-                        android:progress="5"
-                        android:layout_marginTop="4dp" />
 
                 </LinearLayout>
 

@@ -10,25 +10,19 @@ object AppConfig {
     private const val KEY_API_KEY = "api_key"
     private const val KEY_DEVICE_ID = "device_id"
     private const val KEY_MODEL = "model"
-    private const val KEY_SIDELOAD_ENABLED = "sideload_enabled"
     private const val KEY_MOUSE_SENSITIVITY_X = "mouse_sensitivity_x"
     private const val KEY_MOUSE_SENSITIVITY_Y = "mouse_sensitivity_y"
     private const val KEY_GLASSES_SERIAL = "glasses_serial"
     private const val KEY_GLASSES_BRIGHTNESS = "glasses_brightness"
     private const val KEY_GLASSES_SCREEN_TIMEOUT = "glasses_screen_timeout"
     private const val KEY_GLASSES_POWER_TIMEOUT = "glasses_power_timeout"
-    private const val KEY_GLASSES_SOUND_EFFECT = "glasses_sound_effect"
     private const val KEY_GLASSES_NOTIFICATION_SOUND = "glasses_notification_sound"
     private const val KEY_GLASSES_NOTIFICATION_DURATION = "glasses_notification_duration"
-    private const val KEY_GLASSES_TTS_SPEED = "glasses_tts_speed"
     private const val KEY_GLASSES_WAKEWORD_ENABLED = "glasses_wakeword_enabled"
     private const val KEY_GLASSES_MAC = "glasses_mac"
-    private const val KEY_GLASSES_SOCKET_UUID = "glasses_socket_uuid"
     private const val KEY_GLASSES_DEVICE_NAME = "glasses_device_name"
     private const val KEY_GLASSES_ADB_ENABLED = "glasses_adb_enabled"
     private const val KEY_DISPLAY_POSITION_Y = "display_position_y"
-    private const val KEY_OPEN_AFTER_INSTALL = "open_after_install"
-    private const val KEY_OPEN_CLOSE_AFTER_INSTALL = "open_close_after_install"
     private const val KEY_AUDIO_BITRATE = "audio_bitrate"
     private const val KEY_AUDIO_RELAY_DESIRED = "audio_relay_desired"
     private const val KEY_VIDEO_RESOLUTION = "video_resolution"
@@ -211,13 +205,6 @@ object AppConfig {
         prefs(context).edit().putString(KEY_MAP_PROVIDER, provider).apply()
     }
 
-    fun getSideloadEnabled(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_SIDELOAD_ENABLED, false)
-
-    fun setSideloadEnabled(context: Context, enabled: Boolean) {
-        prefs(context).edit().putBoolean(KEY_SIDELOAD_ENABLED, enabled).apply()
-    }
-
     fun getGlassesSerial(context: Context): String =
         prefs(context).getString(KEY_GLASSES_SERIAL, "") ?: ""
 
@@ -282,13 +269,6 @@ object AppConfig {
         return v.coerceIn(1, 1440)
     }
 
-    fun getGlassesSoundEffect(context: Context): String =
-        prefs(context).getString(KEY_GLASSES_SOUND_EFFECT, "") ?: ""
-
-    fun setGlassesSoundEffect(context: Context, value: String) {
-        prefs(context).edit().putString(KEY_GLASSES_SOUND_EFFECT, value).apply()
-    }
-
     fun getGlassesNotificationSound(context: Context): String =
         prefs(context).getString(KEY_GLASSES_NOTIFICATION_SOUND, "") ?: ""
 
@@ -303,12 +283,6 @@ object AppConfig {
         prefs(context).edit().putString(KEY_GLASSES_NOTIFICATION_DURATION, value).apply()
     }
 
-    fun getGlassesTtsSpeed(context: Context): String =
-        prefs(context).getString(KEY_GLASSES_TTS_SPEED, "") ?: ""
-
-    fun setGlassesTtsSpeed(context: Context, value: String) {
-        prefs(context).edit().putString(KEY_GLASSES_TTS_SPEED, value).apply()
-    }
 
     fun getGlassesWakewordEnabled(context: Context): Boolean =
         prefs(context).getBoolean(KEY_GLASSES_WAKEWORD_ENABLED, false)
@@ -322,13 +296,6 @@ object AppConfig {
 
     fun setGlassesMac(context: Context, mac: String) {
         prefs(context).edit().putString(KEY_GLASSES_MAC, mac).apply()
-    }
-
-    fun getGlassesSocketUuid(context: Context): String =
-        prefs(context).getString(KEY_GLASSES_SOCKET_UUID, "") ?: ""
-
-    fun setGlassesSocketUuid(context: Context, uuid: String) {
-        prefs(context).edit().putString(KEY_GLASSES_SOCKET_UUID, uuid).apply()
     }
 
     fun getGlassesDeviceName(context: Context): String =
@@ -350,20 +317,6 @@ object AppConfig {
 
     fun setDisplayPositionY(context: Context, y: Float) {
         prefs(context).edit().putFloat(KEY_DISPLAY_POSITION_Y, y).apply()
-    }
-
-    fun getOpenAfterInstall(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_OPEN_AFTER_INSTALL, false)
-
-    fun setOpenAfterInstall(context: Context, enabled: Boolean) {
-        prefs(context).edit().putBoolean(KEY_OPEN_AFTER_INSTALL, enabled).apply()
-    }
-
-    fun getOpenCloseAfterInstall(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_OPEN_CLOSE_AFTER_INSTALL, false)
-
-    fun setOpenCloseAfterInstall(context: Context, enabled: Boolean) {
-        prefs(context).edit().putBoolean(KEY_OPEN_CLOSE_AFTER_INSTALL, enabled).apply()
     }
 
     fun getAudioBitrate(context: Context): Int =

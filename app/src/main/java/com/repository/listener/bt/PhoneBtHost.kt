@@ -8,10 +8,6 @@ import android.os.Looper
 import com.repository.listener.config.AppConfig
 import com.repository.listener.service.ListenerService
 import com.repository.listener.util.LogCollector
-import com.rokid.cxr.client.extend.CxrApi
-import com.rokid.cxr.client.extend.callbacks.ApkStatusCallback
-import com.rokid.cxr.client.extend.callbacks.WifiHotStatusCallback
-import com.rokid.cxr.client.extend.infos.RKAppInfo
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,20 +30,16 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * High-level BT host for glasses communication.
  *
- * Messaging uses GlassesRfcommClient (direct RFCOMM, framed).
- * CxrApi is retained for non-messaging features: WiFi P2P hotspot (file sync),
- * Rokid APK launch/stop, and Rokid audio scene/codec control.
+ * Messaging uses GlassesRfcommClient (direct RFCOMM, framed). The glasses listener is
+ * activated warm via CH_ACTIVATE and cold-started via the 0x07 BLE wake event.
  */
 class PhoneBtHost(private val context: Context) {
 
     companion object {
         private const val TAG = "PhoneBtHost"
         private const val RETRY_INTERVAL_MS = 5000L
-        /** Max time a CONNECTING state can linger without any incoming RFCOMM frame before we
-         *  conclude the attempt is zombied and reset it. Normal attempts complete in <5s; 30s
-         *  gives slow BT stacks breathing room without making the UI feel dead. */
-        private const val STALE_CONNECTING_MS = 30_000L
-        private const val MAX_CACHED_FAILURES = 3
+        /** Bonded-but-RFCOMM-down cycles before we presume the listener is dead and cold-start it. */
+        private const val COLD_START_AFTER_FAILURES = 2
         private const val MAX_CAPS_CHARS = 10_000  // Safe limit: worst-case 3 bytes/char in JNI modified UTF-8
     }
 
@@ -87,8 +79,13 @@ class PhoneBtHost(private val context: Context) {
     /** In-flight ping deferreds keyed by requestId. Resolved by onBlePong handler. */
     private val pendingPings = ConcurrentHashMap<Int, CompletableDeferred<Boolean>>()
 
-    /** 5-minute background reachability ticker job. Started in ensureRfcommClientStarted. */
-    private var reachabilityTickerJob: Job? = null
+    /**
+     * In-flight device-command deferreds keyed by requestId. Resolved when the glasses
+     * reply over CH_COMMAND with ["command_result", requestId, resultJson] (handled in
+     * [handleCommandFromGlasses]). Mirrors [pendingPings].
+     */
+    private val pendingCommands = ConcurrentHashMap<String, CompletableDeferred<String>>()
+    private val deviceCommandIdSeq = AtomicLong(0)
 
     /**
      * GlassesReachability is the SOLE writer of [ListenerService.glassesConnected] and the
@@ -102,25 +99,55 @@ class PhoneBtHost(private val context: Context) {
     private inner class GlassesReachability {
         @Volatile private var state: State = State.Unknown
 
+        val currentState: State get() = state
+
         /** True iff a confirm-ping is currently outstanding (armed by a timeout or RFCOMM drop). */
         @Volatile private var confirmInFlight: Boolean = false
 
+        /**
+         * Monotonic generation, bumped whenever the confirm state is cleared (any proof of
+         * life: pong/hello/rfcomm-connect/inbound-frame) OR a new confirm-ping is armed. A
+         * confirm-ping coroutine captures the generation at arm time; when its ping times out it
+         * is only authoritative if the generation is unchanged. This prevents a stale confirm
+         * timeout from spuriously flipping Unreachable (or re-arming) after a newer proof of life
+         * already promoted us back to Reachable.
+         */
+        private var confirmGeneration: Long = 0
+
+        /** Clear any in-flight confirm and invalidate its pending timeout. */
+        private fun clearConfirm() {
+            confirmInFlight = false
+            confirmGeneration++
+        }
+
         @Synchronized
         fun onBlePong() {
-            confirmInFlight = false
+            clearConfirm()
             transition(State.Reachable, "ble_pong")
         }
 
         @Synchronized
         fun onBleHello() {
-            confirmInFlight = false
+            clearConfirm()
             transition(State.Reachable, "ble_hello")
         }
 
         @Synchronized
         fun onRfcommConnected() {
-            confirmInFlight = false
+            clearConfirm()
             transition(State.Reachable, "rfcomm_connected")
+        }
+
+        /**
+         * Any inbound RFCOMM frame from the glasses is hard proof of life. Use this to
+         * recover from a stale Unreachable that can occur when a ping timed out (e.g. during
+         * a glasses reboot) but the RFCOMM socket never observed a drop -- so onRfcommConnected
+         * never re-fired.
+         */
+        @Synchronized
+        fun onProofOfLife() {
+            clearConfirm()
+            transition(State.Reachable, "rfcomm_inbound")
         }
 
         @Synchronized
@@ -130,28 +157,61 @@ class PhoneBtHost(private val context: Context) {
             armConfirmPing("rfcomm_disconnected")
         }
 
+        /**
+         * The BLE wake link (the steady-state idle channel) went down. That is a strong
+         * signal the glasses BT stack is gone (reboot, range loss, power off), but BLE
+         * also bounces transiently, so debounce via a confirm-ping rather than flipping
+         * Unreachable immediately. If the confirm-ping fails, [onConfirmTimeout] flips us
+         * Unreachable. This is what makes "any BT stack down => debounced Disconnected".
+         */
+        @Synchronized
+        fun onBleLinkDown() {
+            armConfirmPing("ble_link_down")
+        }
+
+        /**
+         * A bare ping (BLE-up probe or the periodic safety ping) timed out while we believed we
+         * were Reachable and no confirm is outstanding -- arm a confirm-ping to debounce.
+         */
         @Synchronized
         fun onPingTimeout() {
             if (state == State.Reachable && !confirmInFlight) {
-                // First missed ping while we believed Reachable -- arm a confirm-ping.
                 armConfirmPing("ping_timeout")
+            }
+            // If a confirm is already in flight, its own [onConfirmTimeout] decides -- don't
+            // double-act here.
+        }
+
+        /**
+         * Result of a confirm-ping that was armed at [generation]. Only authoritative if no
+         * proof of life or newer confirm has bumped the generation since. [pong] is false on
+         * timeout. On an authoritative timeout we flip Unreachable.
+         */
+        @Synchronized
+        fun onConfirmTimeout(generation: Long) {
+            if (generation != confirmGeneration || !confirmInFlight) {
+                // A newer proof-of-life / confirm superseded this one -- ignore the stale timeout.
                 return
             }
-            // Confirm-ping also timed out (or we were already Unreachable/Unknown).
-            // Flip Unreachable.
             confirmInFlight = false
-            transition(State.Unreachable, "ping_timeout_confirm")
+            transition(State.Unreachable, "confirm_ping_failed")
         }
 
         private fun armConfirmPing(reason: String) {
             if (confirmInFlight) return
             confirmInFlight = true
-            log("Reachability: arming confirm-ping ($reason)")
+            confirmGeneration++
+            val generation = confirmGeneration
+            log("Reachability: arming confirm-ping ($reason, gen=$generation)")
             scope.launch {
                 // Brief settle delay before the confirm-ping so we don't race a fresh
                 // RFCOMM reconnect.
                 delay(500)
-                pingGlasses(timeoutMs = 1500)
+                // A successful pong resolves via onBlePong (clears confirm). If it times out,
+                // pingGlasses returns false and we adjudicate against the captured generation
+                // (do NOT let pingGlasses re-enter onPingTimeout -- this IS the confirm).
+                val pong = pingGlasses(timeoutMs = 1500, notifyReachabilityOnTimeout = false)
+                if (!pong) onConfirmTimeout(generation)
             }
         }
 
@@ -188,11 +248,37 @@ class PhoneBtHost(private val context: Context) {
     private val reachability = GlassesReachability()
 
     /**
+     * Single source of truth for glasses connectivity (mirrors the SOLE writer of
+     * [ListenerService.glassesConnected]). True iff the reachability machine is in
+     * Reachable.
+     */
+    val isReachable: Boolean
+        get() = reachability.currentState == State.Reachable
+
+    /**
+     * Connection phase for the HTTP status endpoint / UI:
+     * - "connected"     -- reachability machine in Reachable
+     * - "connecting"    -- RFCOMM socket up but not yet promoted, or an attempt in flight
+     * - "not_connected" -- otherwise
+     */
+    fun glassesConnectionPhase(): String = when {
+        reachability.currentState == State.Reachable -> "connected"
+        rfcommConnected || ListenerService.glassesConnecting -> "connecting"
+        else -> "not_connected"
+    }
+
+    /**
      * Send one BLE_PING and wait up to [timeoutMs] for the matching BLE_PONG.
      * Returns true on pong, false on timeout or failure to send. On timeout the
      * reachability state machine is notified.
      */
-    suspend fun pingGlasses(timeoutMs: Long = 1500): Boolean {
+    /**
+     * Send a BLE ping and await a pong. [notifyReachabilityOnTimeout] is true for a bare
+     * liveness probe (BLE-up / safety ping) which should debounce via reachability.onPingTimeout;
+     * false for the reachability machine's own confirm-ping, which adjudicates the timeout itself
+     * (via the generation guard) and must NOT re-enter onPingTimeout.
+     */
+    suspend fun pingGlasses(timeoutMs: Long = 1500, notifyReachabilityOnTimeout: Boolean = true): Boolean {
         val id = nextRequestId()
         val deferred = CompletableDeferred<Boolean>()
         pendingPings[id] = deferred
@@ -204,16 +290,19 @@ class PhoneBtHost(private val context: Context) {
             withTimeout(timeoutMs) { deferred.await() }
         } catch (e: TimeoutCancellationException) {
             pendingPings.remove(id)
-            reachability.onPingTimeout()
+            if (notifyReachabilityOnTimeout) reachability.onPingTimeout()
             false
         }
     }
 
     /**
-     * Run [action] only if the glasses are reachable (verified via a fresh BLE ping).
-     * Calls [onUnreachable] on the main thread otherwise. Acquires + releases the
-     * bt-manager active session for the duration of [action] so RFCOMM keep-alive
-     * stays armed during user-driven workflows.
+     * Run [action] only if the glasses are reachable. If the RFCOMM data link is already up
+     * that is hard proof of life -- proceed without a BLE ping (the BLE ping is only a wake
+     * mechanism for when RFCOMM is idle/down, and it fails outright when GATT discovery hasn't
+     * cached the RX characteristic, even though messaging works fine over RFCOMM). Otherwise
+     * fall back to a fresh BLE ping. Calls [onUnreachable] on the main thread if neither holds.
+     * Acquires + releases the bt-manager active session for the duration of [action] so RFCOMM
+     * keep-alive stays armed during user-driven workflows.
      */
     fun runWithGlasses(
         timeoutMs: Long = 1500,
@@ -222,7 +311,7 @@ class PhoneBtHost(private val context: Context) {
         action: suspend () -> Unit,
     ): Job {
         return scope.launch {
-            if (!pingGlasses(timeoutMs)) {
+            if (!rfcommConnected && !pingGlasses(timeoutMs)) {
                 withContext(Dispatchers.Main) { onUnreachable() }
                 return@launch
             }
@@ -241,8 +330,13 @@ class PhoneBtHost(private val context: Context) {
 
     @Volatile
     private var autoConnectPending = false
-    private var cachedReconnectFailures = 0
-    private var rfcommReconnectFailures = 0
+
+    /**
+     * Consecutive bonded-but-RFCOMM-down reconnect cycles. After
+     * [COLD_START_AFTER_FAILURES] of these the listener process is presumed dead
+     * (force-stopped/OOM), so we cold-start it via a 0x07 BLE wake to bt-manager.
+     */
+    private var coldStartFailures = 0
     private var pairModeActive = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private val reconnectRunnable = Runnable { startScanning() }
@@ -351,86 +445,33 @@ class PhoneBtHost(private val context: Context) {
             deviceFound = { device ->
                 log("Device found: ${device.name ?: device.address}")
                 handleDeviceFound(device)
-            },
-            onConnectionStateChanged = { state ->
-                log("BT connection state: $state")
-                when (state) {
-                    BluetoothHelper.ConnectionState.CONNECTED -> {
-                        // CXR-M connected (used for WiFi hotspot / apps). Messaging uses rfcommClient.
-                        log("CXR-M connected (for WiFi hotspot/app mgmt)")
-                        ensureRfcommClientStarted()
-                    }
-                    BluetoothHelper.ConnectionState.NOT_CONNECTED -> {
-                        if (hotspotInfo != null) disableHotspot()
-                        autoConnectPending = false
-                        cachedReconnectFailures++
-                        if (cachedReconnectFailures >= MAX_CACHED_FAILURES) {
-                            log("Cached reconnect failed $MAX_CACHED_FAILURES times (keeping MAC+UUID, only cleared on re-pair)")
-                            cachedReconnectFailures = 0
-                        }
-                        // Messaging lives on RFCOMM (rfcommClient), not on CXR-M GATT. If GATT
-                        // drops but the RFCOMM socket is still alive, user-visible state is
-                        // "connected" -- only fire onGlassesDisconnected when RFCOMM is also
-                        // down. Otherwise the UI flashes "Disconnected" during normal GATT
-                        // bounces while messaging keeps working.
-                        if (!rfcommConnected) {
-                            listener?.onGlassesDisconnected()
-                        } else {
-                            log("GATT NOT_CONNECTED but RFCOMM alive; UI stays connected")
-                        }
-                        scheduleRetry()
-                    }
-                    else -> {}
-                }
             }
         ).also {
             it.logCallback = { msg -> logCallback?.invoke(msg) }
             it.onGlassesIdentified = { device, classicMac ->
-                // BLE scan positively identified our glasses via REPO magic.
-                // Service data contains the classic BT MAC -- use it directly
-                // for RFCOMM without GATT discovery.
+                // BLE scan positively identified our glasses via REPO magic. The data link
+                // is the RFCOMM message relay (dialed by bond on a fixed MESSAGE_UUID) plus
+                // the BLE wake link -- no GATT/UUID discovery. Bond (RFCOMM requires it),
+                // record the classic MAC, then kick the relay.
                 if (!autoConnectPending && !rfcommConnected) {
                     val isBogus = classicMac == null ||
                         classicMac == "00:00:00:00:00:00" ||
                         classicMac == "02:00:00:00:00:00"
-                    if (isBogus) {
-                        log("REPO glasses identified but MAC is bogus ($classicMac) -- trying GATT")
-                        autoConnectPending = true
-                        pairModeActive = false
-                        val serial = AppConfig.getGlassesSerial(context).ifEmpty { "auto" }
-                        bluetoothHelper.initDevice(device, serial)
-                    } else {
-                        log("REPO glasses identified -- classic MAC=$classicMac, bonding first then RFCOMM")
-                        autoConnectPending = true
-                        pairModeActive = false
-                        AppConfig.setGlassesMac(context, classicMac)
-                        AppConfig.setGlassesSerial(context, "auto")
-                        // Do NOT seed the CXR socket UUID here. The CXR-M control
-                        // channel (CxrApi.connectBluetooth) terminates at the glasses
-                        // CXRService, which listens on a per-session random serviceRecord
-                        // UUID advertised over the Rokid GATT characteristic (9301).
-                        // Seeding the message-relay UUID would make connectBluetooth dial
-                        // the MessageRelay socket and corrupt its frame parser. The CXR
-                        // socket UUID is discovered and cached only via GATT (initDevice).
-                        // The message relay (GlassesRfcommClient) dials MESSAGE_UUID
-                        // directly using the bonded MAC and does not need this cache.
-                        // Bond first -- RFCOMM requires an active bond. The RFCOMM
-                        // connect is deferred to the bond-complete callback or next
-                        // retry cycle (5s) which will find cached credentials.
-                        try { device.createBond() } catch (_: Exception) {}
-                        ensureRfcommClientStarted()
-                        // Schedule RFCOMM after a short delay to let bonding start
-                        mainHandler.postDelayed({
-                            if (!rfcommConnected) {
-                                rfcommClient.requestImmediateReconnect("repo_ble_bonded")
-                            }
-                        }, 3000)
-                        // Run GATT discovery to obtain the real CXR serviceRecord UUID
-                        // for the CXR-M control session (settings, openApp, audio, WiFi P2P).
-                        // This caches the correct dynamic UUID via onConnectionInfo.
-                        val serial = AppConfig.getGlassesSerial(context).ifEmpty { "auto" }
-                        bluetoothHelper.initDevice(device, serial)
+                    autoConnectPending = true
+                    pairModeActive = false
+                    if (!isBogus) {
+                        AppConfig.setGlassesMac(context, classicMac!!)
                     }
+                    AppConfig.setGlassesSerial(context, "auto")
+                    // Bond first -- RFCOMM requires an active bond. The connect is deferred
+                    // to the bond-complete callback or the next retry cycle.
+                    try { device.createBond() } catch (_: Exception) {}
+                    ensureRfcommClientStarted()
+                    mainHandler.postDelayed({
+                        if (!rfcommConnected) {
+                            rfcommClient.requestImmediateReconnect("repo_ble_bonded")
+                        }
+                    }, 3000)
                 }
             }
         }
@@ -439,171 +480,96 @@ class PhoneBtHost(private val context: Context) {
     val isConnected: Boolean
         get() = rfcommConnected
 
-    data class HotspotInfo(
-        val ssid: String,
-        val password: String,
-        val ip: String,
-        val securityType: Int
-    )
-
-    @Volatile
-    var hotspotInfo: HotspotInfo? = null
-        private set
-
-    fun enableHotspot(onResult: (HotspotInfo?) -> Unit) {
-        if (!isConnected) {
-            log("enableHotspot: not connected")
-            onResult(null)
-            return
+    /**
+     * Count one bonded-but-RFCOMM-down reconnect cycle. Once we cross
+     * [COLD_START_AFTER_FAILURES] the glasses listener process is presumed dead
+     * (force-stopped / OOM-killed -- START_STICKY won't bring those back), so push a
+     * 0x07 LAUNCH_LISTENER over BLE for bt-manager to startForegroundService it, then
+     * let the normal RFCOMM reconnect re-attach. The counter resets on a successful
+     * RFCOMM connect (onConnected).
+     */
+    private fun maybeColdStartGlassesListener(reason: String) {
+        coldStartFailures++
+        if (coldStartFailures < COLD_START_AFTER_FAILURES) return
+        if (bleWake.sendLaunchListener()) {
+            log("Cold-start: sent 0x07 LAUNCH_LISTENER after $coldStartFailures failed cycles ($reason)")
+        } else {
+            log("Cold-start: 0x07 LAUNCH_LISTENER not sent (BLE wake link down) ($reason)")
         }
-        try {
-            log("enableHotspot: calling initWifiHot...")
-            val result = CxrApi.getInstance().initWifiHot(object : WifiHotStatusCallback {
-                override fun onWifiHotAvailable(ssid: String?, password: String?, ip: String?, securityType: Int) {
-                    log("Hotspot available: SSID=$ssid IP=$ip security=$securityType")
-                    val info = if (ssid != null && password != null && ip != null) {
-                        HotspotInfo(ssid, password, ip, securityType).also { hotspotInfo = it }
-                    } else null
-                    onResult(info)
-                }
-            })
-            log("enableHotspot: initWifiHot returned $result")
-            if (result != null && result.name != "REQUEST_SUCCEED") {
-                log("enableHotspot: initWifiHot failed with $result")
-                onResult(null)
-            }
-        } catch (e: Exception) {
-            log("enableHotspot failed: ${e.message}")
-            onResult(null)
-        }
-    }
-
-    fun disableHotspot() {
-        log("disableHotspot: calling deinitWifiHot...")
-        try {
-            CxrApi.getInstance().deinitWifiHot()
-        } catch (_: Exception) {}
-        hotspotInfo = null
+        // Throttle: re-arm only after another full window of failures.
+        coldStartFailures = 0
     }
 
     fun startScanning() {
         ensureRfcommClientStarted()
 
-        // Already connected -- the 5s retry timer must not demote the state machine by
-        // kicking reconnectFromCache. Without this guard the UI oscillates CONNECTED ->
-        // CONNECTING every 5s and shows "BT disconnected" at the trough.
+        // Already connected -- the 5s watchdog must not churn the link.
         if (rfcommConnected) {
             log("RFCOMM already connected, skipping reconnect scan")
             scheduleRetry()
             return
         }
-        if (bluetoothHelper.connectionState == BluetoothHelper.ConnectionState.CONNECTED) {
-            // CXR-M reports connected but RFCOMM isn't up yet -- kick the RFCOMM
-            // reconnect signal so the connect thread attempts immediately instead of
-            // waiting for an external BLE wake or outbound send that may never come.
-            rfcommReconnectFailures++
-            if (rfcommReconnectFailures > MAX_CACHED_FAILURES) {
-                // CXR-M state is stale -- glasses are likely unreachable. Reset so the
-                // normal reconnect path with backoff takes over.
-                log("CXR-M CONNECTED but RFCOMM failed ${rfcommReconnectFailures - 1} times -- resetting stale CXR-M state")
-                rfcommReconnectFailures = 0
-                bluetoothHelper.resetConnectionState()
-            } else {
-                log("CXR-M connected but RFCOMM not (attempt $rfcommReconnectFailures) -- requesting immediate RFCOMM reconnect")
-                rfcommClient.requestImmediateReconnect("cxrm_connected_no_rfcomm")
-            }
-            scheduleRetry()
-            return
-        }
 
         log("Starting BT reconnect for glasses")
-
-        // If rfcommClient is already receiving frames, PhoneBtHost's relay listener would
-        // have force-promoted BluetoothHelper.connectionState to CONNECTED, which skips
-        // this code path. So anything we see as CONNECTING here is either (a) a fresh
-        // in-flight attempt (< stale threshold -- wait for it) or (b) a zombie where the
-        // callback never completed AND no data flows (> stale threshold -- reset + retry).
-        if (bluetoothHelper.connectionState == BluetoothHelper.ConnectionState.CONNECTING) {
-            val stuckMs = System.currentTimeMillis() - bluetoothHelper.connectionStateSince
-            if (stuckMs < STALE_CONNECTING_MS) {
-                log("Already connecting (${stuckMs}ms), skipping -- will retry")
-                scheduleRetry()
-                return
-            }
-            log("Stuck in CONNECTING for ${stuckMs}ms with no incoming traffic -- resetting zombie")
-            bluetoothHelper.resetConnectionState()
-        }
-
         autoConnectPending = false
 
         val cachedMac = AppConfig.getGlassesMac(context)
-        val cachedUuid = AppConfig.getGlassesSocketUuid(context)
-        val serial = AppConfig.getGlassesSerial(context)
 
         // Detect bogus MAC (Android returns 02:00:00:00:00:00 without LOCAL_MAC_ADDRESS permission)
         val isBogus = cachedMac == "02:00:00:00:00:00" || cachedMac == "00:00:00:00:00:00"
         if (isBogus && cachedMac.isNotEmpty()) {
             log("Bogus cached MAC ($cachedMac) -- clearing and re-pairing")
             AppConfig.setGlassesMac(context, "")
-            AppConfig.setGlassesSocketUuid(context, "")
         }
 
-        if (!isBogus && cachedMac.isNotEmpty() && cachedUuid.isNotEmpty() && serial.isNotEmpty()) {
-            log("Cached glasses info found (mac=$cachedMac) -- direct reconnect")
-            autoConnectPending = true
-            bluetoothHelper.reconnectFromCache(cachedMac, cachedUuid, serial)
+        // The data link is the RFCOMM message relay (GlassesRfcommClient): it dials a fixed
+        // MESSAGE_UUID and finds the glasses by bond, plus the BLE wake link. No GATT/UUID
+        // discovery. If the glasses are still bonded, kick the relay + map socket and ensure
+        // the BLE wake link is armed; cold-start the listener over 0x07 if it keeps failing.
+        val bondedGlasses = findBondedGlasses()
+        if (bondedGlasses != null) {
+            log("Glasses bonded (${bondedGlasses.address}) -- kicking RFCOMM message relay + map socket + BLE wake")
+            maybeColdStartGlassesListener("bonded")
+            rfcommClient.requestImmediateReconnect("bonded")
+            mapRfcommClient.requestImmediateReconnect("bonded")
+            ensureBleWakeStarted()
             scheduleRetry()
-            return
-        }
-
-        // No cache -- auto-start BLE discovery to (re)find the glasses.
-        // Self-healing: no manual intervention needed after bond loss.
-        // NON-destructive: never wipe cached credentials here. Credentials are
-        // only cleared by an explicit user repair (the Pair Mode button); a
-        // missing CXR socketUuid (e.g. GATT onConnectionInfo never landed) must
-        // not nuke the still-valid bonded MAC, which would kick the phone out of
-        // its own pairing with no user action.
-        // Guard: don't re-enter if already scanning (prevents 5s loop).
-        if (!pairModeActive) {
-            log("No cached credentials -- auto-starting BLE discovery (non-destructive)")
+        } else if (!pairModeActive) {
+            // Not bonded yet -- run BLE discovery to identify + bond our glasses.
+            log("No bonded glasses -- auto-starting BLE discovery")
             enterPairMode(clearCache = false)
         } else {
-            log("No cached credentials -- pair mode already active, waiting for discovery")
+            log("No bonded glasses -- pair mode already active, waiting for discovery")
             scheduleRetry()
         }
     }
 
     /**
-     * Enter pair mode: close all connections, start BLE discovery.
+     * Enter pair mode: start BLE discovery to identify + bond our glasses.
      *
-     * @param clearCache when true (the user-driven "Pair Mode" button), wipe the
-     *   cached MAC + socketUuid so GATT discovery runs fully fresh against a new
-     *   device. When false (automatic self-heal after a transient cache miss),
-     *   keep the cached credentials -- discovery re-finds the SAME bonded glasses
-     *   and re-populates any missing field without kicking the user out of an
-     *   otherwise-valid pairing.
+     * @param clearCache when true (the user-driven "Pair Mode" button), wipe the cached
+     *   MAC so discovery can bind to a different physical device. When false (automatic
+     *   self-heal), keep the cached MAC -- discovery re-finds the SAME bonded glasses.
      */
     fun enterPairMode(clearCache: Boolean = true) {
         log("=== ENTERING PAIR MODE (clearCache=$clearCache) ===")
         pairModeActive = true
         mainHandler.removeCallbacks(reconnectRunnable)
         autoConnectPending = false
-        cachedReconnectFailures = 0
 
-        // Disconnect existing connection
-        bluetoothHelper.resetConnectionState()
+        // Drop any stale connected-device identity.
+        bluetoothHelper.clearConnectedDevice()
 
         if (clearCache) {
-            // Explicit user repair: clear cached credentials so GATT discovery
-            // runs fresh (and can bind to a different physical device).
+            // Explicit user repair: clear the cached MAC so discovery can bind to a
+            // different physical device.
             AppConfig.setGlassesMac(context, "")
-            AppConfig.setGlassesSocketUuid(context, "")
             log("Cleared cached credentials, starting BLE discovery...")
         } else {
             log("Keeping cached credentials, starting BLE discovery...")
         }
 
-        // Start full BLE scan + GATT discovery
+        // Start BLE scan to identify + bond our glasses.
         bluetoothHelper.onPermissionsGranted()
         scheduleRetry()
     }
@@ -628,18 +594,19 @@ class PhoneBtHost(private val context: Context) {
     private fun handleDeviceFound(device: BluetoothDevice) {
         val name = device.name ?: return
         if (!name.startsWith("Glasses_")) return
-        if (bluetoothHelper.connectionState != BluetoothHelper.ConnectionState.NOT_CONNECTED) return
+        if (rfcommConnected) return
         if (autoConnectPending) return
 
-        val serial = AppConfig.getGlassesSerial(context)
-        if (serial.isEmpty()) {
-            log("Glasses device '$name' found but serial is empty -- waiting for Config. Retrying in ${RETRY_INTERVAL_MS}ms.")
-            return
-        }
-
         autoConnectPending = true
-        log("Auto-connecting to '$name' with serial '$serial'")
-        bluetoothHelper.initDevice(device, serial)
+        log("Auto-connecting to '$name' -- bonding + kicking RFCOMM relay")
+        AppConfig.setGlassesMac(context, device.address)
+        try { device.createBond() } catch (_: Exception) {}
+        ensureRfcommClientStarted()
+        mainHandler.postDelayed({
+            if (!rfcommConnected) {
+                rfcommClient.requestImmediateReconnect("device_found_bonded")
+            }
+        }, 3000)
     }
 
     private fun log(msg: String) {
@@ -663,16 +630,11 @@ class PhoneBtHost(private val context: Context) {
                 mainHandler.removeCallbacks(reconnectRunnable)
                 cancelCountdown()
                 autoConnectPending = false
-                cachedReconnectFailures = 0
-                rfcommReconnectFailures = 0
+                coldStartFailures = 0
                 pairModeActive = false
-                // The RFCOMM socket is up, so by definition we are CONNECTED. The GATT-
-                // discovery path that normally promotes BluetoothHelper.connectionState can
-                // leave us stuck in CONNECTING after an app force-stop or BT stack bounce
-                // (its callbacks don't re-fire on an already-open socket). Promote here
-                // directly so the UI + startScanning guard reflect reality.
+                // Record the connected-device identity for the UI / identity mirrors.
                 val cachedMac = AppConfig.getGlassesMac(context).takeIf { it.isNotEmpty() }
-                bluetoothHelper.forceConnected(deviceName, cachedMac)
+                bluetoothHelper.setConnectedDevice(deviceName, cachedMac)
                 installCustomCmdListener()
                 listener?.onGlassesConnected()
                 // Kick the classic-BT A2DP source -> sink connection so media
@@ -692,8 +654,6 @@ class PhoneBtHost(private val context: Context) {
                 mapRfcommClient.requestImmediateReconnect("control_connected")
                 // Reachability: RFCOMM up is hard proof of life.
                 reachability.onRfcommConnected()
-                // Start the 5-minute background reachability ticker if not already running.
-                ensureReachabilityTickerStarted()
             }
             override fun onDisconnected() {
                 log("RFCOMM disconnected from glasses")
@@ -704,7 +664,7 @@ class PhoneBtHost(private val context: Context) {
                 if (ttsSessionHeld.compareAndSet(true, false)) {
                     rfcommClient.clearActiveSession("tts_playback")
                 }
-                bluetoothHelper.resetConnectionState()
+                bluetoothHelper.clearConnectedDevice()
                 listener?.onGlassesDisconnected()
                 // Reachability debounces this -- one drop arms a confirm-ping rather
                 // than flipping Unreachable immediately.
@@ -761,6 +721,18 @@ class PhoneBtHost(private val context: Context) {
         }
         bleWake.setOnConnectionStateCallback { up ->
             log("BleWake: link state=${if (up) "UP" else "DOWN"}")
+            if (up) {
+                // The BLE wake link is the steady-state idle channel (RFCOMM is demand-opened
+                // and closed during idle). When BLE (re)connects -- e.g. after a glasses reboot
+                // -- probe liveness so a stale Unreachable (left by a ping that timed out while
+                // the glasses were down) recovers immediately instead of waiting up to 5 min
+                // for the next reachability ticker. A pong promotes reachability to Reachable.
+                scope.launch { pingGlasses(timeoutMs = 2_000) }
+            } else {
+                // BLE wake link dropped. Feed the reachability machine so a stack-down
+                // (reboot/range-loss/power-off) debounces to Disconnected via a confirm-ping.
+                reachability.onBleLinkDown()
+            }
         }
         bleWake.setOnPongCallback { requestId, rttMillis ->
             log("BleWake: rx PONG id=$requestId rtt=${rttMillis}ms")
@@ -772,21 +744,6 @@ class PhoneBtHost(private val context: Context) {
             reachability.onBleHello()
         }
         bleWake.start(dev)
-    }
-
-    /**
-     * Background reachability ticker. Once RFCOMM has come up at least once we keep
-     * pinging the glasses every 5 minutes regardless of RFCOMM state, so the
-     * reachability state machine has fresh evidence even during long idle stretches.
-     */
-    private fun ensureReachabilityTickerStarted() {
-        if (reachabilityTickerJob?.isActive == true) return
-        reachabilityTickerJob = scope.launch {
-            while (isActive) {
-                delay(300_000) // 5 minutes
-                pingGlasses(timeoutMs = 2_000)
-            }
-        }
     }
 
     private fun findBondedGlasses(): android.bluetooth.BluetoothDevice? {
@@ -806,16 +763,12 @@ class PhoneBtHost(private val context: Context) {
             rfcommClient.setRelayListener(object : RelayListener {
                 override fun onCustomCmd(cmd: String?, args: RelayCaps?) {
                     if (cmd == null || args == null) return
-                    // Any incoming RFCOMM frame is proof of a live connection. If the state
-                    // machine hasn't caught up (e.g. the initial onConnected callback was
-                    // missed during an app-restart race), force-promote now so reality
-                    // matches the UI.
-                    if (bluetoothHelper.connectionState != BluetoothHelper.ConnectionState.CONNECTED) {
-                        bluetoothHelper.forceConnected(
-                            bluetoothHelper.connectedDeviceName,
-                            bluetoothHelper.connectedDeviceMac ?: AppConfig.getGlassesMac(context).takeIf { it.isNotEmpty() },
-                        )
-                    }
+                    // Any incoming RFCOMM frame is hard proof of a live connection. Feed the
+                    // reachability state machine (sole writer of glassesConnected) so a stale
+                    // Unreachable -- e.g. left by a ping timeout during a glasses reboot where
+                    // the RFCOMM socket never observed a drop, or by restarting the phone app
+                    // over a still-live socket -- recovers immediately.
+                    reachability.onProofOfLife()
                     when (cmd) {
                         BtProtocol.CH_STATUS -> handleStatusFromGlasses(args)
                         BtProtocol.CH_STATE_SNAPSHOT -> handleStateSnapshotFromGlasses(args)
@@ -1233,6 +1186,8 @@ class PhoneBtHost(private val context: Context) {
                 val resultJson = args.at(2).getString()
                 rxByteCount.addAndGet(command.length.toLong() + requestId.length.toLong() + resultJson.length.toLong() + 16)
                 log("Glasses command result: requestId=$requestId")
+                // Resolve any awaiting sendDeviceCommand() caller first.
+                pendingCommands.remove(requestId)?.complete(resultJson)
                 onGlassesCommandResult?.invoke(requestId, JSONObject(resultJson))
                 return
             }
@@ -1631,6 +1586,41 @@ class PhoneBtHost(private val context: Context) {
         }
     }
 
+    /**
+     * Send a device command on CH_DEVICE_COMMAND and await the glasses' reply.
+     *
+     * The glasses dispatch onCommand(type, requestId, paramsJson) and reply via
+     * sendCommandResult(requestId, resultJson), which lands on CH_COMMAND as
+     * ["command_result", requestId, resultJson] and is completed in
+     * [handleCommandFromGlasses]. Returns the raw reply JSON string, or null on timeout.
+     */
+    suspend fun sendDeviceCommand(type: String, paramsJson: String = "{}", timeoutMs: Long = 8000): String? {
+        val requestId = "dc-${deviceCommandIdSeq.incrementAndGet()}-${System.currentTimeMillis()}"
+        val deferred = CompletableDeferred<String>()
+        pendingCommands[requestId] = deferred
+        try {
+            val caps = RelayCaps()
+            caps.write(type)
+            caps.write(requestId)
+            caps.write(paramsJson)
+            rfcommClient.send(BtProtocol.CH_DEVICE_COMMAND, *caps.asArray())
+            txByteCount.addAndGet(estimateCapsSize(type, requestId, paramsJson))
+            log("Device command sent (await): $type ($requestId)")
+        } catch (e: Exception) {
+            pendingCommands.remove(requestId)
+            log("Failed to send device command (await): ${e.message}")
+            return null
+        }
+        return try {
+            withTimeout(timeoutMs) { deferred.await() }
+        } catch (e: TimeoutCancellationException) {
+            log("Device command timed out: $type ($requestId)")
+            null
+        } finally {
+            pendingCommands.remove(requestId)
+        }
+    }
+
     // --- Lone mode (foreign-device proximity alarm) ---
     // The glasses own the dedup map + trusted set + overlay + alarm; these helpers drive its
     // lifecycle and feed the glasses the devices this phone scans. Glasses push the merged list
@@ -1667,126 +1657,31 @@ class PhoneBtHost(private val context: Context) {
     }
 
     /**
-     * Launch the glasses app via CXR-M openApp(). Centralizes the openApp logic.
-     */
-    fun ensureGlassesAppRunning(onSuccess: () -> Unit = {}, onFailure: () -> Unit = {}) {
-        try {
-            val appInfo = RKAppInfo(
-                "com.repository.glasses.listener",
-                "com.repository.glasses.listener.MainActivity"
-            )
-            CxrApi.getInstance().openApp(appInfo, object : ApkStatusCallback {
-                    override fun onOpenAppSucceed() {
-                        log("openApp succeeded")
-                        onSuccess()
-                    }
-                    override fun onOpenAppFailed() {
-                        log("openApp failed")
-                        onFailure()
-                    }
-                    override fun onUploadApkSucceed() {}
-                    override fun onUploadApkFailed() {}
-                    override fun onInstallApkSucceed() {}
-                    override fun onInstallApkFailed() {}
-                    override fun onUninstallApkSucceed() {}
-                    override fun onUninstallApkFailed() {}
-                }
-            )
-        } catch (e: Exception) {
-            log("ensureGlassesAppRunning failed: ${e.message}")
-            onFailure()
-        }
-    }
-
-    /**
-     * Stop the glasses app via CXR-M stopApp(). Kills the process; service restarts via START_STICKY.
-     */
-    fun stopGlassesApp(onResult: (Boolean) -> Unit = {}) {
-        try {
-            CxrApi.getInstance().stopApp("com.repository.glasses.listener", object : ApkStatusCallback {
-                override fun onOpenAppSucceed() {}
-                override fun onOpenAppFailed() {}
-                override fun onUploadApkSucceed() {}
-                override fun onUploadApkFailed() {}
-                override fun onInstallApkSucceed() {}
-                override fun onInstallApkFailed() {}
-                override fun onUninstallApkSucceed() {}
-                override fun onUninstallApkFailed() {}
-            })
-            log("stopApp called")
-            onResult(true)
-        } catch (e: Exception) {
-            log("stopGlassesApp failed: ${e.message}")
-            onResult(false)
-        }
-    }
-
-    /**
-     * Activate glasses with openApp() safety net.
-     * Fast path: if health monitor reports responsive, send activate directly.
-     * Slow path: call openApp() first, then send activate in callback.
-     * Timeout path: 3s safety timeout sends activate anyway.
+     * Activate the glasses listener.
+     * Warm path: if the health monitor reports the listener responsive (or RFCOMM is up),
+     * send CH_ACTIVATE directly.
+     * Cold path: the listener process is likely dead (force-stopped / OOM) -- send a 0x07
+     * LAUNCH_LISTENER BLE wake so bt-manager startForegroundService's it, kick the RFCOMM
+     * relay, and send CH_ACTIVATE once a frame proves it is back (best-effort: also send
+     * after a short delay).
      */
     fun activateWithEnsure(healthMonitor: GlassesHealthMonitor) {
-        if (healthMonitor.isResponsive) {
-            log("Glasses responsive - fast path activate")
+        if (healthMonitor.isResponsive || rfcommConnected) {
+            log("Glasses responsive - warm path activate (CH_ACTIVATE)")
             sendActivateCommand()
             return
         }
 
-        log("Glasses not responsive - launching via openApp")
-        val completed = AtomicBoolean(false)
-
-        val timeoutRunnable = Runnable {
-            if (completed.compareAndSet(false, true)) {
-                log("openApp timeout (3s) - sending activate anyway")
-                sendActivateCommand()
-            }
+        log("Glasses not responsive - cold-start via 0x07 LAUNCH_LISTENER")
+        if (bleWake.sendLaunchListener()) {
+            log("Cold-start: sent 0x07 LAUNCH_LISTENER")
+        } else {
+            log("Cold-start: 0x07 LAUNCH_LISTENER not sent (BLE wake link down)")
         }
-        mainHandler.postDelayed(timeoutRunnable, 3000)
-
-        ensureGlassesAppRunning(
-            onSuccess = {
-                if (completed.compareAndSet(false, true)) {
-                    mainHandler.removeCallbacks(timeoutRunnable)
-                    log("openApp succeeded - sending activate")
-                    sendActivateCommand()
-                }
-            },
-            onFailure = {
-                if (completed.compareAndSet(false, true)) {
-                    mainHandler.removeCallbacks(timeoutRunnable)
-                    log("openApp failed - sending activate anyway")
-                    sendActivateCommand()
-                }
-            }
-        )
-    }
-
-    fun requestGlassesAudioStream() {
-        // Force-reset any stale stream first. After glasses app restart, the old
-        // CXR-M stream stays "open" on phone side, delivering zeros. closeAudioRecord
-        // tears it down so the subsequent openAudioRecord creates a fresh stream and
-        // triggers a new onStartAudioStream callback.
-        try {
-            CxrApi.getInstance().closeAudioRecord("listener")
-            log("closeAudioRecord (pre-reset): ok")
-        } catch (_: Exception) {}
-
-        try {
-            // Codec 3 = Android platform audio (what Rokid uses for Android phones)
-            val status = CxrApi.getInstance().openAudioRecord(3, 0, "listener")
-            log("openAudioRecord(codec=3): $status")
-        } catch (e: Exception) {
-            log("openAudioRecord failed: ${e.message}")
-        }
-        // Also set speech scene via system-level command (Sys_ChangeAudioSceneId, not translation-only Trans_)
-        try {
-            val sceneStatus = CxrApi.getInstance().changeAudioSceneId(1, null)
-            log("changeAudioSceneId(1): $sceneStatus")
-        } catch (e: Exception) {
-            log("changeAudioSceneId failed: ${e.message}")
-        }
+        rfcommClient.requestImmediateReconnect("activate_cold_start")
+        // Send the activate once the relay is (re)established; also fire after a short
+        // safety delay so a missed reconnect callback does not strand the activation.
+        mainHandler.postDelayed({ sendActivateCommand() }, 3000)
     }
 
     fun sendCommand(type: String, requestId: String, paramsJson: String) {
@@ -2119,41 +2014,10 @@ class PhoneBtHost(private val context: Context) {
     }
 
     /**
-     * Push key-value settings to glasses via RKSettingsManager pipeline.
-     * Same mechanism as GlassesSettingsActivity uses for individual setting changes.
-     */
-    fun sendSettingsUpdate(vararg pairs: Pair<String, String>) {
-        try {
-            val caps = RelayCaps()
-            caps.write("Settings_Update")
-            val json = JSONArray().apply {
-                pairs.forEach { (key, value) ->
-                    put(JSONObject().apply {
-                        put("key", key)
-                        put("value", value)
-                    })
-                }
-            }.toString()
-            caps.write(json)
-            rfcommClient.send("Settings", *caps.asArray())
-            txByteCount.addAndGet(estimateCapsSize("Settings_Update", json))
-            log("Settings update sent: ${pairs.map { "${it.first}=${it.second}" }.joinToString(", ")}")
-        } catch (e: Exception) {
-            log("Failed to send settings update: ${e.message}")
-        }
-    }
-
-    /**
-     * Sync all saved display/system settings to glasses.
-     * Called on glasses connection to restore phone-authoritative settings
-     * that glasses lose on reboot/reconnect (they revert to Rokid OS defaults).
-     * Brightness and volume are NOT pushed -- glasses are authoritative for those.
-     */
-    /**
-     * Public entry point for callers that want to push the full current settings
-     * snapshot to glasses via the CH_SETTINGS JSON channel. Delegates to
-     * [syncAllSettings] using the host application context so brightness,
-     * screen-timeout, and power-timeout travel over the agreed contract.
+     * Sync all saved display/system settings to glasses via the CH_SETTINGS JSON channel
+     * (read by glasses-side GlassesConfig.applySettings). Called on glasses connection to restore
+     * phone-authoritative settings that glasses lose on reboot/reconnect. Brightness and volume
+     * are glasses-authoritative for those values but still pushed here for parity.
      */
     fun pushGlassesSettings() {
         syncAllSettings(context.applicationContext)
@@ -2162,27 +2026,11 @@ class PhoneBtHost(private val context: Context) {
     fun syncAllSettings(context: Context) {
         log("Syncing all saved settings to glasses")
 
-        // RKSettingsManager settings -- batched via sendSettingsUpdate.
-        // Brightness / screen-timeout / power-timeout are NOT sent here anymore;
-        // they ride on the CH_SETTINGS JSON payload below (agreed contract with
-        // the glasses-side worker).
         val notificationDuration = AppConfig.getGlassesNotificationDuration(context).ifEmpty { "5" }
-        val soundEffect = AppConfig.getGlassesSoundEffect(context)
         val notificationSound = AppConfig.getGlassesNotificationSound(context)
-        val ttsSpeed = AppConfig.getGlassesTtsSpeed(context)
 
-        val settingsPairs = mutableListOf<Pair<String, String>>()
-        settingsPairs.add("settings_msg_notification_display_duration" to notificationDuration)
-        if (soundEffect.isNotEmpty()) settingsPairs.add("settings_sound_effect" to soundEffect)
-        if (notificationSound.isNotEmpty()) settingsPairs.add("settings_msg_notification_sound_enabled" to notificationSound)
-        if (ttsSpeed.isNotEmpty()) settingsPairs.add("settings_local_tts_speed" to ttsSpeed)
-
-        if (settingsPairs.isNotEmpty()) {
-            sendSettingsUpdate(*settingsPairs.toTypedArray())
-        }
-
-        // App settings -- sent via CH_SETTINGS to GlassesConfig.
-        // Brightness / screen-timeout / power-timeout use the agreed Int keys.
+        // App settings -- sent via CH_SETTINGS to GlassesConfig.applySettings (the only live
+        // settings channel now that the CXR RKSettingsManager pipeline is gone).
         val normalizedY = AppConfig.getDisplayPositionY(context)
         val bottomMargin = ((1.0f - normalizedY) * 200).toInt()
         val appSettings = JSONObject().apply {
@@ -2197,27 +2045,23 @@ class PhoneBtHost(private val context: Context) {
         }
         sendSettings(appSettings.toString())
 
-        // Direct CxrApi settings (not routed through RKSettingsManager)
-        val cxr = CxrApi.getInstance()
-
-        // Rokid's built-in offline wakeword/assistant (settings_voice_control)
-        // must NEVER run -- speech detection is exclusively our pipeline. It
-        // defaults ON at boot, so force it OFF on every sync. "0" (any non-"open"
-        // value) disables it; never send "open". Idempotent.
-        try {
-            cxr.setVoiceCtrl("0")
-            log("Forced Rokid voice control OFF (setVoiceCtrl=0)")
-        } catch (e: Exception) {
-            log("Failed to force setVoiceCtrl(0): ${e.message}")
+        // Rokid's built-in offline wakeword/assistant must NEVER run -- speech
+        // detection is exclusively our pipeline. It defaults ON at boot, so force
+        // it OFF on every sync. The glasses-side voice_ctrl_off handler drives the
+        // AssistantSuppressor and persists the local setting; it re-applies on boot.
+        scope.launch {
+            val resp = sendDeviceCommand("voice_ctrl_off")
+            if (resp != null) {
+                log("Forced Rokid voice control OFF (voice_ctrl_off)")
+            } else {
+                log("voice_ctrl_off command got no reply (timeout)")
+            }
         }
     }
 
     fun release() {
-        if (hotspotInfo != null) disableHotspot()
         mainHandler.removeCallbacks(reconnectRunnable)
         cancelCountdown()
-        reachabilityTickerJob?.cancel()
-        reachabilityTickerJob = null
         scope.cancel()
         // Tear down both RFCOMM links so neither connect thread is leaked.
         rfcommClient.stop()
