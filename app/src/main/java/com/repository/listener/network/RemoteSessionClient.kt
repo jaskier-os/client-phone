@@ -14,6 +14,19 @@ import java.util.concurrent.TimeUnit
 data class SlashCommand(val name: String, val description: String)
 data class RemoteDirsResponse(val available: Boolean, val dirs: List<String>)
 data class RemoteSessionResponse(val sessionId: String, val workDir: String)
+data class ConversationInfo(
+    val sessionId: String,
+    val summary: String,
+    val lastModified: Long,
+    val customTitle: String? = null,
+    val firstPrompt: String? = null,
+    val gitBranch: String? = null,
+    val cwd: String? = null,
+    val createdAt: Long? = null
+) {
+    /** Best human label for a row: user title, else first prompt, else summary. */
+    val label: String get() = customTitle ?: firstPrompt ?: summary
+}
 data class LiveSession(
     val pid: Int,
     val workDir: String,
@@ -93,13 +106,18 @@ class RemoteSessionClient(
         })
     }
 
-    fun startSession(workDir: String, permissionMode: String?, callback: (Result<RemoteSessionResponse>) -> Unit) {
+    fun startSession(workDir: String, permissionMode: String?, sessionId: String? = null, callback: (Result<RemoteSessionResponse>) -> Unit) {
         val url = "$baseUrl/api/v1/remote-sessions/start"
         val body = JSONObject().apply {
             put("workDir", workDir)
             put("deviceId", deviceId)
             if (permissionMode != null) {
                 put("permissionMode", permissionMode)
+            }
+            // When resuming a prior conversation, pass its id so the CLI spawns
+            // with --resume instead of minting a fresh session.
+            if (sessionId != null) {
+                put("sessionId", sessionId)
             }
         }
         val request = Request.Builder()
@@ -317,6 +335,68 @@ class RemoteSessionClient(
                         handler.post { callback(Result.success(sessions)) }
                     } catch (e: Exception) {
                         LogCollector.e(TAG, "Parse listRcSessions failed: ${e.message}")
+                        handler.post { callback(Result.failure(e)) }
+                    }
+                }
+            }
+        })
+    }
+
+    // List resumable Claude Code conversations for a directory (sourced from the
+    // remote-session CLI's on-disk transcripts via pc-agent). Used by the resume
+    // picker at launch and the in-session /resume command.
+    fun listConversations(workDir: String, limit: Int = 50, offset: Int = 0, callback: (Result<List<ConversationInfo>>) -> Unit) {
+        val params = mutableListOf<String>()
+        params.add("workDir=${java.net.URLEncoder.encode(workDir, "UTF-8")}")
+        params.add("limit=$limit")
+        params.add("offset=$offset")
+        val url = "$baseUrl/api/v1/remote-sessions/conversations?${params.joinToString("&")}"
+        val request = Request.Builder()
+            .url(url)
+            .addHeader("x-api-key", apiKey)
+            .get()
+            .build()
+
+        client.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: IOException) {
+                LogCollector.e(TAG, "listConversations failed: ${e.message}")
+                handler.post { callback(Result.failure(e)) }
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                response.use { resp ->
+                    if (!resp.isSuccessful) {
+                        val errBody = resp.body?.string() ?: ""
+                        val msg = try {
+                            JSONObject(errBody).optJSONObject("error")?.optString("message") ?: "HTTP ${resp.code}"
+                        } catch (_: Exception) {
+                            "HTTP ${resp.code}"
+                        }
+                        handler.post { callback(Result.failure(IOException(msg))) }
+                        return
+                    }
+                    try {
+                        val json = JSONObject(resp.body!!.string())
+                        val arr = json.optJSONArray("sessions")
+                        val sessions = mutableListOf<ConversationInfo>()
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val obj = arr.getJSONObject(i)
+                                sessions.add(ConversationInfo(
+                                    sessionId = obj.getString("sessionId"),
+                                    summary = obj.optString("summary", ""),
+                                    lastModified = obj.optLong("lastModified", 0L),
+                                    customTitle = obj.optString("customTitle", null).takeIf { !it.isNullOrEmpty() },
+                                    firstPrompt = obj.optString("firstPrompt", null).takeIf { !it.isNullOrEmpty() },
+                                    gitBranch = obj.optString("gitBranch", null).takeIf { !it.isNullOrEmpty() },
+                                    cwd = obj.optString("cwd", null).takeIf { !it.isNullOrEmpty() },
+                                    createdAt = if (obj.has("createdAt")) obj.optLong("createdAt") else null
+                                ))
+                            }
+                        }
+                        handler.post { callback(Result.success(sessions)) }
+                    } catch (e: Exception) {
+                        LogCollector.e(TAG, "Parse listConversations failed: ${e.message}")
                         handler.post { callback(Result.failure(e)) }
                     }
                 }

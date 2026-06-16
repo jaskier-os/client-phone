@@ -1367,6 +1367,60 @@ class RemoteControlActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * In-session /resume: list prior conversations for this folder and let the
+     * user switch to one. sessionId is fixed for an activity's lifetime, so
+     * resuming a different conversation relaunches the activity with the new
+     * EXTRA_SESSION_ID; startSession(sessionId) makes pc-agent spawn --resume,
+     * and the fresh activity backfills the chosen conversation's transcript.
+     */
+    internal fun showResumePicker() {
+        val wsUrl = AppConfig.getOrchestratorUrl(this)
+        val rcApiKey = AppConfig.getApiKey(this)
+        val rcDeviceId = AppConfig.getDeviceId(this)
+        val client = RemoteSessionClient(wsUrl, rcApiKey, rcDeviceId)
+
+        val picker = com.repository.listener.ui.ConversationPickerBottomSheet().apply {
+            this.workDir = this@RemoteControlActivity.workDir
+            isLoading = true
+            onNewConversation = { startResumedSession(client, null) }
+            onConversationSelected = { conv -> startResumedSession(client, conv.sessionId) }
+        }
+        picker.show(supportFragmentManager, "resume_picker")
+
+        client.listConversations(workDir) { result ->
+            result.onSuccess { list -> picker.showConversations(list) }
+            result.onFailure { err -> picker.showError("Failed to load conversations: ${err.message}") }
+        }
+    }
+
+    private fun startResumedSession(client: RemoteSessionClient, resumeSessionId: String?) {
+        // No-op if resuming the conversation already open in this activity.
+        if (resumeSessionId != null && resumeSessionId == sessionId) return
+        client.startSession(workDir, currentMode, resumeSessionId) { result ->
+            result.onSuccess { response ->
+                val intent = Intent(this, RemoteControlActivity::class.java).apply {
+                    putExtra(EXTRA_SESSION_ID, response.sessionId)
+                    putExtra(EXTRA_WORK_DIR, response.workDir)
+                    putExtra(EXTRA_PERMISSION_MODE, currentMode)
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+                }
+                startActivity(intent)
+                finish()
+            }
+            result.onFailure { err ->
+                LogCollector.e(TAG, "Resume failed: ${err.message}")
+                runOnUiThread {
+                    adapter.addMessage(RcMessage.SessionEvent(
+                        id = UUID.randomUUID().toString(),
+                        timestamp = System.currentTimeMillis(),
+                        event = "Resume failed: ${err.message}"
+                    ))
+                }
+            }
+        }
+    }
+
     internal fun showModePopup() {
         val popup = PopupMenu(this, modeSelector)
         popup.menu.add(0, 0, 0, "Default")

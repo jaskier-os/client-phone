@@ -86,7 +86,7 @@ object SlashCommandRegistry {
         register(ForwardCommand("review", "Review code changes"))
         register(ForwardCommand("diff", "Show diff of changes"))
         register(ForwardCommand("simplify", "Simplify selected code"))
-        register(ForwardCommand("resume", "Resume a previous task"))
+        register(ResumeCommand())
     }
 }
 
@@ -275,6 +275,18 @@ private class FilesCommand : SlashCommandHandler("files", "List files in context
         callback: (CommandResult) -> Unit
     ) {
         callback(CommandResult.ForwardToDesktop("/files"))
+    }
+}
+
+// --- Resume command (opens the conversation picker for this folder) ---
+
+private class ResumeCommand : SlashCommandHandler("resume", "Resume a previous conversation") {
+    override fun execute(
+        activity: RemoteControlActivity,
+        args: String,
+        callback: (CommandResult) -> Unit
+    ) {
+        callback(CommandResult.ShowDialog { act -> act.showResumePicker() })
     }
 }
 

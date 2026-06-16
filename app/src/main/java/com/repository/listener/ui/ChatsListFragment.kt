@@ -824,7 +824,7 @@ class ChatsListFragment : Fragment() {
                     return@onSuccess
                 }
                 sheet.onDirSelected = { workDir ->
-                    startRemoteSession(remoteClient, workDir, AppConfig.getDefaultPermissionMode(ctx))
+                    showConversationPicker(remoteClient, workDir, AppConfig.getDefaultPermissionMode(ctx))
                 }
                 sheet.showDirs(response.dirs)
             }
@@ -834,15 +834,39 @@ class ChatsListFragment : Fragment() {
         }
     }
 
-    private fun startRemoteSession(remoteClient: RemoteSessionClient, workDir: String, permissionMode: String?) {
+    /**
+     * After a folder is chosen, list its prior conversations so the user can
+     * resume one or start fresh. Resuming passes the conversation's sessionId to
+     * startSession, which makes pc-agent spawn the CLI with --resume.
+     */
+    private fun showConversationPicker(remoteClient: RemoteSessionClient, workDir: String, permissionMode: String?) {
+        val picker = ConversationPickerBottomSheet().apply {
+            this.workDir = workDir
+            isLoading = true
+            onNewConversation = {
+                startRemoteSession(remoteClient, workDir, permissionMode, null)
+            }
+            onConversationSelected = { conv ->
+                startRemoteSession(remoteClient, workDir, permissionMode, conv.sessionId)
+            }
+        }
+        picker.show(childFragmentManager, "conversation_picker")
+
+        remoteClient.listConversations(workDir) { result ->
+            result.onSuccess { list -> picker.showConversations(list) }
+            result.onFailure { err -> picker.showError("Failed to load conversations: ${err.message}") }
+        }
+    }
+
+    private fun startRemoteSession(remoteClient: RemoteSessionClient, workDir: String, permissionMode: String?, resumeSessionId: String? = null) {
         val ctx = context ?: return
         val rootView = view ?: return
-        Snackbar.make(rootView, "Starting session...", Snackbar.LENGTH_INDEFINITE)
+        Snackbar.make(rootView, if (resumeSessionId != null) "Resuming session..." else "Starting session...", Snackbar.LENGTH_INDEFINITE)
             .setBackgroundTint(ContextCompat.getColor(ctx, R.color.gbx_bg1))
             .setTextColor(ContextCompat.getColor(ctx, R.color.gbx_fg))
             .show()
 
-        remoteClient.startSession(workDir, permissionMode) { result ->
+        remoteClient.startSession(workDir, permissionMode, resumeSessionId) { result ->
             result.onSuccess { response ->
                 val intent = Intent(requireContext(), RemoteControlActivity::class.java).apply {
                     putExtra(RemoteControlActivity.EXTRA_SESSION_ID, response.sessionId)
