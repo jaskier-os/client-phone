@@ -95,7 +95,7 @@ object AppConfig {
      *  above. Runtime-switchable (idle-only). */
     const val MAP_PROVIDER_YANDEX = "yandex"
     const val MAP_PROVIDER_GOOGLE = "google"
-    const val DEFAULT_MAP_PROVIDER = MAP_PROVIDER_YANDEX
+    const val DEFAULT_MAP_PROVIDER = MAP_PROVIDER_GOOGLE
 
     // openWakeWord detection parameters
     const val OWW_THRESHOLD = 0.5f          // Score threshold for single frame
@@ -170,7 +170,7 @@ object AppConfig {
     }
 
     fun getSttLanguage(context: Context): String =
-        prefs(context).getString(KEY_STT_LANGUAGE, "ru") ?: "ru"
+        prefs(context).getString(KEY_STT_LANGUAGE, "en") ?: "en"
 
     fun setSttLanguage(context: Context, language: String) {
         prefs(context).edit().putString(KEY_STT_LANGUAGE, language).apply()
