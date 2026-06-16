@@ -56,3 +56,6 @@ Thumbs.db
 # Test outputs
 test/ui/reports/
 test/ui/screenshots/
+
+# Local planning notes (not for version control)
+docs/plans/
