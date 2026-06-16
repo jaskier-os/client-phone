@@ -141,6 +141,32 @@ class RcChatHarness(val device: UiDevice) {
         Thread.sleep(500)
     }
 
+    /**
+     * Fetch resumable conversations for a workDir via the orchestrator
+     * (-> pc-agent -> remote-session list-sessions). Mirrors what the resume
+     * picker calls. Returns the parsed list; throws on transport failure.
+     */
+    fun listConversations(workDir: String): List<com.repository.listener.network.ConversationInfo> {
+        val wsUrl = AppConfig.getOrchestratorUrl(ctx)
+        val apiKey = AppConfig.getApiKey(ctx)
+        val deviceId = AppConfig.getDeviceId(ctx)
+        val client = RemoteSessionClient(wsUrl, apiKey, deviceId)
+
+        val latch = CountDownLatch(1)
+        var out: List<com.repository.listener.network.ConversationInfo>? = null
+        var error: Throwable? = null
+        client.listConversations(workDir) { result ->
+            result.onSuccess { out = it }
+            result.onFailure { err -> error = err }
+            latch.countDown()
+        }
+        check(latch.await(30, TimeUnit.SECONDS)) {
+            "Timed out waiting for listConversations (workDir=$workDir)"
+        }
+        error?.let { throw IllegalStateException("listConversations failed: ${it.message}", it) }
+        return out ?: error("listConversations returned null")
+    }
+
     /** Navigate from MainActivity to the chats tab (index 1 of 7 tabs). */
     fun openChatsTab() {
         val tabs = device.wait(Until.findObject(By.res(PKG, "tabLayout")), DEFAULT_TIMEOUT)
@@ -157,6 +183,13 @@ class RcChatHarness(val device: UiDevice) {
     // ------------------------------------------------------------------
     // Messaging
     // ------------------------------------------------------------------
+
+    /**
+     * Type a slash command into rcInput and submit it. Slash-prefixed text is
+     * intercepted by the SlashCommandRegistry on send (not forwarded as a chat
+     * message), so this is just sendMessage with an intention-revealing name.
+     */
+    fun sendSlashCommand(command: String) = sendMessage(command)
 
     /** Type into rcInput and click rcSendButton. */
     fun sendMessage(text: String) {
