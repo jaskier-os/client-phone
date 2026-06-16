@@ -451,11 +451,15 @@ class ChatHistoryClient(
         callback: (Result<SendMessageResponse>) -> Unit
     ) {
         val url = "$baseUrl/api/v1/chats/$conversationId/message"
+        // Stable idempotency key for this send. Built once, so an OkHttp
+        // connection-level resend reuses the same body and the server collapses
+        // the retry into a single turn instead of duplicating the user bubble.
         val body = JSONObject().apply {
             put("text", text)
             if (imageBase64 != null) put("image", imageBase64)
             put("deviceId", deviceId)
             put("deviceType", deviceType)
+            put("requestId", java.util.UUID.randomUUID().toString())
         }
         val request = Request.Builder()
             .url(url)
@@ -502,11 +506,14 @@ class ChatHistoryClient(
         callback: (Result<CreateChatResponse>) -> Unit
     ) {
         val url = "$baseUrl/api/v1/chats"
+        // Stable idempotency key (see sendMessage) so a transport-level resend of
+        // this create does not produce a duplicate first turn.
         val body = JSONObject().apply {
             put("text", text)
             if (imageBase64 != null) put("image", imageBase64)
             put("deviceId", deviceId)
             put("deviceType", deviceType)
+            put("requestId", java.util.UUID.randomUUID().toString())
         }
         val request = Request.Builder()
             .url(url)

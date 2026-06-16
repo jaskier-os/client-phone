@@ -132,8 +132,13 @@ class ChatDetailActivity : AppCompatActivity() {
                         setChatResponding(false)
                         isWaitingForResponse = false
                         updateSendButtonState()
+                        // Upsert by requestId so the final response replaces the
+                        // bubble that streaming (or a history reload) already
+                        // rendered for this turn instead of duplicating it.
+                        adapter.upsertAssistantMessage(requestId, text)
+                    } else {
+                        adapter.addMessage(msg)
                     }
-                    adapter.addMessage(msg)
                     scrollToBottom()
                 }
             } catch (e: Exception) {

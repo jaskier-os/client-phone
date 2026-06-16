@@ -16,6 +16,7 @@ import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.repository.listener.R
 import com.repository.listener.ui.MarkwonFactory
+import java.util.UUID
 
 class ChatDetailAdapter(
     private val onMessageClicked: (Int, ChatMessage) -> Unit,
@@ -282,6 +283,35 @@ class ChatDetailAdapter(
             text = toolName,
             requestId = parentRequestId,
             isAnimating = true
+        )
+        messages.add(msg)
+        notifyItemInserted(messages.size - 1)
+        return messages.size - 1
+    }
+
+    /**
+     * Update the existing ASSISTANT message for a requestId, or append one if
+     * none exists yet. Prevents a duplicate assistant bubble when the final
+     * response broadcast arrives for a turn that streaming (or a history reload)
+     * already rendered. requestId must be non-empty to match; an empty id always
+     * appends. Returns the affected position.
+     */
+    fun upsertAssistantMessage(requestId: String, text: String): Int {
+        if (requestId.isNotEmpty()) {
+            val existing = messages.indexOfLast {
+                it.role == ChatMessage.Role.ASSISTANT && it.requestId == requestId
+            }
+            if (existing >= 0) {
+                messages[existing].text = text
+                notifyItemChanged(existing)
+                return existing
+            }
+        }
+        val msg = ChatMessage(
+            id = UUID.randomUUID().toString(),
+            role = ChatMessage.Role.ASSISTANT,
+            text = text,
+            requestId = requestId
         )
         messages.add(msg)
         notifyItemInserted(messages.size - 1)
