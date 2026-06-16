@@ -149,9 +149,9 @@ class PhoneHidMouseBridge(private val context: Context) {
     private fun registerApp() {
         val hid = hidDevice ?: return
         val sdp = BluetoothHidDeviceAppSdpSettings(
-            "Repository Glasses Mouse",
+            "Jaskier Glasses Mouse",
             "Head-tracking mouse via glasses",
-            "Repository",
+            "Jaskier",
             BluetoothHidDevice.SUBCLASS1_MOUSE,
             reportDescriptor
         )

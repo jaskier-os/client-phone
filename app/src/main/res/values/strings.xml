@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Repository</string>
+    <string name="app_name">Jaskier</string>
     <string name="hint_orchestrator_url">Orchestrator URL</string>
     <string name="sherlock_bot_hint">\@username_bot</string>
     <string name="hint_api_key">API Key</string>
@@ -11,7 +11,7 @@
     <string name="status_listening">Status: Listening</string>
     <string name="status_connecting">Status: Connecting...</string>
     <string name="status_stopped">Status: Stopped</string>
-    <string name="notification_channel_name">Repository Service</string>
+    <string name="notification_channel_name">Jaskier Service</string>
     <string name="notification_channel_description">Voice listener foreground service</string>
 
     <string name="tab_config">Config</string>

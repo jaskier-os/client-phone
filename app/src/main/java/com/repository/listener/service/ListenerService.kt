@@ -6576,7 +6576,7 @@ class ListenerService : LifecycleService(),
                                         val entry = rcDumpState[sessionId]
                                         val folder = folderNameFromWorkDir(entry?.workDir)
                                         val title = entry?.sessionName
-                                        val notifTitle = listOfNotNull(folder, title).joinToString(": ").ifEmpty { "Repository" }
+                                        val notifTitle = listOfNotNull(folder, title).joinToString(": ").ifEmpty { "Jaskier" }
                                         phoneBtHost.sendNotification("rcfinish-$sessionId", notifTitle, "Done", "", false)
                                     }
                                 } catch (_: Exception) {}
