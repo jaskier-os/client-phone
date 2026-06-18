@@ -210,6 +210,12 @@ class MapRfcommClient(private val context: Context) {
         return try {
             val adapter = BluetoothAdapter.getDefaultAdapter() ?: return null
             val bonded = adapter.bondedDevices ?: return null
+            // Prefer the exact paired unit (cached MAC) so a second bonded glasses can't hijack
+            // the map relay. Fall back to name-matching only when no MAC is cached.
+            val cachedMac = com.repository.listener.config.AppConfig.getGlassesMac(context)
+            if (cachedMac.isNotEmpty()) {
+                bonded.firstOrNull { it.address.equals(cachedMac, ignoreCase = true) }?.let { return it }
+            }
             bonded.firstOrNull {
                 val name = it.name ?: ""
                 name.contains("glasses", ignoreCase = true) ||
@@ -220,6 +226,14 @@ class MapRfcommClient(private val context: Context) {
         } catch (_: Exception) {
             null
         }
+    }
+
+    /** Forget the targeted device + drop the socket so the next reconnect re-resolves via the
+     *  cached MAC. Mirrors GlassesRfcommClient.resetTarget(); used on user re-pair. */
+    fun resetTarget() {
+        currentDevice = null
+        closeSocket()
+        if (shouldRun) reconnectSignal.release()
     }
 
     private fun handleDisconnect() {

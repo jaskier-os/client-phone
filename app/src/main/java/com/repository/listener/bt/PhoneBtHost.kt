@@ -223,6 +223,18 @@ class PhoneBtHost(private val context: Context) {
             broadcast(next == State.Reachable)
         }
 
+        /**
+         * Re-emit the current state even if it didn't change. Needed when the phone re-pairs to a
+         * DIFFERENT unit while already Reachable: the bond/RFCOMM switches but the reachability
+         * state stays Reachable, so transition() would emit nothing and the UI's "Pairing..."
+         * button would never reset. Forcing a broadcast pushes a fresh connected event + the new
+         * device name so the UI updates.
+         */
+        fun forceBroadcast() {
+            log("Reachability: forced re-broadcast (state=$state)")
+            broadcast(state == State.Reachable)
+        }
+
         private fun broadcast(reachable: Boolean) {
             try {
                 ListenerService.glassesConnected = reachable
@@ -448,12 +460,21 @@ class PhoneBtHost(private val context: Context) {
             }
         ).also {
             it.logCallback = { msg -> logCallback?.invoke(msg) }
-            it.onGlassesIdentified = { device, classicMac ->
+            it.onGlassesIdentified = { device, classicMac, pairingAvailable ->
                 // BLE scan positively identified our glasses via REPO magic. The data link
                 // is the RFCOMM message relay (dialed by bond on a fixed MESSAGE_UUID) plus
                 // the BLE wake link -- no GATT/UUID discovery. Bond (RFCOMM requires it),
                 // record the classic MAC, then kick the relay.
-                if (!autoConnectPending && !rfcommConnected) {
+                //
+                // In user-driven pair mode we ONLY bond a unit that advertises pairingAvailable=1
+                // (unbonded / pairing-window-open). This is what lets the phone skip an old, still-
+                // paired glasses that is in range advertising the same name, and bond the NEW one
+                // that is actually waiting to pair. Outside pair mode we ignore the flag so a
+                // normal reconnect to the already-paired unit still works.
+                val blockedByPairing = pairModeActive && !pairingAvailable
+                if (blockedByPairing) {
+                    log("Pair mode: ignoring ${device.address} (pairingAvailable=false -- already-paired unit)")
+                } else if (!autoConnectPending && !rfcommConnected) {
                     val isBogus = classicMac == null ||
                         classicMac == "00:00:00:00:00:00" ||
                         classicMac == "02:00:00:00:00:00"
@@ -564,7 +585,19 @@ class PhoneBtHost(private val context: Context) {
             // Explicit user repair: clear the cached MAC so discovery can bind to a
             // different physical device.
             AppConfig.setGlassesMac(context, "")
-            log("Cleared cached credentials, starting BLE discovery...")
+            // Drop the live RFCOMM link (so the guards in handleDeviceFound /
+            // onGlassesIdentified clear) but KEEP the old bond. We deliberately do not unpair
+            // the old unit: a still-bonded unit advertises pairingAvailable=0 and is skipped,
+            // while the new unit advertises pairingAvailable=1 and gets bonded. Unpairing the
+            // old unit would make it also advertise pairing=1 and reintroduce the ambiguity.
+            rfcommConnected = false
+            autoConnectPending = false
+            // Forget the previously-targeted unit so the relays re-resolve to whichever unit we
+            // bond next (via the new cached MAC). Without this, currentDevice stays latched on
+            // the old glasses and the relay reattaches to it even after a fresh pairing.
+            rfcommClient.resetTarget()
+            mapRfcommClient.resetTarget()
+            log("Cleared cached MAC + reset relay target (kept old bond), starting flag-gated BLE discovery...")
         } else {
             log("Keeping cached credentials, starting BLE discovery...")
         }
@@ -596,6 +629,14 @@ class PhoneBtHost(private val context: Context) {
         if (!name.startsWith("Glasses_")) return
         if (rfcommConnected) return
         if (autoConnectPending) return
+        // In user-driven pair mode, do NOT bond on name alone -- multiple units advertise the
+        // same "Glasses_xxxx" name, so name-matching would grab whichever (often the old, still-
+        // paired) unit is seen first. Defer to the BLE onGlassesIdentified path, which gates on
+        // the pairing flag and only bonds a unit that is actually available for pairing.
+        if (pairModeActive) {
+            log("Pair mode: deferring '$name' (${device.address}) to flag-gated BLE identify path")
+            return
+        }
 
         autoConnectPending = true
         log("Auto-connecting to '$name' -- bonding + kicking RFCOMM relay")
@@ -654,6 +695,16 @@ class PhoneBtHost(private val context: Context) {
                 mapRfcommClient.requestImmediateReconnect("control_connected")
                 // Reachability: RFCOMM up is hard proof of life.
                 reachability.onRfcommConnected()
+                // Mirror the freshly-connected device identity, then force a state re-broadcast.
+                // If reachability was ALREADY Reachable (e.g. we re-paired from one unit to another
+                // without ever dropping to Unreachable), onRfcommConnected() emits nothing, and the
+                // UI's "Pairing..." button would never reset. The forced broadcast guarantees the
+                // UI sees a connected event + the new device name and resets the button.
+                ListenerService.glassesDeviceName = deviceName
+                AppConfig.getGlassesMac(context).takeIf { it.isNotEmpty() }?.let {
+                    ListenerService.glassesDeviceMac = it
+                }
+                reachability.forceBroadcast()
             }
             override fun onDisconnected() {
                 log("RFCOMM disconnected from glasses")
@@ -665,6 +716,8 @@ class PhoneBtHost(private val context: Context) {
                     rfcommClient.clearActiveSession("tts_playback")
                 }
                 bluetoothHelper.clearConnectedDevice()
+                // Drop any live sideload session: the p2p0 route dies with the BT link.
+                onSideloadBtDisconnected?.invoke()
                 listener?.onGlassesDisconnected()
                 // Reachability debounces this -- one drop arms a confirm-ping rather
                 // than flipping Unreachable immediately.
@@ -1028,6 +1081,15 @@ class PhoneBtHost(private val context: Context) {
                             }
                         }
                         BtProtocol.CH_SYNC -> handleSyncFromGlasses(args)
+                        BtProtocol.CH_SIDELOAD -> {
+                            try {
+                                val json = args.at(0).getString()
+                                log("Sideload reply from glasses: ${json.take(80)}")
+                                onSideloadReply?.invoke(json)
+                            } catch (e: Exception) {
+                                log("Failed to parse sideload reply: ${e.message}")
+                            }
+                        }
                         BtProtocol.CH_WAKE_EVENT -> handleWakeEventFromGlasses(args)
                         "Dev" -> handleDevNotification(args)
                         else -> {
@@ -1397,6 +1459,29 @@ class PhoneBtHost(private val context: Context) {
             log("Settings sent (${settingsJson.length} chars)")
         } catch (e: Exception) {
             log("Failed to send settings: ${e.message}")
+        }
+    }
+
+    /** Glasses -> phone sideload reply (CH_SIDELOAD JSON frame). Fed to SideloadForwarder. */
+    var onSideloadReply: ((String) -> Unit)? = null
+
+    /** Fired when the RFCOMM link drops so a live sideload session can be invalidated. */
+    var onSideloadBtDisconnected: (() -> Unit)? = null
+
+    /** Send a CH_SIDELOAD JSON frame (OPEN_WIFI / CLOSE_WIFI) to the glasses. */
+    fun sendSideloadFrame(json: String): Boolean {
+        if (!isConnected) {
+            log("Sideload frame dropped: not connected")
+            return false
+        }
+        return try {
+            val ok = rfcommClient.send(BtProtocol.CH_SIDELOAD, json)
+            txByteCount.addAndGet(estimateCapsSize(json))
+            log("Sideload frame sent: ${json.take(60)}")
+            ok
+        } catch (e: Exception) {
+            log("Failed to send sideload frame: ${e.message}")
+            false
         }
     }
 
@@ -2042,6 +2127,13 @@ class PhoneBtHost(private val context: Context) {
             put("settings_power_timeout_min", AppConfig.getGlassesPowerTimeoutMin(context))
             val chatFontSize = AppConfig.getGlassesChatFontSize(context)
             if (chatFontSize.isNotEmpty()) put("settings_chat_font_size", chatFontSize)
+            // Deliberately NOT included in the bulk reconnect-sync: enable_sideloading is
+            // persisted on the GLASSES too and re-armed there at boot from GlassesConfig.load().
+            // Re-pushing it on every BT reconnect would let a stale phone value (e.g. after the
+            // phone app's data was cleared, which resets AppConfig to false) silently turn off
+            // sideloading the user expected to stay on. The glasses' persisted value is therefore
+            // authoritative; the flag is pushed ONLY on an explicit user toggle (see
+            // GlassesSettingsFragment.setSideloadingEnabled / the sideload_toggle ADB command).
         }
         sendSettings(appSettings.toString())
 

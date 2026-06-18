@@ -110,6 +110,18 @@ class GlassesRfcommClient(private val context: Context) {
         reconnectSignal.release()
     }
 
+    /**
+     * Forget the currently-targeted device and drop the live socket, so the next reconnect
+     * re-resolves the target from the cached MAC via findGlassesDevice(). Called when the user
+     * re-pairs to a different physical unit -- otherwise currentDevice stays latched on the old
+     * glasses and the relay keeps reattaching to it even after a new bond + cached-MAC change.
+     */
+    fun resetTarget() {
+        currentDevice = null
+        closeSocket()
+        if (shouldRun) reconnectSignal.release()
+    }
+
     fun stop() {
         shouldRun = false
         // Wake the connect thread so it can observe shouldRun=false and exit.
@@ -247,6 +259,15 @@ class GlassesRfcommClient(private val context: Context) {
         return try {
             val adapter = BluetoothAdapter.getDefaultAdapter() ?: return null
             val bonded = adapter.bondedDevices ?: return null
+            // Prefer the exact unit the user paired/selected (cached MAC). When TWO glasses are
+            // bonded (e.g. an old + a freshly paired one), name-matching alone would dial
+            // whichever "Glasses_*" is first in the bonded set -- which is how the relay kept
+            // attaching to the OLD unit after pairing the new one. The cached MAC is the single
+            // source of truth for "our glasses"; only fall back to name-matching when it's unset.
+            val cachedMac = com.repository.listener.config.AppConfig.getGlassesMac(context)
+            if (cachedMac.isNotEmpty()) {
+                bonded.firstOrNull { it.address.equals(cachedMac, ignoreCase = true) }?.let { return it }
+            }
             // Match only devices that look like glasses -- never fall back to
             // arbitrary bonded devices (earbuds, speakers, etc.).
             bonded.firstOrNull {

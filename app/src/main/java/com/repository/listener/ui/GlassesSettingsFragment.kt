@@ -39,6 +39,7 @@ class GlassesSettingsFragment : Fragment() {
     private lateinit var txtTxTotal: TextView
     private lateinit var txtRxTotal: TextView
     private lateinit var chkAdbDebug: CheckBox
+    private lateinit var chkEnableSideloading: CheckBox
     private lateinit var chkWeatherWidget: CheckBox
     private lateinit var btnInfo: View
     private lateinit var btnSettings: View
@@ -149,6 +150,15 @@ class GlassesSettingsFragment : Fragment() {
             } else {
                 sendAdbSetting(false)
             }
+        }
+
+        // Enable sideloading toggle. Persists the flag, pushes enable_sideloading to the
+        // glasses over CH_SETTINGS, and starts/stops the phone's LAN HTTP server that the
+        // desktop deploy script targets.
+        chkEnableSideloading = view.findViewById(R.id.chkEnableSideloading)
+        chkEnableSideloading.isChecked = AppConfig.getSideloadingEnabled(requireContext())
+        chkEnableSideloading.setOnCheckedChangeListener { _, isChecked ->
+            setSideloadingEnabled(isChecked)
         }
 
         // Weather widget toggle
@@ -351,6 +361,24 @@ class GlassesSettingsFragment : Fragment() {
         } catch (e: Exception) {
             LogCollector.e(TAG, "Failed to send ADB setting: ${e.message}")
         }
+    }
+
+    private fun setSideloadingEnabled(enabled: Boolean) {
+        val ctx = requireContext()
+        // Persist + start/stop the phone's LAN HTTP server atomically (phone-local, no glasses required).
+        ListenerService.applySideloadingState(ctx, enabled)
+        // Push the flag to the glasses as a JSON bool (matches GlassesConfig.optBoolean).
+        val svc = ListenerService.phoneBtHostInstance
+        if (svc != null) {
+            try {
+                svc.sendSettings(JSONObject().put("enable_sideloading", enabled).toString())
+            } catch (e: Exception) {
+                LogCollector.e(TAG, "Failed to send enable_sideloading: ${e.message}")
+            }
+        } else {
+            LogCollector.w(TAG, "setSideloadingEnabled: phoneBtHostInstance null; flag persisted, BT push skipped")
+        }
+        LogCollector.i(TAG, "Sideloading ${if (enabled) "enabled" else "disabled"}")
     }
 
     private fun sendDisplayPosition(normalizedY: Float) {

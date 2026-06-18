@@ -137,7 +137,7 @@ class BluetoothHelper(
 
     /** Fires when BLE scan positively identifies our glasses via REPO service data.
      *  Second param is the classic BT MAC extracted from service data (for RFCOMM). */
-    var onGlassesIdentified: ((BluetoothDevice, String?) -> Unit)? = null
+    var onGlassesIdentified: ((BluetoothDevice, String?, Boolean) -> Unit)? = null
 
     val scanListener = object : android.bluetooth.le.ScanCallback() {
         @SuppressLint("MissingPermission")
@@ -160,8 +160,13 @@ class BluetoothHelper(
                             svcData[4], svcData[5], svcData[6],
                             svcData[7], svcData[8], svcData[9])
                     } else null
-                    log("BLE: positively identified our glasses via REPO service data classicMac=$classicMac rssi=${r.rssi}")
-                    onGlassesIdentified?.invoke(r.device, classicMac)
+                    // Byte 10 (when present) is the pairing flag: 1 = this unit is currently
+                    // available for pairing (unbonded / pairing window open), 0 = already paired.
+                    // Older glasses firmware omits it (10-byte payload); treat absent as "pairing
+                    // available" so a not-yet-updated unit still pairs.
+                    val pairingAvailable = svcData.size < 11 || svcData[10].toInt() != 0
+                    log("BLE: positively identified our glasses via REPO service data classicMac=$classicMac rssi=${r.rssi} pairingAvailable=$pairingAvailable")
+                    onGlassesIdentified?.invoke(r.device, classicMac, pairingAvailable)
                 }
                 if (scanResultMap[name] == null) {
                     log("BLE scan found: $name (${r.device.address}) rssi=${r.rssi} repo=${isOurs}")

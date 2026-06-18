@@ -80,9 +80,7 @@ class ServerConfigFragment : Fragment() {
 
     private lateinit var editOrchestratorUrl: EditText
     private lateinit var editApiKey: EditText
-    private lateinit var editDeviceId: EditText
     private lateinit var dropdownModel: AutoCompleteTextView
-    private lateinit var editGlassesSerial: EditText
     private lateinit var btnToggle: Button
     private lateinit var btnBatterySettings: Button
 
@@ -109,25 +107,12 @@ class ServerConfigFragment : Fragment() {
 
         editOrchestratorUrl = view.findViewById(R.id.editOrchestratorUrl)
         editApiKey = view.findViewById(R.id.editApiKey)
-        editDeviceId = view.findViewById(R.id.editDeviceId)
         dropdownModel = view.findViewById(R.id.dropdownModel)
-        editGlassesSerial = view.findViewById(R.id.editGlassesSerial)
         btnToggle = view.findViewById(R.id.btnToggle)
         btnBatterySettings = view.findViewById(R.id.btnBatterySettings)
 
         editOrchestratorUrl.setText(AppConfig.getOrchestratorUrl(ctx))
         editApiKey.setText(AppConfig.getApiKey(ctx))
-        editDeviceId.setText(AppConfig.getDeviceId(ctx))
-        editGlassesSerial.setText(AppConfig.getGlassesSerial(ctx))
-
-        // Auto-save serial on every edit so it persists across reboots
-        editGlassesSerial.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            override fun afterTextChanged(s: Editable?) {
-                AppConfig.setGlassesSerial(ctx, s?.toString()?.trim() ?: "")
-            }
-        })
 
         val modelAdapter = NoFilterAdapter(ctx, android.R.layout.simple_dropdown_item_1line, models)
         dropdownModel.setAdapter(modelAdapter)
@@ -326,8 +311,6 @@ class ServerConfigFragment : Fragment() {
 
         AppConfig.setOrchestratorUrl(ctx, editOrchestratorUrl.text.toString().trim())
         AppConfig.setApiKey(ctx, editApiKey.text.toString().trim())
-        AppConfig.setDeviceId(ctx, editDeviceId.text.toString().trim())
-        AppConfig.setGlassesSerial(ctx, editGlassesSerial.text.toString().trim())
 
         val intent = Intent(ctx, ListenerService::class.java).apply {
             action = ListenerService.ACTION_START

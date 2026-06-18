@@ -482,3 +482,113 @@ bash AI/clients/phone/test/adb/test_ar_recording.sh
 # Full suite
 bash AI/clients/phone/test/adb/run_all_tests.sh
 ```
+
+## Sideloading (deploy to glasses through the phone, no USB cable)
+
+A feature that lets a **desktop deploy/control the glasses over LAN + WiFi-Direct, routed
+through the phone**, replacing the direct adb-USB cable to the glasses. The headline use is
+running `AI/clients/glasses/scripts/deploy-to-glasses-via-phone.sh` (a sibling of the USB
+`deploy-to-glasses.sh`) entirely over the air: build APKs, push them into the glasses
+`/system/priv-app` overlay, install, apply grants, reboot, and verify -- with the glasses
+never on adb.
+
+### Data path
+
+```
+desktop  --HTTP/LAN-->  phone (LAN server :8771)  --BT(RFCOMM)+WiFi-Direct-->  glasses
+                                                     (BT opens the link; HTTP-over-p2p0 carries data)
+```
+
+The glasses run a WiFi-Direct Group Owner (filesync APK, HTTP :8849). The phone joins that
+group and forwards desktop requests to it. All glasses-side privileged work (file writes into
+/system, `pm install`, grants, reboot, arbitrary shell) runs as **root via the `appsud` daemon**
+(see the glasses CLAUDE.md "Glasses App Root").
+
+### Enabling it
+
+Gated by the glasses setting **"Enable sideloading"** (a CheckBox in `GlassesSettingsFragment`,
+key `enable_sideloading`). When ON the phone:
+1. Persists the flag (`AppConfig.setSideloadingEnabled`) and pushes it to the glasses over the
+   `CH_SETTINGS` BT channel (so the glasses' filesync server starts accepting sideload requests).
+2. Starts a **LAN HTTP server on port 8771** (`SideloadHttpServer`, bound `0.0.0.0`) that the
+   desktop targets.
+
+It can also be toggled headlessly via the ADB command receiver (used by deploy/test tooling):
+```bash
+adb -s <phone> shell am broadcast -n com.repository.listener/.adb.AdbCommandReceiver \
+  -a com.repository.listener.ADB_COMMAND --es type sideload_toggle \
+  --es command_id t1 --es params '{"enabled":true}'
+# result JSON in run-as files/adb_results/t1.json -> {enabled, lan_server_up, glasses_bt_connected}
+```
+
+### Phone-side components
+
+- `ui/GlassesSettingsFragment.kt` -- the "Enable sideloading" CheckBox; `setSideloadingEnabled()`
+  persists + `ListenerService.applySideloadingState()` + pushes `enable_sideloading` over BT.
+- `service/ListenerService.kt` -- `applySideloadingState(context, enabled)` (atomic persist+apply
+  under one lock so a racing toggle can't desync the persisted flag from the running server);
+  `sideload_toggle` ADB command in `handleAdbCommand`; constructs the forwarder + LAN server in
+  `onCreate` and restores them from the persisted flag; `primaryWifiNetwork()` (see VPN note).
+- `sync/SideloadHttpServer.kt` -- the LAN-facing server (raw `ServerSocket`, hand-rolled like the
+  glasses `FileHttpServer`, no NanoHTTPD/Ktor). Lifecycle tied to the flag.
+- `sync/SideloadForwarder.kt` -- BT handshake (`CH_SIDELOAD`: `OPEN_WIFI`/`CLOSE_WIFI` ->
+  `WIFI_READY{ssid,passphrase,ip,port,deviceAddress}`/`WIFI_ERROR`/`WIFI_CLOSED`), joins the
+  glasses P2P group via the existing `sync/WifiDirectJoiner.kt`, and forwards uploads/exec/poll
+  to the glasses over OkHttp bound to p2p0.
+- `bt/BtProtocol.kt` -- `CH_SIDELOAD = "listener_sideload"`.
+
+### LAN HTTP API (desktop -> phone, port 8771)
+
+| Endpoint | Purpose |
+|---|---|
+| `GET  /sideload/health` | `{ok,glassesBt}` |
+| `POST /sideload/open`  | phone sends BT OPEN_WIFI, joins the glasses P2P group (~slow, WiFi-Direct group formation; retry on P2P reason=0) |
+| `POST /sideload/close` | leave the group + BT CLOSE_WIFI |
+| `POST /sideload/upload?name=<f>` (raw body) | forwards to glasses `/sideload/upload`; returns `{ok,path,size,sha256}` |
+| `POST /sideload/exec` (`{cmd}`) | **synchronous** root exec, capped at 120s (legacy/short commands). Returns `{rc,stdout,stderr,truncated}` |
+| `POST /sideload/exec/start` (`{cmd}`) -> `{job}` | **async** root exec, NO time limit |
+| `POST /sideload/exec/poll` (`{job,stdoutFrom,stderrFrom}`) | incremental `{running,rc,stdoutB64,stderrB64,stdoutTotal,stderrTotal,truncated,error}` |
+| `POST /sideload/cleanup` | wipe glasses staging |
+
+The glasses return verbatim; the phone forwards. Glasses JSON is passed through unchanged.
+
+### Async exec (run ANY command, including long-running)
+
+Long commands cannot hold a single HTTP request open across WiFi-Direct, so exec uses a
+**start/poll job model**: `exec/start` returns a job id; the desktop drains it via `exec/poll`
+until `running==false`, then reads `rc`. Output is **base64** (`stdoutB64`/`stderrB64`) so it is
+binary-clean -- a multibyte UTF-8 char or binary byte split across two polls is never corrupted.
+Verified on hardware: 60s+ commands stream live with the correct exit code, 400KB output with
+zero corruption, UTF-8 intact. See the glasses CLAUDE.md "Sideloading exec internals".
+
+### VPN-bypass for the LAN reply (important)
+
+If the phone has an active VPN (Hiddify/Amnezia), its killswitch policy-routes unmarked app
+traffic into the tun, so the LAN server's TCP **reply** would leave over the VPN and the desktop
+would hang (ping works, TCP times out). `SideloadHttpServer` therefore **binds each accepted
+client socket to the phone's WiFi `Network`** (`Network.bindSocket`, network chosen by
+`primaryWifiNetwork()`: TRANSPORT_WIFI + NET_CAPABILITY_NOT_VPN + iface `wlan*`, never p2p/tun).
+Loopback peers (adb-forward over USB) skip the bind. If binding fails the socket is closed (clean
+RST, not a multi-minute hang). On a phone with no VPN this is a no-op.
+
+### Testing without a real LAN
+
+The desktop<->phone LAN is often firewalled (MIUI per-app firewall, or the dev box's own VPN).
+For tests, bridge the phone's port over the USB cable instead -- the glasses data path is still
+WiFi-Direct, which is what matters:
+```bash
+adb -s <phone> forward tcp:18771 tcp:8771
+PHONE_IP=127.0.0.1 PHONE_PORT=18771 bash AI/clients/glasses/scripts/deploy-to-glasses-via-phone.sh
+```
+
+### Tmp hygiene (uploaded/derived files never persist)
+
+Every file sideload touches on the glasses is removed after use; nothing survives a session:
+- Uploaded files land in the filesync **app-private** dir (`<filesDir>/sideload/`), wiped on
+  session open, close, stop, `/sideload/cleanup`, sync-exec finally, and async-job finish.
+- `gl_push` removes its staged copy unconditionally after the in-place rewrite (even on failure).
+- APK installs need a **world-readable** copy (PackageManager/system_server can't read the
+  app-private dir), placed in `/data/local/tmp/sideload-stage/`. The desktop removes it inline;
+  in addition filesync **force-wipes that dir via the appsud root daemon on every session
+  teardown**, so even a job killed mid-install leaves nothing behind. Verified: a root-owned
+  leftover planted there is gone after `/sideload/close`.

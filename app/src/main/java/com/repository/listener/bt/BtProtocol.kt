@@ -172,6 +172,14 @@ object BtProtocol {
     // File sync (glasses <-> phone). See GlassesSyncClient / SyncChannelHandler.
     const val CH_SYNC = "listener_sync"
 
+    // Sideload control (phone <-> glasses). JSON frames in arg[0].
+    // Phone -> glasses: {"t":"OPEN_WIFI"} | {"t":"CLOSE_WIFI"}.
+    // Glasses -> phone: {"t":"WIFI_READY","details":{ssid,passphrase,ip,port,deviceAddress}}
+    //                 | {"t":"WIFI_ERROR","reason":"..."}
+    //                 | {"t":"WIFI_CLOSED"}.
+    // Gated on the phone's enable_sideloading toggle; reuses WifiDirectJoiner.
+    const val CH_SIDELOAD = "listener_sideload"
+
     // Glasses -> phone generic command channel (e.g. request_start_translation).
     // Args: JSON array [commandType: String, paramsObject: JSONObject?]
     const val CH_GLASSES_COMMAND = "glasses_command"

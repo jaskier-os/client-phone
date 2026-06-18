@@ -47,23 +47,6 @@
         </com.google.android.material.textfield.TextInputLayout>
 
         <com.google.android.material.textfield.TextInputLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="12dp"
-            app:helperText="Unique identifier for this device (e.g. phone-01)"
-            style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
-
-            <com.google.android.material.textfield.TextInputEditText
-                android:id="@+id/editDeviceId"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:hint="@string/hint_device_id"
-                android:inputType="text"
-                android:singleLine="true" />
-
-        </com.google.android.material.textfield.TextInputLayout>
-
-        <com.google.android.material.textfield.TextInputLayout
             android:id="@+id/modelDropdownLayout"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -150,24 +133,7 @@
             android:layout_height="wrap_content"
             android:layout_marginBottom="16dp"
             android:text="Trigger AI on this phone"
-            android:checked="true" />
-
-        <com.google.android.material.textfield.TextInputLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginBottom="24dp"
-            app:helperText="Serial number of Rokid glasses for auto-connect"
-            style="@style/Widget.Material3.TextInputLayout.OutlinedBox">
-
-            <com.google.android.material.textfield.TextInputEditText
-                android:id="@+id/editGlassesSerial"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:hint="@string/hint_glasses_serial"
-                android:inputType="text"
-                android:singleLine="true" />
-
-        </com.google.android.material.textfield.TextInputLayout>
+            android:checked="false" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnSystemPrompt"

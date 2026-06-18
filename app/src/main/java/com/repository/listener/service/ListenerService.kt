@@ -375,6 +375,35 @@ class ListenerService : LifecycleService(),
             }
         }
 
+        /** Static handle to the running service's sideload LAN server so the settings UI
+         *  can start/stop it when the enable_sideloading toggle flips without binding. */
+        @Volatile var sideloadHttpServerInstance: com.repository.listener.sync.SideloadHttpServer? = null
+
+        /** Serializes persist+apply so the persisted flag and the running server can never
+         *  diverge under concurrent toggles (UI thread vs ADB binder thread). */
+        private val sideloadStateLock = Any()
+
+        /** Persist the enable_sideloading flag AND apply it to the LAN HTTP server lifecycle
+         *  as one atomic step. The server start()/stop() act on the value that was just
+         *  persisted under the same lock, so a racing toggle cannot leave runtime and
+         *  persisted state disagreeing. Idempotent: start()/stop() are no-ops when already
+         *  in the target state. */
+        @JvmStatic
+        fun applySideloadingState(context: Context, enabled: Boolean) {
+            synchronized(sideloadStateLock) {
+                try {
+                    AppConfig.setSideloadingEnabled(context, enabled)
+                    val server = sideloadHttpServerInstance ?: run {
+                        LogCollector.w(TAG, "applySideloadingState: server not ready")
+                        return
+                    }
+                    if (enabled) server.start() else server.stop()
+                } catch (e: Exception) {
+                    LogCollector.w(TAG, "applySideloadingState failed: ${e.message}")
+                }
+            }
+        }
+
         // Current orchestrator state -- readable by fragments on resume
         @Volatile var orchestratorConnected = false
 
@@ -676,6 +705,11 @@ class ListenerService : LifecycleService(),
 
     // File sync -- owns the glasses -> phone sync state machine.
     private lateinit var glassesSyncClient: GlassesSyncClient
+
+    // Sideload -- forwards desktop deploy ops to the glasses over WiFi-Direct, and the
+    // LAN HTTP server that the desktop targets (active only while enable_sideloading is on).
+    private lateinit var sideloadForwarder: com.repository.listener.sync.SideloadForwarder
+    private lateinit var sideloadHttpServer: com.repository.listener.sync.SideloadHttpServer
 
     // Weather widget cache push -- fires when WeatherWorker updates the cached frame,
     // or when the UI toggles the widget off (hide frame on glasses).
@@ -3271,6 +3305,31 @@ class ListenerService : LifecycleService(),
             glassesSyncClient.onMessage(msgType, sessionId, payload)
         }
 
+        // Sideload: forwarder (BT handshake + WiFi-Direct join + HTTP to glasses) and the
+        // LAN HTTP server that the desktop deploy script targets. The server is started
+        // only while enable_sideloading is on (see applySideloadingState).
+        sideloadForwarder = com.repository.listener.sync.SideloadForwarder(
+            context = this,
+            sendBtFrame = { json -> phoneBtHost.sendSideloadFrame(json) },
+            isBtConnected = { phoneBtHost.isConnected },
+        ).apply {
+            remoteLog = { LogCollector.i("GlassesFileSync", it) }
+        }
+        phoneBtHost.onSideloadReply = { json -> sideloadForwarder.onBtReply(json) }
+        phoneBtHost.onSideloadBtDisconnected = { sideloadForwarder.invalidateSession() }
+        sideloadHttpServer = com.repository.listener.sync.SideloadHttpServer(
+            forwarder = sideloadForwarder,
+            isBtConnected = { phoneBtHost.isConnected },
+            lanNetwork = { primaryWifiNetwork() },
+        ).apply {
+            remoteLog = { LogCollector.i("GlassesFileSync", it) }
+        }
+        sideloadHttpServerInstance = sideloadHttpServer
+        // Restore the LAN server lifecycle from the persisted toggle.
+        if (AppConfig.getSideloadingEnabled(this)) {
+            sideloadHttpServer.start()
+        }
+
         // Route glasses-side wake events (WakeWordPipeline on glasses fired) into the
         // phone's session activation flow. This is the sole activation path for
         // glasses wake-ups -- the phone does NOT run WakeWordDetector against the
@@ -5392,6 +5451,33 @@ class ListenerService : LifecycleService(),
         })
     }
 
+    /**
+     * The phone's primary WiFi network (wlan0), or null if not on WiFi. Selected by transport
+     * (TRANSPORT_WIFI) and interface name (not "p2p*"), so it is never the VPN tun (which lacks
+     * TRANSPORT_WIFI) nor the WiFi-Direct p2p network the forwarder uses. No subnet is hardcoded;
+     * whatever WiFi the phone is on is used. The sideload HTTP server binds each LAN client
+     * socket to this so replies bypass an active VPN killswitch.
+     */
+    private fun primaryWifiNetwork(): android.net.Network? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            cm.allNetworks.firstOrNull { n ->
+                val c = cm.getNetworkCapabilities(n) ?: return@firstOrNull false
+                // Must be real WiFi, never the VPN tun. NOT_VPN excludes any tun that
+                // surfaces an underlying WiFi transport; the iface filter pins wlan* and
+                // rejects the WiFi-Direct p2p* net the forwarder uses for glasses traffic.
+                if (!c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) return@firstOrNull false
+                if (!c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return@firstOrNull false
+                val iface = cm.getLinkProperties(n)?.interfaceName ?: return@firstOrNull false
+                iface.startsWith("wlan")
+            }
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "primaryWifiNetwork failed: ${e.message}")
+            null
+        }
+    }
+
     private fun handleAdbCommand(commandId: String, type: String, paramsStr: String) {
         LogCollector.i(TAG, "ADB command dispatch: type=$type, id=$commandId")
 
@@ -5402,6 +5488,20 @@ class ListenerService : LifecycleService(),
                     put("glasses_phase", phoneBtHost.glassesConnectionPhase())
                     put("service_state", state.name)
                     put("orchestrator_connected", orchestratorClient.isConnected)
+                }
+                AdbResultWriter.writeSuccess(this, commandId, type, data)
+            }
+            "sideload_toggle" -> {
+                val p = try { JSONObject(paramsStr) } catch (_: Exception) { JSONObject() }
+                val enabled = p.optBoolean("enabled", true)
+                applySideloadingState(this, enabled)
+                if (phoneBtHost.isConnected) {
+                    phoneBtHost.sendSettings(JSONObject().put("enable_sideloading", enabled).toString())
+                }
+                val data = JSONObject().apply {
+                    put("enabled", enabled)
+                    put("lan_server_up", sideloadHttpServerInstance?.isRunning ?: false)
+                    put("glasses_bt_connected", phoneBtHost.isConnected)
                 }
                 AdbResultWriter.writeSuccess(this, commandId, type, data)
             }
@@ -9907,6 +10007,8 @@ class ListenerService : LifecycleService(),
         rcDoneClearRunnables.clear()
         rcSessionTurning.clear()
         phoneBtHostInstance = null
+        sideloadHttpServerInstance = null
+        if (::sideloadHttpServer.isInitialized) { try { sideloadHttpServer.stop() } catch (_: Exception) {} }
         audioDucker.reset()
         notificationQueue.clear("destroy")
 

@@ -22,6 +22,7 @@ object AppConfig {
     private const val KEY_GLASSES_MAC = "glasses_mac"
     private const val KEY_GLASSES_DEVICE_NAME = "glasses_device_name"
     private const val KEY_GLASSES_ADB_ENABLED = "glasses_adb_enabled"
+    private const val KEY_ENABLE_SIDELOADING = "enable_sideloading"
     private const val KEY_DISPLAY_POSITION_Y = "display_position_y"
     private const val KEY_AUDIO_BITRATE = "audio_bitrate"
     private const val KEY_AUDIO_RELAY_DESIRED = "audio_relay_desired"
@@ -88,7 +89,8 @@ object AppConfig {
      *  "gps" = skip Locator and use Android FusedLocationProviderClient directly. */
     const val LOCATOR_API_YANDEX = "yandex"
     const val LOCATOR_API_GPS = "gps"
-    const val DEFAULT_LOCATOR_API_PREFERENCE = LOCATOR_API_YANDEX
+    // Default to Regular GPS (Android FusedLocationProviderClient), not the Yandex Locator API.
+    const val DEFAULT_LOCATOR_API_PREFERENCE = LOCATOR_API_GPS
 
     /** Map provider for navigation: routing, geocoding, POI search, interactive
      *  map, glasses minimap, location/mock. Independent of the Locator preference
@@ -177,7 +179,7 @@ object AppConfig {
     }
 
     fun getPhoneAiTriggerEnabled(context: Context): Boolean =
-        prefs(context).getBoolean(KEY_PHONE_AI_TRIGGER_ENABLED, true)
+        prefs(context).getBoolean(KEY_PHONE_AI_TRIGGER_ENABLED, false)
 
     fun setPhoneAiTriggerEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_PHONE_AI_TRIGGER_ENABLED, enabled).apply()
@@ -310,6 +312,13 @@ object AppConfig {
 
     fun setGlassesAdbEnabled(context: Context, enabled: Boolean) {
         prefs(context).edit().putBoolean(KEY_GLASSES_ADB_ENABLED, enabled).apply()
+    }
+
+    fun getSideloadingEnabled(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_ENABLE_SIDELOADING, false)
+
+    fun setSideloadingEnabled(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_ENABLE_SIDELOADING, enabled).apply()
     }
 
     fun getDisplayPositionY(context: Context): Float =
