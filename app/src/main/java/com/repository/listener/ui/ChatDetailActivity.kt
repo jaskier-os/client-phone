@@ -53,6 +53,7 @@ class ChatDetailActivity : AppCompatActivity() {
         const val EXTRA_CONVERSATION_ID = "conversation_id"
         const val EXTRA_CONVERSATION_TITLE = "conversation_title"
         const val EXTRA_CONVERSATION_CLOSED = "conversation_closed"
+        private const val THINKING_TIMEOUT_MS = 120_000L
     }
 
     private lateinit var adapter: ChatDetailAdapter
@@ -88,6 +89,7 @@ class ChatDetailActivity : AppCompatActivity() {
     private var isWaitingForResponse = false
     private var receiversRegistered = false
     private val handler = Handler(Looper.getMainLooper())
+    private var thinkingTimeoutRunnable: Runnable? = null
     private var loadingActive = false
     private var loadingIndex = 0
     private val loadingRunnable = object : Runnable {
@@ -131,6 +133,7 @@ class ChatDetailActivity : AppCompatActivity() {
                         adapter.stopToolAnimation(requestId)
                         setChatResponding(false)
                         isWaitingForResponse = false
+                        thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
                         updateSendButtonState()
                         // Upsert by requestId so the final response replaces the
                         // bubble that streaming (or a history reload) already
@@ -235,6 +238,7 @@ class ChatDetailActivity : AppCompatActivity() {
                 stopLoading()
                 adapter.submitMessages(emptyList())
                 isWaitingForResponse = false
+                thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
                 updateSendButtonState()
             }
         }
@@ -433,6 +437,13 @@ class ChatDetailActivity : AppCompatActivity() {
         super.onResume()
         if (!isClosed) registerBroadcastReceivers()
         handler.post(draftRunnable)
+        // Recover from stale thinking state: if we went through onPause while
+        // waiting for a response, the WS broadcast with the answer was likely
+        // dropped (receivers were unregistered). Reload conversation to pick up
+        // the response from the server, and reset thinking state if it arrived.
+        if (isWaitingForResponse && conversationId.isNotEmpty()) {
+            loadConversation()
+        }
     }
 
     override fun onPause() {
@@ -445,11 +456,17 @@ class ChatDetailActivity : AppCompatActivity() {
         }
         unregisterBroadcastReceivers()
         stopLoading()
+        thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
         val recorder = voiceRecorder
         voiceRecorder = null
         recorder?.cancelRecording()
         btnMic.cancelRecording()
         recordingOverlay.reset()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacksAndMessages(null)
     }
 
     private fun animateSendButton(show: Boolean) {
@@ -621,6 +638,7 @@ class ChatDetailActivity : AppCompatActivity() {
 
     private fun loadConversation() {
         client?.getChatDetail(conversationId) { result ->
+            if (isFinishing || isDestroyed) return@getChatDetail
             result.onSuccess { detail ->
                 val messages = mutableListOf<ChatMessage>()
                 var hasPendingResponse = false
@@ -666,12 +684,29 @@ class ChatDetailActivity : AppCompatActivity() {
                 adapter.submitMessages(messages)
                 scrollToBottom()
                 // If the last turn is still awaiting a response, show thinking state
+                // and arm the safety timeout so we never get permanently stuck
                 if (hasPendingResponse) {
                     setChatResponding(true)
+                    if (!isWaitingForResponse) {
+                        isWaitingForResponse = true
+                        updateSendButtonState()
+                        thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
+                        thinkingTimeoutRunnable = Runnable {
+                            if (isWaitingForResponse) {
+                                LogCollector.w(TAG, "Thinking timeout fired (from loadConversation) -- force-clearing")
+                                setChatResponding(false)
+                                isWaitingForResponse = false
+                                updateSendButtonState()
+                                runOnUiThread { adapter.removeLoadingMessages() }
+                                loadConversation()
+                            }
+                        }.also { handler.postDelayed(it, THINKING_TIMEOUT_MS) }
+                    }
                     startLoading()
                 } else {
                     setChatResponding(false)
                     isWaitingForResponse = false
+                    thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
                     updateSendButtonState()
                 }
             }
@@ -679,6 +714,7 @@ class ChatDetailActivity : AppCompatActivity() {
                 LogCollector.e(TAG, "Failed to load conversation: ${err.message}")
                 Toast.makeText(this, "Failed to load conversation", Toast.LENGTH_SHORT).show()
                 isWaitingForResponse = false
+                thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
                 updateSendButtonState()
             }
         }
@@ -717,6 +753,20 @@ class ChatDetailActivity : AppCompatActivity() {
         isWaitingForResponse = true
         updateSendButtonState()
 
+        // Safety timeout -- if no response clears thinking state within the limit,
+        // force-clear it so the UI never gets stuck permanently
+        thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
+        thinkingTimeoutRunnable = Runnable {
+            if (isWaitingForResponse) {
+                LogCollector.w(TAG, "Thinking timeout fired after ${THINKING_TIMEOUT_MS}ms -- force-clearing thinking state")
+                setChatResponding(false)
+                isWaitingForResponse = false
+                updateSendButtonState()
+                runOnUiThread { adapter.removeLoadingMessages() }
+                loadConversation()
+            }
+        }.also { handler.postDelayed(it, THINKING_TIMEOUT_MS) }
+
         // Add loading placeholder
         val loadingMsg = ChatMessage(
             id = UUID.randomUUID().toString(),
@@ -730,10 +780,15 @@ class ChatDetailActivity : AppCompatActivity() {
         val deviceId = AppConfig.getDeviceId(this)
         val deviceType = "phone"
 
+        // Always ensure receivers are registered before sending so WS responses
+        // that arrive before HTTP completes are not silently dropped
+        if (!isClosed) registerBroadcastReceivers()
+
         if (conversationId.isEmpty()) {
             isCreatingChat = true
             client?.createChat(text, imageBase64, deviceId, deviceType) { result ->
                 isCreatingChat = false
+                if (isFinishing || isDestroyed) return@createChat
                 result.onSuccess { response ->
                     DraftStore.clear(this@ChatDetailActivity, DraftStore.KEY_NEW_CHAT)
                     conversationId = response.conversationId
@@ -747,12 +802,14 @@ class ChatDetailActivity : AppCompatActivity() {
                     Toast.makeText(this, "Failed to send: ${err.message}", Toast.LENGTH_SHORT).show()
                     setChatResponding(false)
                     isWaitingForResponse = false
+                    thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
                     updateSendButtonState()
                     runOnUiThread { adapter.removeLoadingMessages() }
                 }
             }
         } else {
             client?.sendMessage(conversationId, text, imageBase64, deviceId, deviceType) { result ->
+                if (isFinishing || isDestroyed) return@sendMessage
                 result.onSuccess {
                     if (isClosed) {
                         isClosed = false
@@ -771,6 +828,7 @@ class ChatDetailActivity : AppCompatActivity() {
                     Toast.makeText(this, "Failed to send: ${err.message}", Toast.LENGTH_SHORT).show()
                     setChatResponding(false)
                     isWaitingForResponse = false
+                    thinkingTimeoutRunnable?.let { handler.removeCallbacks(it) }
                     updateSendButtonState()
                     loadConversation()
                 }
