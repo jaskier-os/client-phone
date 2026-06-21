@@ -93,6 +93,9 @@ class GlassesRfcommClient(private val context: Context) {
     @Volatile
     private var currentDevice: BluetoothDevice? = null
 
+    /** The device this relay is currently targeting/connected to (the exact unit it dialed). */
+    fun connectedDevice(): BluetoothDevice? = currentDevice
+
     private val mainHandler = Handler(Looper.getMainLooper())
     private val writeLock = Any()
 
@@ -120,6 +123,24 @@ class GlassesRfcommClient(private val context: Context) {
         currentDevice = null
         closeSocket()
         if (shouldRun) reconnectSignal.release()
+    }
+
+    /**
+     * Pin the relay to an EXACT device object (the unit the BLE scan identified as available for
+     * pairing). The connect loop does currentDevice ?: findGlassesDevice(), so an explicit
+     * currentDevice wins and NO MAC lookup happens -- this is what makes pairing bond the exact
+     * advertised unit instead of re-resolving (and mis-resolving) by cached MAC / first-bonded name.
+     * Drops any live socket and signals a reconnect onto the new target. Starts the connect loop if
+     * it isn't running yet (so setTargetDevice during cold pairing still brings the link up).
+     */
+    fun setTargetDevice(device: BluetoothDevice) {
+        currentDevice = device
+        closeSocket()
+        if (!shouldRun) {
+            start(device)
+        } else {
+            reconnectSignal.release()
+        }
     }
 
     fun stop() {
@@ -233,8 +254,12 @@ class GlassesRfcommClient(private val context: Context) {
                     val uuid = UUID.fromString(MESSAGE_UUID)
                     listener?.onLog("Connecting RFCOMM to ${device.name ?: device.address} uuid=$MESSAGE_UUID")
                     val s = device.createRfcommSocketToServiceRecord(uuid)
-                    s.connect()
+                    // Publish the socket BEFORE the blocking connect() so a concurrent
+                    // setTargetDevice/resetTarget -> closeSocket() can abort an in-flight connect to
+                    // the OLD device immediately, instead of wasting a full connect attempt before
+                    // retargeting. connect() then throws and the loop re-acquires onto the new target.
                     socket = s
+                    s.connect()
                     outputStream = s.outputStream
                     isConnected = true
                     val devName = device.name ?: device.address
@@ -268,15 +293,18 @@ class GlassesRfcommClient(private val context: Context) {
             if (cachedMac.isNotEmpty()) {
                 bonded.firstOrNull { it.address.equals(cachedMac, ignoreCase = true) }?.let { return it }
             }
-            // Match only devices that look like glasses -- never fall back to
-            // arbitrary bonded devices (earbuds, speakers, etc.).
-            bonded.firstOrNull {
+            // Last-resort name fallback ONLY when there is exactly ONE bonded glasses. With two
+            // bonded units, first-by-name would silently pick the wrong one (the bug this redesign
+            // fixes), so we refuse to guess and return null instead -- the pairing path pins the
+            // exact device via setTargetDevice() and never reaches here.
+            val glasses = bonded.filter {
                 val name = it.name ?: ""
                 name.contains("glasses", ignoreCase = true) ||
                     name.startsWith("Glasses_") ||
                     name.startsWith("RG_") ||
                     name.contains("Rokid", ignoreCase = true)
             }
+            glasses.singleOrNull()
         } catch (_: Exception) {
             null
         }

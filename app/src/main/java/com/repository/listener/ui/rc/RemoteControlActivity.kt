@@ -1175,7 +1175,7 @@ class RemoteControlActivity : AppCompatActivity() {
                 val serverMode = live.permissionMode
                 if (serverMode != null) {
                     val phoneMode = when (serverMode) {
-                        "ask_on_potentially_safe" -> "default"
+                        "ask_on_potentially_safe" -> "bypassAll"
                         "acceptAll" -> "acceptEdits"
                         "bypassAll" -> "bypassAll"
                         "plan" -> "plan"
@@ -1423,17 +1423,15 @@ class RemoteControlActivity : AppCompatActivity() {
 
     internal fun showModePopup() {
         val popup = PopupMenu(this, modeSelector)
-        popup.menu.add(0, 0, 0, "Default")
-        popup.menu.add(0, 1, 1, "Plan mode")
-        popup.menu.add(0, 2, 2, "Accept all edits")
-        popup.menu.add(0, 3, 3, "Bypass all permissions")
+        popup.menu.add(0, 0, 0, "Plan mode")
+        popup.menu.add(0, 1, 1, "Accept all edits")
+        popup.menu.add(0, 2, 2, "Bypass all permissions")
         popup.setOnMenuItemClickListener { item ->
             val mode = when (item.itemId) {
-                0 -> "default"
-                1 -> "plan"
-                2 -> "acceptEdits"
-                3 -> "bypassAll"
-                else -> "default"
+                0 -> "plan"
+                1 -> "acceptEdits"
+                2 -> "bypassAll"
+                else -> "bypassAll"
             }
             sendBroadcast(Intent(ListenerService.ACTION_RC_MODE_REQ).apply {
                 setPackage(packageName)
@@ -1449,7 +1447,6 @@ class RemoteControlActivity : AppCompatActivity() {
 
     private fun updateModeSelector() {
         val label = when (currentMode) {
-            "default" -> "Default"
             "plan" -> "Plan"
             "acceptEdits" -> "Accept"
             "bypassAll" -> "Bypass"

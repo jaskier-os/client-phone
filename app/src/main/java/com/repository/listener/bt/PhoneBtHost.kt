@@ -2,7 +2,11 @@ package com.repository.listener.bt
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import com.repository.listener.config.AppConfig
@@ -62,6 +66,47 @@ class PhoneBtHost(private val context: Context) {
     val bleWake = BleWakeNotifyClient(context)
     private val batteryLogger = BatteryEventLogger(context)
     @Volatile private var bleWakeStarted = false
+
+    /**
+     * Bond-state receiver. onGlassesIdentified calls createBond() (async) then kicks the reconnect
+     * immediately, so the first RFCOMM dial races bonding and fails -- recovery would otherwise wait
+     * up to 5s for the retry timer. This receiver fires an immediate reconnect the moment the bond
+     * completes for our pending pair target (or any bonded glasses), so pairing connects promptly.
+     */
+    @Volatile private var bondReceiverRegistered = false
+    private val bondStateReceiver = object : BroadcastReceiver() {
+        @SuppressLint("MissingPermission")
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+            val newState = intent.getIntExtra(
+                BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR
+            )
+            if (newState != BluetoothDevice.BOND_BONDED) return
+            val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                ?: return
+            val pinned = pendingPairAddress
+            val isPendingTarget = pinned != null && device.address.equals(pinned, ignoreCase = true)
+            val isBondedGlasses = device.address.equals(
+                findBondedGlasses()?.address, ignoreCase = true
+            )
+            if (!isPendingTarget && !isBondedGlasses) return
+            log("Bond completed for ${device.address} -- kicking immediate RFCOMM reconnect")
+            rfcommClient.requestImmediateReconnect("bond_complete")
+            mapRfcommClient.requestImmediateReconnect("bond_complete")
+        }
+    }
+
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private fun ensureBondReceiverRegistered() {
+        if (bondReceiverRegistered) return
+        bondReceiverRegistered = true
+        val filter = IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(bondStateReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(bondStateReceiver, filter)
+        }
+    }
 
     /** Coroutine scope for reachability ping/pong + the 5-minute background ticker. */
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -349,7 +394,18 @@ class PhoneBtHost(private val context: Context) {
      * (force-stopped/OOM), so we cold-start it via a 0x07 BLE wake to bt-manager.
      */
     private var coldStartFailures = 0
+    @Volatile
     private var pairModeActive = false
+
+    /**
+     * Address of the device we locked onto in pair mode (set when we pin a device in
+     * onGlassesIdentified). Once set, further identifies for a DIFFERENT address are ignored
+     * until the connection completes (onConnected) or pairing is reset (disconnect-with-failure,
+     * enterPairMode, exitPairMode). This stops a second glasses left in pairing from overwriting
+     * the target the user actually chose.
+     */
+    @Volatile
+    private var pendingPairAddress: String? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val reconnectRunnable = Runnable { startScanning() }
 
@@ -396,6 +452,9 @@ class PhoneBtHost(private val context: Context) {
      *  glasses side (battery cross, settings flip, wear toggle). All four params are
      *  the latest authoritative values from glasses. */
     var onRecordingStateChanged: ((batteryPct: Int, alwaysRecord: Boolean, onDemandActive: Boolean, recordingActive: Boolean, worn: Boolean) -> Unit)? = null
+    /** Glasses reported its authoritative enable_sideloading state (in the status snapshot). The
+     *  phone mirrors this -- persists + drives the LAN server -- and never pushes back on connect. */
+    var onGlassesSideloadingState: ((enabled: Boolean) -> Unit)? = null
     var onChatListRequested: (() -> Unit)? = null
     var onSwitchChatRequested: ((String) -> Unit)? = null
     var onNewChatRequested: (() -> Unit)? = null
@@ -460,39 +519,63 @@ class PhoneBtHost(private val context: Context) {
             }
         ).also {
             it.logCallback = { msg -> logCallback?.invoke(msg) }
-            it.onGlassesIdentified = { device, classicMac, pairingAvailable ->
-                // BLE scan positively identified our glasses via REPO magic. The data link
-                // is the RFCOMM message relay (dialed by bond on a fixed MESSAGE_UUID) plus
-                // the BLE wake link -- no GATT/UUID discovery. Bond (RFCOMM requires it),
-                // record the classic MAC, then kick the relay.
-                //
-                // In user-driven pair mode we ONLY bond a unit that advertises pairingAvailable=1
-                // (unbonded / pairing-window-open). This is what lets the phone skip an old, still-
-                // paired glasses that is in range advertising the same name, and bond the NEW one
-                // that is actually waiting to pair. Outside pair mode we ignore the flag so a
-                // normal reconnect to the already-paired unit still works.
-                val blockedByPairing = pairModeActive && !pairingAvailable
-                if (blockedByPairing) {
-                    log("Pair mode: ignoring ${device.address} (pairingAvailable=false -- already-paired unit)")
-                } else if (!autoConnectPending && !rfcommConnected) {
-                    val isBogus = classicMac == null ||
-                        classicMac == "00:00:00:00:00:00" ||
-                        classicMac == "02:00:00:00:00:00"
-                    autoConnectPending = true
-                    pairModeActive = false
-                    if (!isBogus) {
-                        AppConfig.setGlassesMac(context, classicMac!!)
+            it.onGlassesIdentified = { device, _, pairingAvailable ->
+                // The BLE scan callback runs on the BLE binder thread, but every pair-flag
+                // (pairModeActive / autoConnectPending / rfcommConnected / pendingPairAddress) is
+                // mutated on the main thread by startScanning / enter/exitPairMode / onConnected /
+                // onDisconnected. Hop to main so the whole check-then-act below is single-threaded
+                // and races nothing.
+                mainHandler.post {
+                    // BLE scan positively identified our glasses via REPO magic. The data link is the
+                    // RFCOMM message relay (dialed by bond on a fixed MESSAGE_UUID) plus the BLE wake
+                    // link -- no GATT/UUID discovery. Bond (RFCOMM requires it), pin BOTH relays to this
+                    // EXACT device object, cache its address, then kick the relay.
+                    //
+                    // In user-driven pair mode we ONLY bond a unit that advertises pairingAvailable=1
+                    // (unbonded / pairing-window-open). This is what lets the phone skip an old, still-
+                    // paired glasses that is in range advertising the same name, and bond the NEW one
+                    // that is actually waiting to pair. Outside pair mode we ignore the flag so a
+                    // normal reconnect to the already-paired unit still works.
+                    val blockedByPairing = pairModeActive && !pairingAvailable
+                    // Latch: once we have pinned a device (autoConnectPending) ignore any further
+                    // identify for a DIFFERENT address until this attempt completes or is reset.
+                    // If the user left BOTH units in pairing, the second unit's identify must not
+                    // overwrite the one we already chose.
+                    val pinned = pendingPairAddress
+                    if (autoConnectPending && pinned != null && device.address != pinned) {
+                        log("Pair lock: ignoring ${device.address} -- already locked onto $pinned")
+                        return@post
                     }
-                    AppConfig.setGlassesSerial(context, "auto")
-                    // Bond first -- RFCOMM requires an active bond. The connect is deferred
-                    // to the bond-complete callback or the next retry cycle.
-                    try { device.createBond() } catch (_: Exception) {}
-                    ensureRfcommClientStarted()
-                    mainHandler.postDelayed({
-                        if (!rfcommConnected) {
-                            rfcommClient.requestImmediateReconnect("repo_ble_bonded")
-                        }
-                    }, 3000)
+                    if (blockedByPairing) {
+                        log("Pair mode: ignoring ${device.address} (pairingAvailable=false -- already-paired unit)")
+                    } else if (!autoConnectPending && !rfcommConnected) {
+                        autoConnectPending = true
+                        pendingPairAddress = device.address
+                        pairModeActive = false
+                        // Cache the address the BOND actually uses -- device.address (the address the
+                        // BLE scan found, which createBond/RFCOMM and bondedDevices all key on). Do NOT
+                        // cache the REPO-advertised classicMac: on some units that is the public
+                        // identity MAC while the bond is keyed by a resolvable private address (RPA),
+                        // so caching classicMac makes findGlassesDevice() miss the bond and fall back
+                        // to the wrong bonded unit. The cache only matters for a later cold reconnect;
+                        // THIS pairing dials the exact object below regardless of what the cache holds.
+                        AppConfig.setGlassesMac(context, device.address)
+                        AppConfig.setGlassesSerial(context, "auto")
+                        // Bond first -- RFCOMM requires an active bond. createBond() is a no-op that
+                        // returns true if already bonded, so re-pairing an already-bonded unit is safe.
+                        try { device.createBond() } catch (_: Exception) {}
+                        ensureRfcommClientStarted()
+                        // Pin BOTH relays to THIS exact device. setTargetDevice sets currentDevice +
+                        // drops any stale socket + signals reconnect, so the connect loop dials this
+                        // unit with NO MAC re-lookup -- the exact device BLE saw is the one we bond.
+                        rfcommClient.setTargetDevice(device)
+                        mapRfcommClient.setTargetDevice(device)
+                        mainHandler.postDelayed({
+                            if (!rfcommConnected) {
+                                rfcommClient.requestImmediateReconnect("repo_ble_bonded")
+                            }
+                        }, 3000)
+                    }
                 }
             }
         }
@@ -531,6 +614,17 @@ class PhoneBtHost(private val context: Context) {
             return
         }
 
+        // During user-driven pair mode the ONLY path allowed to drive bonding/connection is the
+        // BLE onGlassesIdentified callback (it gates on pairingAvailable and pins the exact unit).
+        // The findBondedGlasses() -> requestImmediateReconnect("bonded") path below resolves by
+        // cached MAC / first-bonded name and would re-latch the WRONG already-bonded unit, racing
+        // the identify path. So while pairing, just reschedule the retry and bail.
+        if (pairModeActive) {
+            log("Pair mode active -- deferring to BLE identify path, not kicking bonded reconnect")
+            scheduleRetry()
+            return
+        }
+
         log("Starting BT reconnect for glasses")
         autoConnectPending = false
 
@@ -555,13 +649,11 @@ class PhoneBtHost(private val context: Context) {
             mapRfcommClient.requestImmediateReconnect("bonded")
             ensureBleWakeStarted()
             scheduleRetry()
-        } else if (!pairModeActive) {
-            // Not bonded yet -- run BLE discovery to identify + bond our glasses.
+        } else {
+            // Not bonded yet -- run BLE discovery to identify + bond our glasses. (pairModeActive
+            // already returned above, so this is always the non-pair-mode self-heal entry.)
             log("No bonded glasses -- auto-starting BLE discovery")
             enterPairMode(clearCache = false)
-        } else {
-            log("No bonded glasses -- pair mode already active, waiting for discovery")
-            scheduleRetry()
         }
     }
 
@@ -577,6 +669,8 @@ class PhoneBtHost(private val context: Context) {
         pairModeActive = true
         mainHandler.removeCallbacks(reconnectRunnable)
         autoConnectPending = false
+        // Fresh pair attempt -- clear any stale lock so the next identify can pin.
+        pendingPairAddress = null
 
         // Drop any stale connected-device identity.
         bluetoothHelper.clearConnectedDevice()
@@ -605,6 +699,20 @@ class PhoneBtHost(private val context: Context) {
         // Start BLE scan to identify + bond our glasses.
         bluetoothHelper.onPermissionsGranted()
         scheduleRetry()
+    }
+
+    /** Cancel an in-progress pairing: stop the BLE pair scan + retry loop and clear pair state.
+     *  Lets the user toggle pairing off from the UI. Any already-established RFCOMM link is left
+     *  alone; this only stops the active *search* for a new unit. */
+    fun exitPairMode() {
+        log("=== EXITING PAIR MODE (user cancelled) ===")
+        pairModeActive = false
+        autoConnectPending = false
+        // User cancelled -- release the pair lock.
+        pendingPairAddress = null
+        mainHandler.removeCallbacks(reconnectRunnable)
+        cancelCountdown()
+        try { bluetoothHelper.stopScan() } catch (_: Exception) {}
     }
 
     private fun scheduleRetry() {
@@ -673,9 +781,17 @@ class PhoneBtHost(private val context: Context) {
                 autoConnectPending = false
                 coldStartFailures = 0
                 pairModeActive = false
+                // Connection completed -- release the pair lock so a later re-pair can pin again.
+                pendingPairAddress = null
                 // Record the connected-device identity for the UI / identity mirrors.
                 val cachedMac = AppConfig.getGlassesMac(context).takeIf { it.isNotEmpty() }
                 bluetoothHelper.setConnectedDevice(deviceName, cachedMac)
+                // Single-glasses policy: this app supports exactly ONE active glasses. Now that we
+                // are connected, unpair every OTHER bonded glasses so two bonded units can never
+                // fight over the link (BLE wakes / reconnects from a second bonded unit otherwise
+                // flap the connection + A2DP between the two). The keeper is the unit we just
+                // connected to -- match by the bonded device whose connection backs this socket.
+                pruneOtherBondedGlasses(keepDevice = rfcommClient.connectedDevice())
                 installCustomCmdListener()
                 listener?.onGlassesConnected()
                 // Kick the classic-BT A2DP source -> sink connection so media
@@ -709,6 +825,10 @@ class PhoneBtHost(private val context: Context) {
             override fun onDisconnected() {
                 log("RFCOMM disconnected from glasses")
                 rfcommConnected = false
+                // Pairing attempt failed / link dropped before completing: release the pair lock
+                // and the auto-connect guard so the next identify (or retry) can pin a target again.
+                autoConnectPending = false
+                pendingPairAddress = null
                 // Connection drop with TTS in flight: bt-manager will eventually
                 // safety-timeout the session, but we must reset our local guard now
                 // so the next stream's compareAndSet re-arms setActiveSession.
@@ -745,6 +865,7 @@ class PhoneBtHost(private val context: Context) {
         rfcommClient.start()
         mapRfcommClient.onLog = { msg -> log("MapRFCOMM: $msg") }
         mapRfcommClient.start()
+        ensureBondReceiverRegistered()
         ensureBleWakeStarted()
     }
 
@@ -766,6 +887,14 @@ class PhoneBtHost(private val context: Context) {
                 log("BleWake: rx BATTERY_LEVEL pct=$pct")
                 batteryLogger.record(pct, System.nanoTime())
                 // Telemetry only -- do NOT trigger an RFCOMM reconnect for battery pings.
+                return@setOnNotifyCallback
+            }
+            // During user-driven pair mode the ONLY path allowed to drive bonding/connection is the
+            // BLE onGlassesIdentified callback (it gates on pairingAvailable and pins the exact unit).
+            // A BLE-wake notify here would kick the relays onto whatever the cached MAC resolves to,
+            // racing the identify path -- so defer, matching startScanning / handleDeviceFound.
+            if (pairModeActive) {
+                log("BleWake: rx code=0x${"%02X".format(code.toInt() and 0xFF)} ignored -- pair mode active")
                 return@setOnNotifyCallback
             }
             log("BleWake: rx code=0x${"%02X".format(code.toInt() and 0xFF)} -> requesting RFCOMM reconnect")
@@ -802,13 +931,59 @@ class PhoneBtHost(private val context: Context) {
     private fun findBondedGlasses(): android.bluetooth.BluetoothDevice? {
         return try {
             val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter() ?: return null
+            val bonded = adapter.bondedDevices ?: return null
+            // Prefer the exact paired unit (cached MAC). With TWO glasses bonded (old + freshly
+            // paired) a first-by-name match would return whichever is first in the bonded set and
+            // arm BLE-wake / A2DP / cold-start against the WRONG unit after a switch. The cached
+            // MAC is the single source of truth for "our glasses". Mirrors the relays'
+            // findGlassesDevice().
             val cachedMac = AppConfig.getGlassesMac(context)
-            adapter.bondedDevices?.firstOrNull { d ->
-                (cachedMac.isNotEmpty() && d.address.equals(cachedMac, ignoreCase = true)) ||
-                (d.name ?: "").startsWith("Glasses_") ||
-                (d.name ?: "").contains("glasses", ignoreCase = true)
+            if (cachedMac.isNotEmpty()) {
+                bonded.firstOrNull { it.address.equals(cachedMac, ignoreCase = true) }?.let { return it }
             }
+            // Name fallback ONLY when there is exactly ONE bonded glasses -- two units must never
+            // silently pick the wrong one, so return null on ambiguity.
+            bonded.filter {
+                val name = it.name ?: ""
+                name.startsWith("Glasses_") || name.contains("glasses", ignoreCase = true)
+            }.singleOrNull()
         } catch (_: Exception) { null }
+    }
+
+    /**
+     * Single-glasses policy: unpair every bonded glasses EXCEPT the one we are now connected to.
+     * Without this, two bonded units (an old one + a freshly paired one) both send BLE wakes and
+     * answer reconnects, flapping the RFCOMM link + A2DP back and forth between them. After pairing
+     * a new unit we forget the others so there is exactly one bonded glasses and zero ambiguity.
+     * Uses the hidden BluetoothDevice.removeBond() (no public API on Android 12). The keeper is the
+     * exact device the relay connected to; fall back to the cached MAC if that's unavailable.
+     */
+    @SuppressLint("MissingPermission")
+    private fun pruneOtherBondedGlasses(keepDevice: android.bluetooth.BluetoothDevice?) {
+        try {
+            val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter() ?: return
+            val keepAddr = (keepDevice?.address ?: AppConfig.getGlassesMac(context)).takeIf { it.isNotEmpty() }
+            if (keepAddr == null) { log("pruneOtherBondedGlasses: no keeper address, skipping"); return }
+            // Persist the keeper so later reconnects resolve to exactly this unit.
+            AppConfig.setGlassesMac(context, keepAddr)
+            val others = (adapter.bondedDevices ?: emptySet()).filter { d ->
+                val name = d.name ?: ""
+                (name.startsWith("Glasses_") || name.contains("glasses", ignoreCase = true) ||
+                    name.startsWith("RG_") || name.contains("Rokid", ignoreCase = true)) &&
+                    !d.address.equals(keepAddr, ignoreCase = true)
+            }
+            if (others.isEmpty()) return
+            for (d in others) {
+                try {
+                    val ok = d.javaClass.getMethod("removeBond").invoke(d) as? Boolean ?: false
+                    log("pruneOtherBondedGlasses: removeBond(${d.name}/${d.address}) -> $ok (keeper=$keepAddr)")
+                } catch (e: Exception) {
+                    log("pruneOtherBondedGlasses: removeBond(${d.address}) failed: ${e.message}")
+                }
+            }
+        } catch (e: Exception) {
+            log("pruneOtherBondedGlasses failed: ${e.message}")
+        }
     }
 
     private fun installCustomCmdListener() {
@@ -1162,6 +1337,12 @@ class PhoneBtHost(private val context: Context) {
                     val active = obj.optBoolean("recording_active", false)
                     val worn = obj.optBoolean("worn", true)
                     onRecordingStateChanged?.invoke(pct, always, onDemand, active, worn)
+                    // Glasses is the source of truth for sideloading. MIRROR its reported value
+                    // into the phone (persist + drive the LAN server) -- the phone never pushes
+                    // enable_sideloading on connect, it only reflects what the glasses reports.
+                    if (obj.has("enable_sideloading")) {
+                        onGlassesSideloadingState?.invoke(obj.optBoolean("enable_sideloading", false))
+                    }
                 } catch (t: Throwable) {
                     log("Failed to parse recording_status JSON: ${t.message}")
                 }
@@ -2154,6 +2335,10 @@ class PhoneBtHost(private val context: Context) {
     fun release() {
         mainHandler.removeCallbacks(reconnectRunnable)
         cancelCountdown()
+        if (bondReceiverRegistered) {
+            try { context.unregisterReceiver(bondStateReceiver) } catch (_: Exception) {}
+            bondReceiverRegistered = false
+        }
         scope.cancel()
         // Tear down both RFCOMM links so neither connect thread is leaked.
         rfcommClient.stop()

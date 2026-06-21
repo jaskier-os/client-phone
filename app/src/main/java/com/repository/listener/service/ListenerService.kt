@@ -2839,6 +2839,16 @@ class ListenerService : LifecycleService(),
                 setPackage(packageName)
             })
         }
+        phoneBtHost.onGlassesSideloadingState = { enabled ->
+            // Glasses is authoritative. Mirror its reported state into the phone: persist +
+            // start/stop the LAN server. applySideloadingState does NOT push back to the glasses,
+            // so this is a one-way reflect with no echo loop. Only re-apply when it actually
+            // differs from what the phone already has.
+            if (AppConfig.getSideloadingEnabled(this) != enabled) {
+                LogCollector.i(TAG, "Mirroring glasses sideloading state -> $enabled")
+                applySideloadingState(this, enabled)
+            }
+        }
         phoneBtHost.onChatListRequested = { handleGlassesChatListRequest() }
         phoneBtHost.onSwitchChatRequested = { id -> handleGlassesSwitchChat(id) }
         phoneBtHost.onNewChatRequested = {
@@ -3245,6 +3255,17 @@ class ListenerService : LifecycleService(),
                 }
             },
             IntentFilter(GlassesSettingsFragment.ACTION_ENTER_PAIR_MODE),
+            Context.RECEIVER_NOT_EXPORTED
+        )
+
+        registerReceiver(
+            object : BroadcastReceiver() {
+                override fun onReceive(ctx: Context, intent: Intent) {
+                    LogCollector.i(TAG, "Exiting pair mode")
+                    phoneBtHost.exitPairMode()
+                }
+            },
+            IntentFilter(GlassesSettingsFragment.ACTION_EXIT_PAIR_MODE),
             Context.RECEIVER_NOT_EXPORTED
         )
 
@@ -5175,6 +5196,215 @@ class ListenerService : LifecycleService(),
                     }
                 }
             }
+            // --- Remote sideload commands (orchestrator -> phone -> glasses) ---
+
+            "sideload_open" -> {
+                if (!AppConfig.getSideloadingEnabled(this)) {
+                    orchestratorClient.sendDeviceResponse(
+                        requestId, "sideload_open",
+                        data = JSONObject().put("ok", false).put("error", "sideloading disabled")
+                    )
+                    return
+                }
+                serviceScope.launch(Dispatchers.IO) {
+                    try {
+                        sideloadForwarder.open()
+                        orchestratorClient.sendDeviceResponse(
+                            requestId, "sideload_open",
+                            data = JSONObject().put("ok", true)
+                        )
+                    } catch (e: Exception) {
+                        LogCollector.e(TAG, "sideload_open failed: ${e.message}")
+                        orchestratorClient.sendDeviceResponse(
+                            requestId, "sideload_open",
+                            data = JSONObject().put("ok", false).put("error", e.message ?: "unknown error")
+                        )
+                    }
+                }
+            }
+
+            "sideload_upload" -> {
+                val downloadUrl = params?.optString("downloadUrl", "") ?: ""
+                val fileName = params?.optString("fileName", "") ?: ""
+                if (downloadUrl.isEmpty() || fileName.isEmpty()) {
+                    orchestratorClient.sendDeviceResponse(
+                        requestId, "sideload_upload",
+                        data = JSONObject().put("ok", false).put("error", "missing downloadUrl or fileName")
+                    )
+                    return
+                }
+                serviceScope.launch(Dispatchers.IO) {
+                    var tempFile: File? = null
+                    try {
+                        // 1) Download file from orchestrator BEFORE opening the sideload
+                        //    session. Once forwarder.open() binds the process to p2p0,
+                        //    all sockets route over WiFi-Direct (no internet).
+                        val orchHttpUrl = AppConfig.getOrchestratorHttpUrl(this@ListenerService)
+                        val orchApiKey = AppConfig.getApiKey(this@ListenerService)
+                        // When a sideload session is already open, bindProcessToNetwork(p2p0)
+                        // is process-wide -- a plain OkHttpClient would route over WiFi-Direct
+                        // (no internet). Pin the download to a real internet network.
+                        val internetSf = internetNetwork()?.socketFactory
+                            ?: javax.net.SocketFactory.getDefault()
+                        val dlClient = okhttp3.OkHttpClient.Builder()
+                            .socketFactory(internetSf)
+                            .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                            .readTimeout(600, java.util.concurrent.TimeUnit.SECONDS)
+                            .writeTimeout(600, java.util.concurrent.TimeUnit.SECONDS)
+                            .build()
+                        val fullUrl = if (downloadUrl.startsWith("http")) downloadUrl
+                            else "$orchHttpUrl$downloadUrl"
+                        val dlReq = okhttp3.Request.Builder()
+                            .url(fullUrl)
+                            .header("x-api-key", orchApiKey)
+                            .get()
+                            .build()
+                        LogCollector.i(TAG, "sideload_upload: downloading $fileName from orchestrator")
+                        dlClient.newCall(dlReq).execute().use { dlResp ->
+                            if (!dlResp.isSuccessful) {
+                                throw Exception("orchestrator download failed: HTTP ${dlResp.code}")
+                            }
+                            val dlBody = dlResp.body
+                                ?: throw Exception("orchestrator returned empty body")
+                            tempFile = File(cacheDir, "sideload-dl-${System.currentTimeMillis()}")
+                            dlBody.byteStream().use { input ->
+                                tempFile!!.outputStream().use { output ->
+                                    input.copyTo(output, bufferSize = 64 * 1024)
+                                }
+                            }
+                        }
+                        LogCollector.i(TAG, "sideload_upload: downloaded ${tempFile!!.length()} bytes to temp")
+
+                        // 2) Open sideload session if not already open (now safe --
+                        //    the file is local, p2p binding won't block the download)
+                        if (!sideloadForwarder.isSessionOpen) {
+                            sideloadForwarder.open()
+                        }
+
+                        // 3) Upload the local temp file to glasses via WiFi-Direct
+                        val glassesResp = sideloadForwarder.upload(
+                            fileName,
+                            java.io.FileInputStream(tempFile!!),
+                            tempFile!!.length()
+                        )
+                        val glassesJson = try { JSONObject(glassesResp) } catch (_: Exception) {
+                            JSONObject().put("raw", glassesResp)
+                        }
+                        LogCollector.i(TAG, "sideload_upload: upload complete for $fileName")
+                        orchestratorClient.sendDeviceResponse(
+                            requestId, "sideload_upload", data = glassesJson
+                        )
+                    } catch (e: Exception) {
+                        LogCollector.e(TAG, "sideload_upload failed: ${e.message}")
+                        orchestratorClient.sendDeviceResponse(
+                            requestId, "sideload_upload",
+                            data = JSONObject().put("ok", false).put("error", e.message ?: "unknown error")
+                        )
+                    } finally {
+                        tempFile?.delete()
+                    }
+                }
+            }
+
+            "sideload_exec" -> {
+                val cmd = params?.optString("cmd", "") ?: ""
+                if (cmd.isEmpty()) {
+                    orchestratorClient.sendDeviceResponse(
+                        requestId, "sideload_exec",
+                        data = JSONObject().put("ok", false).put("error", "missing cmd")
+                    )
+                    return
+                }
+                serviceScope.launch(Dispatchers.IO) {
+                    try {
+                        if (!sideloadForwarder.isSessionOpen) {
+                            sideloadForwarder.open()
+                        }
+
+                        // Start async exec on glasses
+                        val startResp = sideloadForwarder.execStart(
+                            JSONObject().put("cmd", cmd).toString()
+                        )
+                        val startJson = JSONObject(startResp)
+                        val jobId = startJson.getString("job")
+                        LogCollector.i(TAG, "sideload_exec: started job=$jobId cmd=${cmd.take(80)}")
+
+                        // Poll until completion, collecting incremental output
+                        val allStdout = StringBuilder()
+                        val allStderr = StringBuilder()
+                        var stdoutFrom = 0
+                        var stderrFrom = 0
+                        var rc = -1
+                        var truncated = false
+
+                        while (true) {
+                            val pollJson = JSONObject().apply {
+                                put("job", jobId)
+                                put("stdoutFrom", stdoutFrom)
+                                put("stderrFrom", stderrFrom)
+                            }.toString()
+                            val pollResp = sideloadForwarder.execPoll(pollJson)
+                            val poll = JSONObject(pollResp)
+
+                            val outB64 = poll.optString("stdoutB64", "")
+                            val errB64 = poll.optString("stderrB64", "")
+                            if (outB64.isNotEmpty()) {
+                                allStdout.append(outB64)
+                                stdoutFrom = poll.optInt("stdoutTotal", stdoutFrom)
+                            }
+                            if (errB64.isNotEmpty()) {
+                                allStderr.append(errB64)
+                                stderrFrom = poll.optInt("stderrTotal", stderrFrom)
+                            }
+                            truncated = poll.optBoolean("truncated", false)
+
+                            if (!poll.optBoolean("running", true)) {
+                                rc = poll.optInt("rc", -1)
+                                break
+                            }
+
+                            // Brief pause before next poll to avoid busy-spinning
+                            kotlinx.coroutines.delay(500)
+                        }
+
+                        LogCollector.i(TAG, "sideload_exec: job=$jobId finished rc=$rc")
+                        val result = JSONObject().apply {
+                            put("rc", rc)
+                            put("stdoutB64", allStdout.toString())
+                            put("stderrB64", allStderr.toString())
+                            put("truncated", truncated)
+                        }
+                        orchestratorClient.sendDeviceResponse(
+                            requestId, "sideload_exec", data = result
+                        )
+                    } catch (e: Exception) {
+                        LogCollector.e(TAG, "sideload_exec failed: ${e.message}")
+                        orchestratorClient.sendDeviceResponse(
+                            requestId, "sideload_exec",
+                            data = JSONObject().put("ok", false).put("error", e.message ?: "unknown error")
+                        )
+                    }
+                }
+            }
+
+            "sideload_close" -> {
+                serviceScope.launch(Dispatchers.IO) {
+                    try {
+                        sideloadForwarder.close()
+                        orchestratorClient.sendDeviceResponse(
+                            requestId, "sideload_close",
+                            data = JSONObject().put("ok", true)
+                        )
+                    } catch (e: Exception) {
+                        LogCollector.e(TAG, "sideload_close failed: ${e.message}")
+                        orchestratorClient.sendDeviceResponse(
+                            requestId, "sideload_close",
+                            data = JSONObject().put("ok", false).put("error", e.message ?: "unknown error")
+                        )
+                    }
+                }
+            }
+
             else -> {
                 LogCollector.w(TAG, "Unknown device command type: $commandType")
             }
@@ -5474,6 +5704,29 @@ class ListenerService : LifecycleService(),
             }
         } catch (e: Exception) {
             LogCollector.w(TAG, "primaryWifiNetwork failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Any network with internet connectivity that is NOT a VPN and NOT a WiFi-Direct p2p
+     * interface. Works on both WiFi (wlan) and cellular. Used by sideload_upload to pin the
+     * orchestrator download to the real internet when the process is bound to p2p0 for
+     * glasses traffic.
+     */
+    private fun internetNetwork(): android.net.Network? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            cm.allNetworks.firstOrNull { n ->
+                val c = cm.getNetworkCapabilities(n) ?: return@firstOrNull false
+                if (!c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)) return@firstOrNull false
+                if (!c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) return@firstOrNull false
+                val iface = cm.getLinkProperties(n)?.interfaceName ?: return@firstOrNull false
+                !iface.startsWith("p2p")
+            }
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "internetNetwork failed: ${e.message}")
             null
         }
     }

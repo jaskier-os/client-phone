@@ -167,8 +167,13 @@ class MapRfcommClient(private val context: Context) {
                     val uuid = UUID.fromString(MAP_UUID)
                     log("map connecting RFCOMM to ${device.name ?: device.address} uuid=$MAP_UUID")
                     val s = device.createRfcommSocketToServiceRecord(uuid)
-                    s.connect()
+                    // Publish the socket BEFORE the blocking connect() so a concurrent
+                    // setTargetDevice/resetTarget -> closeSocket() aborts an in-flight connect to the
+                    // OLD device immediately instead of wasting a full attempt before retargeting.
+                    // sendBinary stays safe: connected is still false here, so it drops rather than
+                    // touching the not-yet-ready stream.
                     socket = s
+                    s.connect()
                     outputStream = s.outputStream
                     // Set connected ONLY after outputStream is assigned so sendBinary
                     // never sees connected=true with a null stream.
@@ -216,13 +221,16 @@ class MapRfcommClient(private val context: Context) {
             if (cachedMac.isNotEmpty()) {
                 bonded.firstOrNull { it.address.equals(cachedMac, ignoreCase = true) }?.let { return it }
             }
-            bonded.firstOrNull {
+            // Last-resort name fallback ONLY when there is exactly ONE bonded glasses (mirrors
+            // GlassesRfcommClient): two bonded units must never silently pick the wrong one.
+            val glasses = bonded.filter {
                 val name = it.name ?: ""
                 name.contains("glasses", ignoreCase = true) ||
                     name.startsWith("Glasses_") ||
                     name.startsWith("RG_") ||
                     name.contains("Rokid", ignoreCase = true)
             }
+            glasses.singleOrNull()
         } catch (_: Exception) {
             null
         }
@@ -234,6 +242,22 @@ class MapRfcommClient(private val context: Context) {
         currentDevice = null
         closeSocket()
         if (shouldRun) reconnectSignal.release()
+    }
+
+    /**
+     * Pin the map relay to an EXACT device object (the unit BLE identified as available for
+     * pairing). Mirrors GlassesRfcommClient.setTargetDevice(): the connect loop's
+     * currentDevice ?: findGlassesDevice() then dials this exact device with no MAC lookup.
+     * Drops any live socket, signals a reconnect, and starts the loop if not yet running.
+     */
+    fun setTargetDevice(device: BluetoothDevice) {
+        currentDevice = device
+        closeSocket()
+        if (!shouldRun) {
+            start(device)
+        } else {
+            reconnectSignal.release()
+        }
     }
 
     private fun handleDisconnect() {

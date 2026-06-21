@@ -26,7 +26,11 @@ class GlassesSettingsFragment : Fragment() {
     companion object {
         private const val TAG = "GlassesSettingsFragment"
         const val ACTION_ENTER_PAIR_MODE = "com.repository.listener.ENTER_PAIR_MODE"
+        const val ACTION_EXIT_PAIR_MODE = "com.repository.listener.EXIT_PAIR_MODE"
     }
+
+    /** True while the user has the Pair button toggled on (searching for a glasses to bond). */
+    private var pairingActive = false
 
     private lateinit var connectionDot: View
     private lateinit var txtConnectionStatus: TextView
@@ -133,12 +137,19 @@ class GlassesSettingsFragment : Fragment() {
 
         btnPairMode = view.findViewById(R.id.btnPairMode)
         btnPairMode.setOnClickListener {
-            btnPairMode.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.gbx_orange))
-            btnPairMode.setTextColor(ContextCompat.getColor(requireContext(), R.color.gbx_bg0_hard))
-            btnPairMode.text = "Pairing..."
-            requireContext().sendBroadcast(Intent(ACTION_ENTER_PAIR_MODE).apply {
-                setPackage(requireContext().packageName)
-            })
+            if (pairingActive) {
+                // Toggle OFF: cancel the in-progress pairing search.
+                setPairButtonIdle()
+                requireContext().sendBroadcast(Intent(ACTION_EXIT_PAIR_MODE).apply {
+                    setPackage(requireContext().packageName)
+                })
+            } else {
+                // Toggle ON: enter pair mode.
+                setPairButtonActive()
+                requireContext().sendBroadcast(Intent(ACTION_ENTER_PAIR_MODE).apply {
+                    setPackage(requireContext().packageName)
+                })
+            }
         }
 
         // ADB debugging toggle
@@ -239,6 +250,22 @@ class GlassesSettingsFragment : Fragment() {
         ctx.unregisterReceiver(batteryReceiver)
     }
 
+    /** Pair button visual + state when actively searching for a glasses to bond. */
+    private fun setPairButtonActive() {
+        pairingActive = true
+        btnPairMode.setBackgroundColor(ContextCompat.getColor(requireContext(), R.color.gbx_orange))
+        btnPairMode.setTextColor(ContextCompat.getColor(requireContext(), R.color.gbx_bg0_hard))
+        btnPairMode.text = "Pairing... (tap to cancel)"
+    }
+
+    /** Pair button visual + state when idle (not pairing). */
+    private fun setPairButtonIdle() {
+        pairingActive = false
+        btnPairMode.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+        btnPairMode.setTextColor(ContextCompat.getColor(requireContext(), R.color.gbx_fg))
+        btnPairMode.text = "Pair Mode"
+    }
+
     private fun updateConnectionStatus(connected: Boolean, connecting: Boolean, deviceName: String?) {
         isConnected = connected
         val dotDrawable = connectionDot.background as? GradientDrawable ?: return
@@ -258,11 +285,9 @@ class GlassesSettingsFragment : Fragment() {
                 txtConnectionStatus.text = "Disconnected"
             }
         }
-        // Reset pair mode button when connected
+        // Reset pair mode button when connected (pairing succeeded / device is up).
         if (connected) {
-            btnPairMode.setBackgroundColor(android.graphics.Color.TRANSPARENT)
-            btnPairMode.setTextColor(ContextCompat.getColor(requireContext(), R.color.gbx_fg))
-            btnPairMode.text = "Pair Mode"
+            setPairButtonIdle()
         }
         btnInfo.isEnabled = connected
         btnSettings.isEnabled = connected
