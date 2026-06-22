@@ -73,11 +73,30 @@ class YandexInteractiveMap(
         override fun onObjectAdded(view: UserLocationView) {
             userLocationView = view
             view.arrow.setDirection(compassHeading)
+            hideAccuracyCircle(view)
         }
         override fun onObjectRemoved(view: UserLocationView) { userLocationView = null }
         override fun onObjectUpdated(view: UserLocationView, event: ObjectEvent) {
             view.arrow.setDirection(compassHeading)
+            hideAccuracyCircle(view)
         }
+    }
+
+    /**
+     * The Yandex SDK draws a translucent-blue accuracy circle around the user dot
+     * whose radius is the location's reported accuracy in METRES. During a journey
+     * the simulated/navigation fix reports a large accuracy, so on the zoomed-in
+     * follow camera that circle balloons into an opaque blue blob that covers the
+     * whole map (it is re-applied on every onObjectUpdated). Force its fill+stroke
+     * fully transparent so the map and route stay visible; the dot+arrow remain.
+     */
+    private fun hideAccuracyCircle(view: UserLocationView) {
+        // The accuracy circle is a CircleMapObject with independently-rendered fill
+        // AND stroke. Zeroing only the fill leaves a visible blue ring (default
+        // strokeWidth ~2dp), so kill the stroke too.
+        view.accuracyCircle.fillColor = android.graphics.Color.TRANSPARENT
+        view.accuracyCircle.strokeColor = android.graphics.Color.TRANSPARENT
+        view.accuracyCircle.strokeWidth = 0f
     }
 
     override fun attach(container: ViewGroup) {
