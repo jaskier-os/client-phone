@@ -21,6 +21,7 @@ class SessionExpiryTest {
 
     private lateinit var db: NavigationDatabase
     private lateinit var dao: JourneySessionDao
+    private lateinit var tracker: SessionTracker
 
     private val origin = Point(55.751244, 37.618423)      // Moscow center
     private val destination = Point(55.753215, 37.622504)  // ~300m away
@@ -34,6 +35,7 @@ class SessionExpiryTest {
             .allowMainThreadQueries()
             .build()
         dao = db.journeySessionDao()
+        tracker = SessionTracker(db)
     }
 
     @After
@@ -69,58 +71,44 @@ class SessionExpiryTest {
     @Test
     fun restoreBeforeExpiry_resumesNormally() = runBlocking {
         val session = makeSession(createdAt = 1_000_000L, etaSeconds = 600)
-        val entity = Converters.toEntity(session)
-        val id = dao.insert(entity)
+        dao.insert(Converters.toEntity(session))
 
-        val stored = dao.getActiveSession()!!
-        val domain = Converters.toDomain(stored)
+        // Restore at a time before expiry (createdAt + 2x ETA = 2_200_000)
+        val now = session.createdAt + 500_000
+        val restored = tracker.restoreSession(farAway, now)
 
-        // Restore at a time before expiry
-        val now = session.createdAt + 500_000 // before expiryTime of 2_200_000
-        assertTrue(now <= domain.expiryTime)
-
-        // Session should still be active and retrievable
+        // In-progress journey is resumed and stays active.
+        assertNotNull(restored)
+        assertTrue(restored!!.isActive)
         assertNotNull(dao.getActiveSession())
-        assertTrue(domain.isActive)
     }
 
     @Test
     fun restoreAfterExpiry_atDestination_deletesSession() = runBlocking {
         val session = makeSession(createdAt = 1_000_000L, etaSeconds = 600)
-        val entity = Converters.toEntity(session)
-        dao.insert(entity)
+        dao.insert(Converters.toEntity(session))
 
-        val stored = dao.getActiveSession()!!
-        val domain = Converters.toDomain(stored)
+        // Past expiry, at destination -- dead journey, deleted.
+        val now = session.expiryTime + 1
+        val restored = tracker.restoreSession(atDestination, now)
 
-        // Simulate: past expiry AND at destination
-        val now = domain.expiryTime + 1
-        assertTrue(now > domain.expiryTime)
-
-        // At destination -- should delete
-        dao.deleteById(domain.id)
+        assertNull(restored)
         assertNull(dao.getActiveSession())
     }
 
     @Test
-    fun restoreAfterExpiry_notAtDestination_extendsBy1Hour() = runBlocking {
+    fun restoreAfterExpiry_notAtDestination_deletesSession() = runBlocking {
         val session = makeSession(createdAt = 1_000_000L, etaSeconds = 600)
-        val entity = Converters.toEntity(session)
-        dao.insert(entity)
+        dao.insert(Converters.toEntity(session))
 
-        val stored = dao.getActiveSession()!!
-        val domain = Converters.toDomain(stored)
+        // Past expiry is dead REGARDLESS of distance to destination: a long-abandoned
+        // journey must NOT be revived (that stale ACTIVE state re-opened the glasses
+        // MAP tab on reconnect/screen-wake). Must delete and return null.
+        val now = session.expiryTime + 1
+        val restored = tracker.restoreSession(farAway, now)
 
-        // Simulate: past expiry, NOT at destination
-        val now = domain.expiryTime + 1
-        val extensionMs = 3_600_000L
-        val newExpiry = now + extensionMs
-
-        dao.updateExpiry(domain.id, newExpiry)
-
-        val updated = dao.getActiveSession()!!
-        assertEquals(newExpiry, updated.expiryTime)
-        assertTrue(updated.isActive)
+        assertNull(restored)
+        assertNull(dao.getActiveSession())
     }
 
     @Test

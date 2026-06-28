@@ -26,9 +26,6 @@ interface JourneySessionDao {
     @Query("DELETE FROM journey_sessions WHERE id = :id")
     suspend fun deleteById(id: Long)
 
-    @Query("UPDATE journey_sessions SET expiryTime = :newExpiry WHERE id = :id")
-    suspend fun updateExpiry(id: Long, newExpiry: Long)
-
     @Query("DELETE FROM journey_sessions WHERE isActive = 0")
     suspend fun deleteAllInactive()
 

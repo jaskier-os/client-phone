@@ -88,6 +88,9 @@ class GoogleMockJourneyTest {
 
         override fun createMinimapImageSource(context: Context): MinimapImageSource =
             object : MinimapImageSource {
+                override val minZoom: Int = 13
+                override val maxZoom: Int = 19
+                override val isCheapPerFrame: Boolean = false
                 override fun start() {}
                 override fun stop() {}
                 override fun render(centerLat: Double, centerLng: Double, zoomLevel: Int, callback: (android.graphics.Bitmap?) -> Unit) = callback(null)
