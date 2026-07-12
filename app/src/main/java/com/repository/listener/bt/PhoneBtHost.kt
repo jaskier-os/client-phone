@@ -482,6 +482,8 @@ class PhoneBtHost(private val context: Context) {
     var onNotifReplySend: ((notifId: String, text: String) -> Unit)? = null
     var onNotifReplyCancel: ((notifId: String) -> Unit)? = null
     var onGlassesInwardAudioData: ((String) -> Unit)? = null  // base64 PCM from glasses inward mic (two-way translation)
+    var onGlassesCallAudioData: ((String) -> Unit)? = null  // base64 PCM from glasses HFP call downlink (far party)
+    var onGlassesCallState: ((Boolean) -> Unit)? = null  // glasses HFP SCO state (call-audio present)
     var onSpeakerVerifyRequested: (() -> Unit)? = null
     var onSpeakerVerifyAudio: ((String) -> Unit)? = null  // base64 PCM from glasses mic 2
     private val speakerVerifyAudioBuffer = StringBuilder()
@@ -1012,6 +1014,8 @@ class PhoneBtHost(private val context: Context) {
                         }
                         BtProtocol.CH_AUDIO_DATA -> handleAudioDataFromGlasses(args)
                         BtProtocol.CH_AUDIO_DATA_INWARD -> handleInwardAudioDataFromGlasses(args)
+                        BtProtocol.CH_AUDIO_DATA_CALL -> handleCallAudioDataFromGlasses(args)
+                        BtProtocol.CH_CALL_STATE -> handleCallStateFromGlasses(args)
                         BtProtocol.CH_CHAT_LIST_REQUEST -> handleChatListRequest()
                         BtProtocol.CH_SWITCH_CHAT -> handleSwitchChat(args)
                         BtProtocol.CH_NEW_CHAT -> {
@@ -1315,6 +1319,32 @@ class PhoneBtHost(private val context: Context) {
             onGlassesInwardAudioData?.invoke(b64Pcm)
         } catch (e: Exception) {
             log("Failed to parse inward audio data: ${e.message}")
+        }
+    }
+
+    private var callAudioDataCount = 0L
+
+    private fun handleCallAudioDataFromGlasses(args: RelayCaps) {
+        try {
+            val b64Pcm = args.at(0).getString()
+            callAudioDataCount++
+            rxByteCount.addAndGet(b64Pcm.length.toLong() + 8)
+            if (callAudioDataCount <= 3 || callAudioDataCount % 200 == 0L) {
+                log("Call audio data #$callAudioDataCount: ${b64Pcm.length} chars")
+            }
+            onGlassesCallAudioData?.invoke(b64Pcm)
+        } catch (e: Exception) {
+            log("Failed to parse call audio data: ${e.message}")
+        }
+    }
+
+    private fun handleCallStateFromGlasses(args: RelayCaps) {
+        try {
+            val scoActive = args.at(0).getString() == "1"
+            log("Glasses call state: sco=$scoActive")
+            onGlassesCallState?.invoke(scoActive)
+        } catch (e: Exception) {
+            log("Failed to parse call state: ${e.message}")
         }
     }
 
@@ -2112,7 +2142,8 @@ class PhoneBtHost(private val context: Context) {
         fromNllb: String,
         toNllb: String,
         fontSize: Int,
-        twoWay: Boolean
+        twoWay: Boolean,
+        wantsCallAudio: Boolean
     ) {
         try {
             val stateJson = JSONObject().apply {
@@ -2123,10 +2154,11 @@ class PhoneBtHost(private val context: Context) {
                 put("toNllb", toNllb)
                 put("fontSize", fontSize)
                 put("twoWay", twoWay)
+                put("wantsCallAudio", wantsCallAudio)
             }.toString()
             rfcommClient.send(BtProtocol.CH_TRANSLATION_STATE, stateJson)
             txByteCount.addAndGet(estimateCapsSize(stateJson))
-            log("Translation state->glasses: active=$active $fromLang -> $toLang twoWay=$twoWay")
+            log("Translation state->glasses: active=$active $fromLang -> $toLang twoWay=$twoWay wantsCallAudio=$wantsCallAudio")
         } catch (e: Exception) {
             log("Failed to send translation state: ${e.message}")
         }

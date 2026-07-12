@@ -77,6 +77,18 @@ object BtProtocol {
     // Used in two-way translation: inward mic captures the wearer's speech.
     const val CH_AUDIO_DATA_INWARD = "listener_audio_data_inward"
 
+    // Glasses -> phone HFP call downlink audio (far party). Raw PCM16LE 16kHz mono,
+    // Base64 encoded. Tapped from the glasses' 8ch mic-array hardware-echo channel (the
+    // SCO downlink) during a call and fed into the phone's translation session as the
+    // "system audio" sub-source, so "System Audio" translation also covers phone calls.
+    const val CH_AUDIO_DATA_CALL = "listener_audio_data_call"
+
+    // Glasses -> phone HFP SCO call-audio state. The glasses are the hands-free endpoint,
+    // so their SCO state is the authoritative signal for far-party call audio arriving.
+    // The phone flips its translation system sub-source (playback<->call) on this.
+    // Args: ["1" sco active, "0" sco idle].
+    const val CH_CALL_STATE = "listener_call_state"
+
     // Phone -> glasses live partial transcription (partials while speaking)
     const val CH_GLASSES_PARTIAL_TEXT = "listener_partial_text"
 

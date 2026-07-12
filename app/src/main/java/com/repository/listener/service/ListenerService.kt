@@ -1359,6 +1359,11 @@ class ListenerService : LifecycleService(),
     private val translationSegmentId = AtomicInteger(0)
     private var translationFontSize = 14
     @Volatile private var translationAudioSource = "glasses"  // "glasses" or "system"
+    // When translationAudioSource == "system", which producer currently feeds the session:
+    // "playback" = phone MediaProjection (media/A2DP), "call" = glasses HFP call downlink.
+    // Flipped by the glasses CH_CALL_STATE relay so "System Audio" also covers phone calls.
+    // The inactive producer early-returns, so only one feeds pushPcm at a time.
+    @Volatile private var systemSubSource = "playback"        // "playback" or "call"
     @Volatile private var translationProvider = "default"     // "default" or "azure"
     @Volatile private var translationTwoWay = false           // bidirectional dual-mic mode (Azure only)
     private var azureTranslationSession: AzureTranslationSession? = null
@@ -1849,7 +1854,12 @@ class ListenerService : LifecycleService(),
             fromNllb = translationFromNllb,
             toNllb = translationToNllb,
             fontSize = translationFontSize,
-            twoWay = translationTwoWay
+            twoWay = translationTwoWay,
+            // Tells the glasses whether the phone wants the far-party call downlink: only
+            // when translation is active with the "system" audio source. The glasses gate
+            // their c6 call-audio tap (and front-beam suspension) on this, so a "glasses"
+            // source translation keeps its front beam during a call.
+            wantsCallAudio = translationMode && translationAudioSource == "system"
         )
     }
 
@@ -3061,6 +3071,8 @@ class ListenerService : LifecycleService(),
         }
         phoneBtHost.onGlassesCommand = { type, params -> handleGlassesCommand(type, params) }
         phoneBtHost.onGlassesInwardAudioData = { b64 -> onGlassesInwardAudioData(b64) }
+        phoneBtHost.onGlassesCallAudioData = { b64 -> onGlassesCallAudioData(b64) }
+        phoneBtHost.onGlassesCallState = { scoActive -> onGlassesCallState(scoActive) }
 
         // Wire notification queue callbacks
         notificationQueue.callback = object : com.repository.listener.notification.NotificationQueue.Callback {
@@ -4708,12 +4720,16 @@ class ListenerService : LifecycleService(),
                 if (translationProvider == "azure") {
                     azureTranslationSession?.switchAudioSource(newSource)
                 }
+                // Re-assert desired state so the glasses learn the source change (gates
+                // whether they tap the far-party call downlink).
+                pushTranslationState()
                 LogCollector.i(TAG, "Translation audio source switched to: $newSource")
             }
             "stop_translation" -> {
                 translationMode = false
                 broadcastTranslationState(false)
                 translationAudioSource = "glasses"
+                systemSubSource = "playback"
                 translationTwoWay = false
                 glassesVadEngine?.reset()
                 systemAudioVadEngine?.release()
@@ -6015,6 +6031,9 @@ class ListenerService : LifecycleService(),
                 if (translationProvider == "azure") {
                     azureTranslationSession?.switchAudioSource(newSource)
                 }
+                // Re-assert desired state so the glasses learn the source change (gates
+                // whether they tap the far-party call downlink).
+                pushTranslationState()
                 LogCollector.i(TAG, "Translation audio source switched to: $newSource")
                 AdbResultWriter.writeSuccess(this, commandId, type,
                     JSONObject().put("audio_source", newSource))
@@ -6024,6 +6043,7 @@ class ListenerService : LifecycleService(),
                 translationMode = false
                 broadcastTranslationState(false)
                 translationAudioSource = "glasses"
+                systemSubSource = "playback"
                 translationTwoWay = false
                 glassesVadEngine?.reset()
                 systemAudioVadEngine?.release()
@@ -8947,6 +8967,8 @@ class ListenerService : LifecycleService(),
 
     private var glassesInwardAudioCount = 0L
     private var glassesInwardAudioDecodeErrCount = 0L
+    private var glassesCallAudioCount = 0L
+    private var glassesCallAudioDecodeErrCount = 0L
 
     /**
      * Inward mic audio from glasses (CH_AUDIO_DATA_INWARD).
@@ -9413,6 +9435,10 @@ class ListenerService : LifecycleService(),
             return
         }
         if (!translationMode || translationAudioSource != "system") return
+        // During a call the far party arrives on CH_AUDIO_DATA_CALL (onCallAudioData);
+        // the phone's own playback capture yields silence but may still tick, so gate it
+        // to the playback sub-source and let onCallAudioData own the call sub-source.
+        if (systemSubSource != "playback") return
         // Stream all audio to server -- no phone-side VAD gating.
         // Server-side whisper vad_filter handles silence detection.
         val byteBuffer = java.nio.ByteBuffer.allocate(samples.size * 2)
@@ -9425,6 +9451,53 @@ class ListenerService : LifecycleService(),
         } else {
             orchestratorClient.sendTranscribeAudioFrame(pcmBytes)
         }
+    }
+
+    /**
+     * Far-party HFP call downlink from the glasses (CH_AUDIO_DATA_CALL). Feeds the SAME
+     * translation session as onSystemAudioChunk, so "System Audio" translation covers
+     * phone calls. Guarded on the call sub-source so it never double-feeds with playback.
+     */
+    private fun onGlassesCallAudioData(b64Pcm: String) {
+        if (!translationMode || translationAudioSource != "system") return
+        if (systemSubSource != "call") return
+        val pcmBytes: ByteArray = try {
+            android.util.Base64.decode(b64Pcm, android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+        } catch (t: Throwable) {
+            if (glassesCallAudioDecodeErrCount++ % 100 == 0L) {
+                LogCollector.w(TAG, "onGlassesCallAudioData base64 decode failed (#${glassesCallAudioDecodeErrCount}): ${t.message}")
+            }
+            return
+        }
+        if (pcmBytes.isEmpty() || pcmBytes.size % 2 != 0) return
+        glassesCallAudioCount++
+        if (glassesCallAudioCount <= 3 || glassesCallAudioCount % 200 == 0L) {
+            LogCollector.i(TAG, "Call downlink audio #$glassesCallAudioCount: ${pcmBytes.size} bytes")
+        }
+        if (translationProvider == "azure") {
+            azureTranslationSession?.pushPcm(pcmBytes)
+            val samples = ShortArray(pcmBytes.size / 2)
+            java.nio.ByteBuffer.wrap(pcmBytes)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .asShortBuffer()
+                .get(samples)
+            broadcastTwoWayAudioLevel(samples)
+        } else {
+            orchestratorClient.sendTranscribeAudioFrame(pcmBytes)
+        }
+    }
+
+    /**
+     * Glasses HFP SCO state relay (CH_CALL_STATE). The glasses are the hands-free endpoint,
+     * so their SCO state is the authoritative signal that far-party call audio is arriving.
+     * Flip the translation system sub-source so onSystemAudioChunk / onGlassesCallAudioData
+     * hand off cleanly. No session restart -- the sink is source-agnostic.
+     */
+    private fun onGlassesCallState(scoActive: Boolean) {
+        val newSub = if (scoActive) "call" else "playback"
+        if (systemSubSource == newSub) return
+        systemSubSource = newSub
+        LogCollector.i(TAG, "Translation system sub-source -> $newSub (glasses sco=$scoActive)")
     }
 
     // --- Glasses amplitude tracking for conflict resolution ---
