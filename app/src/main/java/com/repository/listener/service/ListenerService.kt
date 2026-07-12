@@ -3772,19 +3772,31 @@ class ListenerService : LifecycleService(),
                             if (hi < 0) break
                             val frameLen = (hi shl 8) or lo
 
-                            // FIX 2: validate frame length before trusting it. A valid opus
-                            // frame at 16kHz/20ms is small (tens to low-hundreds of bytes);
-                            // frameLen < 3 is desync garbage (e.g. a 1-byte "frame" from
-                            // interleaved glasses writers) and > 4096 is never legit. When
-                            // the length is bogus the byte stream is misaligned -- no amount
-                            // of skipping/reinit realigns a mid-stream desync, so the fastest
+                            // Validate frame length before trusting it. A valid opus frame at
+                            // 16kHz/20ms is small (tens to low-hundreds of bytes); > 4096 is
+                            // never legit -- the byte stream is misaligned, and no amount of
+                            // skipping/reinit realigns a mid-stream desync, so the fastest
                             // recovery is to break and force a clean socket reconnect (the
                             // glasses re-handshake re-aligns the framing). This is NOT the
                             // restart_audio path; it just drops the corrupted client socket.
-                            if (frameLen < 3 || frameLen > 4096) {
+                            if (frameLen == 0 || frameLen > 4096) {
                                 LogCollector.e(TAG, "[Audio] desync: bad frameLen=$frameLen, resetting decoder and reconnecting")
                                 decoder.reinitialize()
                                 break
+                            }
+
+                            // The glasses encoder runs libopus with DTX enabled: during
+                            // silence it legally emits 1-2 byte frames (TOC-only). Those are
+                            // VALID framing -- consume the payload to stay aligned, count it
+                            // as liveness, and skip the decode (it carries no audio). Tearing
+                            // the socket down here (the old frameLen<3 check) caused a
+                            // teardown/reconnect storm during every silent stretch.
+                            if (frameLen < 3) {
+                                dis.readFully(ByteArray(frameLen))
+                                rfcommFrameCount++
+                                rfcommTotalBytes += 2 + frameLen
+                                lastGlassesAudioTimestamp = android.os.SystemClock.elapsedRealtime()
+                                continue
                             }
 
                             // Read Opus frame
@@ -8593,13 +8605,16 @@ class ListenerService : LifecycleService(),
             return
         }
 
-        // During a call translation the far-party downlink flows over the MESSAGE socket
-        // (CH_AUDIO_DATA_CALL -> onGlassesCallAudioData), NOT the a1b2c3 audio socket that feeds
-        // lastGlassesAudioTimestamp. That timestamp is therefore legitimately stale mid-call, so a
-        // restart_audio here is never the right recovery -- it only tears down the working call
-        // capture. The call audio path has its own liveness; skip the mic watchdog for it.
-        if (translationMode && translationAudioSource == "system" && systemSubSource == "call") {
-            LogCollector.w(TAG, "Mic stream stalled for ${stalledMs}ms but call translation active (system/call sub-source); skipping restart_audio")
+        // During a system-source translation the glasses mic is NOT the capture source
+        // (playback sub-source = phone MediaProjection; call sub-source = far-party downlink
+        // over the MESSAGE socket). The a1b2c3 audio socket that feeds
+        // lastGlassesAudioTimestamp is legitimately quiet: the glasses stream-mode gate
+        // auto-reverts to LOCAL_ONLY and stops writing. Firing restart_audio here put the
+        // glasses in a 40s hard-restart loop (mic pump + socket cycle) that contended with
+        // the translation front-mic recorder's 8ch HAL capture. Skip the watchdog for the
+        // whole system source, not just the call sub-source.
+        if (translationMode && translationAudioSource == "system") {
+            LogCollector.w(TAG, "Mic stream stalled for ${stalledMs}ms but system-source translation active (sub-source=$systemSubSource); skipping restart_audio")
             return
         }
 
