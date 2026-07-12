@@ -8593,6 +8593,16 @@ class ListenerService : LifecycleService(),
             return
         }
 
+        // During a call translation the far-party downlink flows over the MESSAGE socket
+        // (CH_AUDIO_DATA_CALL -> onGlassesCallAudioData), NOT the a1b2c3 audio socket that feeds
+        // lastGlassesAudioTimestamp. That timestamp is therefore legitimately stale mid-call, so a
+        // restart_audio here is never the right recovery -- it only tears down the working call
+        // capture. The call audio path has its own liveness; skip the mic watchdog for it.
+        if (translationMode && translationAudioSource == "system" && systemSubSource == "call") {
+            LogCollector.w(TAG, "Mic stream stalled for ${stalledMs}ms but call translation active (system/call sub-source); skipping restart_audio")
+            return
+        }
+
         LogCollector.w(TAG, "Mic stream stalled for ${stalledMs}ms, requesting glasses mic restart")
         lastGlassesAudioTimestamp = android.os.SystemClock.elapsedRealtime()
         phoneBtHost.sendDeviceCommand("restart_audio", "{}")
