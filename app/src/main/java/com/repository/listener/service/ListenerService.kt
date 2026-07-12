@@ -1832,6 +1832,27 @@ class ListenerService : LifecycleService(),
         })
     }
 
+    /**
+     * Push the authoritative desired translation state to the glasses so they reconcile
+     * their front-mic recorder. The phone owns translationMode; this is the self-healing
+     * net for a dropped edge-triggered start_translation/stop_translation command. Called
+     * on every translationMode change, on glasses (re)connect, and periodically by the mic
+     * watchdog while translation is active (no idle chatter -- an active session already
+     * keeps the RFCOMM link hot). No-op if the glasses are not connected.
+     */
+    private fun pushTranslationState() {
+        if (!phoneBtHost.isConnected) return
+        phoneBtHost.sendTranslationState(
+            active = translationMode,
+            fromLang = translationFromLang,
+            toLang = translationToLang,
+            fromNllb = translationFromNllb,
+            toNllb = translationToNllb,
+            fontSize = translationFontSize,
+            twoWay = translationTwoWay
+        )
+    }
+
     private fun stopAzureTranslationSession() {
         azureTranslationSession?.let {
             try { it.stop() } catch (t: Throwable) { LogCollector.w(TAG, "Azure stop error: ${t.message}") }
@@ -4677,6 +4698,7 @@ class ListenerService : LifecycleService(),
                     )
                 }
                 if (translationAudioSource == "system") startSystemAudioCapture()
+                pushTranslationState()
             }
             "switch_audio_source" -> {
                 val params = command.optJSONObject("params") ?: JSONObject()
@@ -4707,6 +4729,7 @@ class ListenerService : LifecycleService(),
                 translationProvider = "default"
                 stopSystemAudioCapture()
                 relayCommandToGlasses(requestId, command)
+                pushTranslationState()
             }
             "capture_image" -> {
                 if (isGlasses) {
@@ -5970,6 +5993,7 @@ class ListenerService : LifecycleService(),
                 phoneBtHost.sendTranslationConfigToApp(translationFromLang, translationToLang, translationFontSize, translationTwoWay)
                 phoneBtHost.sendCommand("start_translation", commandId, params.toString())
                 if (translationAudioSource == "system") startSystemAudioCapture()
+                pushTranslationState()
                 LogCollector.i(TAG, "Translation started: $translationFromLang -> $translationToLang (fontSize=$translationFontSize, audioSource=$translationAudioSource, provider=$translationProvider)")
                 AdbResultWriter.writeSuccess(this, commandId, type,
                     JSONObject().put("message", "Translation started"))
@@ -6017,6 +6041,7 @@ class ListenerService : LifecycleService(),
                 if (phoneBtHost.isConnected) {
                     phoneBtHost.sendCommand("stop_translation", commandId, "{}")
                 }
+                pushTranslationState()
                 LogCollector.i(TAG, "Translation stopped")
                 AdbResultWriter.writeSuccess(this, commandId, type,
                     JSONObject().put("message", "Translation stopped"))
@@ -8497,6 +8522,10 @@ class ListenerService : LifecycleService(),
         val runnable = object : Runnable {
             override fun run() {
                 checkMicStreamHealth()
+                // Self-heal translation desync: re-assert desired state only while
+                // translation is active (the session already keeps the link hot, so
+                // no idle chatter). Heals a start/stop command that dropped mid-flight.
+                if (translationMode) pushTranslationState()
                 mainHandler.postDelayed(this, MIC_WATCHDOG_INTERVAL_MS)
             }
         }
@@ -9491,22 +9520,12 @@ class ListenerService : LifecycleService(),
             if (cfgFrom.isNotEmpty() && cfgTo.isNotEmpty()) {
                 phoneBtHost.sendTranslationConfigToApp(cfgFrom, cfgTo, cfgFontSize, cfgTwoWay)
             }
-            val params = JSONObject().apply {
-                put("from_language", translationFromLang)
-                put("to_language", translationToLang)
-                put("from_nllb", translationFromNllb)
-                put("to_nllb", translationToNllb)
-                put("font_size", translationFontSize)
-                put("two_way", translationTwoWay)
-            }
-            if (translationMode) {
-                phoneBtHost.sendTranslationConfig(translationFromLang, translationToLang)
-                phoneBtHost.sendCommand("start_translation", "reconnect_${System.currentTimeMillis()}", params.toString())
-                LogCollector.i(TAG, "Translation restore: re-sent start_translation to glasses on reconnect")
-            } else {
-                phoneBtHost.sendCommand("stop_translation", "reconnect_${System.currentTimeMillis()}", "{}")
-                LogCollector.i(TAG, "Translation restore: pushed config + stop_translation on reconnect")
-            }
+            // Reconcile the glasses recorder to our authoritative translationMode on every
+            // (re)connect. Idempotent on the glasses side; heals a start/stop command that
+            // was lost while BT was down. One channel, one code path -- no fire-and-forget
+            // start_translation/stop_translation restore to drift out of sync.
+            pushTranslationState()
+            LogCollector.i(TAG, "Translation restore: pushed translation state (active=$translationMode) on reconnect")
         } catch (e: Exception) {
             LogCollector.w(TAG, "Translation state restore failed: ${e.message}")
         }

@@ -2098,6 +2098,40 @@ class PhoneBtHost(private val context: Context) {
         }
     }
 
+    /**
+     * Send the authoritative desired translation on/off state to the glasses so they
+     * reconcile their translationFrontMicRecorder to match. This is the self-healing net
+     * for a lost edge-triggered start_translation/stop_translation command (fire-and-forget
+     * RFCOMM can drop a frame). The phone owns translationMode; the glasses obey.
+     * Single JSON arg: {active, from, to, fromNllb, toNllb, fontSize, twoWay}.
+     */
+    fun sendTranslationState(
+        active: Boolean,
+        fromLang: String,
+        toLang: String,
+        fromNllb: String,
+        toNllb: String,
+        fontSize: Int,
+        twoWay: Boolean
+    ) {
+        try {
+            val stateJson = JSONObject().apply {
+                put("active", active)
+                put("from", fromLang)
+                put("to", toLang)
+                put("fromNllb", fromNllb)
+                put("toNllb", toNllb)
+                put("fontSize", fontSize)
+                put("twoWay", twoWay)
+            }.toString()
+            rfcommClient.send(BtProtocol.CH_TRANSLATION_STATE, stateJson)
+            txByteCount.addAndGet(estimateCapsSize(stateJson))
+            log("Translation state->glasses: active=$active $fromLang -> $toLang twoWay=$twoWay")
+        } catch (e: Exception) {
+            log("Failed to send translation state: ${e.message}")
+        }
+    }
+
     fun sendTodoListResponse(json: String) =
         sendChunkedJson(BtProtocol.CH_TODO_LIST_RESP, json, "Todo list")
 
