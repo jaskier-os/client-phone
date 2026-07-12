@@ -1375,6 +1375,18 @@ class ListenerService : LifecycleService(),
     // for the other person to read) lives here. Fed by CH_AUDIO_DATA_INWARD.
     private var azurePhoneMicSession: AzureTranslationSession? = null
 
+    // Opus decoder for the far-party call downlink (CH_AUDIO_DATA_CALL). The glasses
+    // Opus-compress that channel to avoid saturating RFCOMM, so it arrives as
+    // Base64 of concatenated 2-byte-LE-length Opus frames (same wire format as the
+    // dedicated MicStream socket). Long-lived: created lazily on the first call
+    // chunk and reused across the session -- a per-chunk MediaCodec create/start
+    // would be far too heavy and lose codec state. Guarded by callOpusDecoderLock
+    // because call chunks arrive on the BT read thread while stop/sub-source teardown
+    // runs on another thread; MediaCodec is not thread-safe and decode() on a
+    // released codec throws.
+    private var callOpusDecoder: com.repository.listener.audio.OpusStreamDecoder? = null
+    private val callOpusDecoderLock = Any()
+
     // --- Copilot (real-time conversational fact-check) ---
     // Two parallel recognition-only Azure sessions transcribe both speakers in
     // their own language. The wearer session is fed by the inward mic
@@ -1872,6 +1884,7 @@ class ListenerService : LifecycleService(),
             try { it.stop() } catch (t: Throwable) { LogCollector.w(TAG, "Azure phone-mic stop error: ${t.message}") }
         }
         azurePhoneMicSession = null
+        releaseCallOpusDecoder()
         resetAzureVadGate()
     }
 
@@ -9458,21 +9471,28 @@ class ListenerService : LifecycleService(),
      * translation session as onSystemAudioChunk, so "System Audio" translation covers
      * phone calls. Guarded on the call sub-source so it never double-feeds with playback.
      */
-    private fun onGlassesCallAudioData(b64Pcm: String) {
+    private fun onGlassesCallAudioData(b64Opus: String) {
         if (!translationMode || translationAudioSource != "system") return
         if (systemSubSource != "call") return
-        val pcmBytes: ByteArray = try {
-            android.util.Base64.decode(b64Pcm, android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING)
+        // The glasses Opus-compress the call downlink to avoid saturating RFCOMM.
+        // The payload is Base64(concatenated 2-byte-LE-length Opus frames); the
+        // encoder used NO_WRAP, so decode with NO_WRAP only -- adding NO_PADDING
+        // here would corrupt frames whose Base64 length is not a multiple of 4.
+        val opusBytes: ByteArray = try {
+            android.util.Base64.decode(b64Opus, android.util.Base64.NO_WRAP)
         } catch (t: Throwable) {
             if (glassesCallAudioDecodeErrCount++ % 100 == 0L) {
                 LogCollector.w(TAG, "onGlassesCallAudioData base64 decode failed (#${glassesCallAudioDecodeErrCount}): ${t.message}")
             }
             return
         }
+        if (opusBytes.isEmpty()) return
+
+        val pcmBytes = decodeCallOpusFrames(opusBytes) ?: return
         if (pcmBytes.isEmpty() || pcmBytes.size % 2 != 0) return
         glassesCallAudioCount++
         if (glassesCallAudioCount <= 3 || glassesCallAudioCount % 200 == 0L) {
-            LogCollector.i(TAG, "Call downlink audio #$glassesCallAudioCount: ${pcmBytes.size} bytes")
+            LogCollector.i(TAG, "Call downlink audio #$glassesCallAudioCount: ${pcmBytes.size} PCM bytes (${opusBytes.size} opus)")
         }
         if (translationProvider == "azure") {
             azureTranslationSession?.pushPcm(pcmBytes)
@@ -9488,6 +9508,59 @@ class ListenerService : LifecycleService(),
     }
 
     /**
+     * Parse concatenated 2-byte-LE-length Opus frames and decode them to a single
+     * PCM16LE buffer via the long-lived [callOpusDecoder]. Lazily initializes the
+     * decoder. Returns null if the decoder is unavailable or produced nothing.
+     * Serialized on [callOpusDecoderLock] against teardown from other threads.
+     */
+    private fun decodeCallOpusFrames(opusBytes: ByteArray): ByteArray? {
+        synchronized(callOpusDecoderLock) {
+            var decoder = callOpusDecoder
+            if (decoder == null) {
+                decoder = com.repository.listener.audio.OpusStreamDecoder()
+                if (!decoder.initialize()) {
+                    LogCollector.e(TAG, "Call Opus decoder init failed; call downlink will not be decoded")
+                    callOpusDecoder = null
+                    return null
+                }
+                callOpusDecoder = decoder
+            }
+
+            val out = java.io.ByteArrayOutputStream(opusBytes.size * 4)
+            var pos = 0
+            var produced = false
+            while (pos + 2 <= opusBytes.size) {
+                val frameLen = (opusBytes[pos].toInt() and 0xFF) or
+                    ((opusBytes[pos + 1].toInt() and 0xFF) shl 8)
+                pos += 2
+                if (frameLen <= 0 || pos + frameLen > opusBytes.size) {
+                    // Truncated/garbled tail -- stop rather than read out of bounds.
+                    if (glassesCallAudioDecodeErrCount++ % 100 == 0L) {
+                        LogCollector.w(TAG, "Call Opus frame length $frameLen out of range at pos=$pos len=${opusBytes.size}")
+                    }
+                    break
+                }
+                val frame = opusBytes.copyOfRange(pos, pos + frameLen)
+                pos += frameLen
+                val pcm = decoder.decode(frame) ?: continue
+                val bb = java.nio.ByteBuffer.allocate(pcm.size * 2).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                bb.asShortBuffer().put(pcm)
+                out.write(bb.array())
+                produced = true
+            }
+            return if (produced) out.toByteArray() else null
+        }
+    }
+
+    /** Release the call-downlink Opus decoder. Safe to call when none exists. */
+    private fun releaseCallOpusDecoder() {
+        synchronized(callOpusDecoderLock) {
+            callOpusDecoder?.let { try { it.release() } catch (_: Throwable) {} }
+            callOpusDecoder = null
+        }
+    }
+
+    /**
      * Glasses HFP SCO state relay (CH_CALL_STATE). The glasses are the hands-free endpoint,
      * so their SCO state is the authoritative signal that far-party call audio is arriving.
      * Flip the translation system sub-source so onSystemAudioChunk / onGlassesCallAudioData
@@ -9497,6 +9570,11 @@ class ListenerService : LifecycleService(),
         val newSub = if (scoActive) "call" else "playback"
         if (systemSubSource == newSub) return
         systemSubSource = newSub
+        // Leaving the call sub-source: drop the Opus decoder so the next call starts
+        // from a clean codec + framing boundary (mirrors the per-accept fresh decoder
+        // on the dedicated MicStream socket). It is re-created lazily on the next
+        // call chunk.
+        if (newSub != "call") releaseCallOpusDecoder()
         LogCollector.i(TAG, "Translation system sub-source -> $newSub (glasses sco=$scoActive)")
     }
 

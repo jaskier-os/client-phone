@@ -482,7 +482,7 @@ class PhoneBtHost(private val context: Context) {
     var onNotifReplySend: ((notifId: String, text: String) -> Unit)? = null
     var onNotifReplyCancel: ((notifId: String) -> Unit)? = null
     var onGlassesInwardAudioData: ((String) -> Unit)? = null  // base64 PCM from glasses inward mic (two-way translation)
-    var onGlassesCallAudioData: ((String) -> Unit)? = null  // base64 PCM from glasses HFP call downlink (far party)
+    var onGlassesCallAudioData: ((String) -> Unit)? = null  // base64 Opus frames from glasses HFP call downlink (far party)
     var onGlassesCallState: ((Boolean) -> Unit)? = null  // glasses HFP SCO state (call-audio present)
     var onSpeakerVerifyRequested: (() -> Unit)? = null
     var onSpeakerVerifyAudio: ((String) -> Unit)? = null  // base64 PCM from glasses mic 2
@@ -1326,13 +1326,13 @@ class PhoneBtHost(private val context: Context) {
 
     private fun handleCallAudioDataFromGlasses(args: RelayCaps) {
         try {
-            val b64Pcm = args.at(0).getString()
+            val b64Opus = args.at(0).getString()
             callAudioDataCount++
-            rxByteCount.addAndGet(b64Pcm.length.toLong() + 8)
+            rxByteCount.addAndGet(b64Opus.length.toLong() + 8)
             if (callAudioDataCount <= 3 || callAudioDataCount % 200 == 0L) {
-                log("Call audio data #$callAudioDataCount: ${b64Pcm.length} chars")
+                log("Call audio data #$callAudioDataCount: ${b64Opus.length} chars")
             }
-            onGlassesCallAudioData?.invoke(b64Pcm)
+            onGlassesCallAudioData?.invoke(b64Opus)
         } catch (e: Exception) {
             log("Failed to parse call audio data: ${e.message}")
         }
