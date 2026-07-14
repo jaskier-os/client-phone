@@ -65,16 +65,8 @@ object AppConfig {
     private const val KEY_AZURE_SPEECH_REGION = "azure_speech_region"
     private const val KEY_TRANSLATION_PROVIDER = "translation_provider"
     private const val KEY_TRANSLATION_TWO_WAY = "translation_two_way"
-    private const val KEY_RC_DEFAULT_PERMISSION_MODE = "rc_default_permission_mode"
     private const val KEY_LONE_TRUSTED = "lone_trusted_macs"
 
-    /** Orchestrator-side permission mode names (NOT CLI names). The phone never converts. */
-    val ALLOWED_PERMISSION_MODES = setOf(
-        "ask_on_potentially_safe",
-        "acceptAll",
-        "bypassAll",
-        "plan"
-    )
     val DEFAULT_AZURE_SPEECH_KEY = BuildConfig.AZURE_SPEECH_KEY
     const val DEFAULT_AZURE_SPEECH_REGION = "southeastasia"
     const val DEFAULT_TRANSLATION_PROVIDER = "azure"
@@ -472,32 +464,6 @@ object AppConfig {
 
     fun setAzureSpeechRegion(context: Context, region: String) {
         prefs(context).edit().putString(KEY_AZURE_SPEECH_REGION, region).apply()
-    }
-
-    /**
-     * Permission mode for new remote-control sessions. Returns null if unset --
-     * per permission-mode-contract.md section 5, the phone MUST NOT hardcode a
-     * client-side default. When unset, omit the field from the start request and
-     * let the orchestrator apply its canonical default.
-     */
-    fun getDefaultPermissionMode(context: Context): String? =
-        prefs(context).getString(KEY_RC_DEFAULT_PERMISSION_MODE, null)
-
-    /**
-     * Persist permission mode. Pass null to clear. Rejects values not in
-     * ALLOWED_PERMISSION_MODES (orchestrator-side names only).
-     */
-    fun setDefaultPermissionMode(context: Context, value: String?) {
-        if (value != null && value !in ALLOWED_PERMISSION_MODES) {
-            throw IllegalArgumentException("Invalid permission mode: $value")
-        }
-        val editor = prefs(context).edit()
-        if (value == null) {
-            editor.remove(KEY_RC_DEFAULT_PERMISSION_MODE)
-        } else {
-            editor.putString(KEY_RC_DEFAULT_PERMISSION_MODE, value)
-        }
-        editor.apply()
     }
 
     fun getTranslationProvider(context: Context): String =

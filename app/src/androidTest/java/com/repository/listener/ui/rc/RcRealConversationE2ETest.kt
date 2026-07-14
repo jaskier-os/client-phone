@@ -130,13 +130,15 @@ class RcRealConversationE2ETest {
             Thread.sleep(1_000)
             ScreenshotHelper.take("09_plan_approved")
         } else {
-            // No plan prompt -- might have auto-resolved. Switch mode manually.
+            // No plan prompt appeared. The phone no longer has a mode selector
+            // (RC sessions are bypass-only), so there is no manual fallback --
+            // the "Approve & Bypass All" prompt is the only path. Fail loudly.
             harness.awaitStatus(
                 { it == null || it.contains("Thought") },
                 timeoutMs = REPLY_TIMEOUT_MS
             )
-            harness.changeMode("Bypass all permissions", "Bypass")
-            ScreenshotHelper.take("09_bypass_mode_manual")
+            ScreenshotHelper.take("09_no_plan_prompt")
+            error("Expected an 'Approve & Bypass' plan prompt but none appeared")
         }
 
         // ============================================================

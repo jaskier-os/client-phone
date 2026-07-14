@@ -85,12 +85,13 @@ class RcChipTapTest {
             device.click(tapX, tapY)
             Thread.sleep(1500)
 
-            // Did RemoteControlActivity open? Look for its mode chip.
-            val modeChip = device.wait(
-                Until.findObject(By.res(PKG, "rcModeSelector")),
+            // Did RemoteControlActivity open? Look for its input field (always
+            // visible; the old mode chip is gone now that sessions are bypass-only).
+            val rcInput = device.wait(
+                Until.findObject(By.res(PKG, "rcInput")),
                 3000L
             )
-            val opened = modeChip != null
+            val opened = rcInput != null
             results.add("chip#$idx tapAt=($tapX,$tapY) opened=$opened")
 
             ScreenshotHelper.take("rc_chip_${idx}_after_tap_opened_$opened")

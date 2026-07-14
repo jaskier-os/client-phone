@@ -295,60 +295,6 @@ class RcStressTest {
         }
     }
 
-    @Test
-    fun permissionModeMidSession() {
-        val ignore1 = harness.assistantTexts().toSet()
-        harness.sendMessage("Reply only with: alpha")
-        val reply1 = harness.awaitAssistantReply(
-            matchSubstring = "alpha",
-            ignoreTexts = ignore1,
-            timeoutMs = SHORT_REPLY_TIMEOUT_MS
-        )
-        assertTrue("First reply should contain 'alpha'", reply1.contains("alpha", ignoreCase = true))
-
-        // The mode selector is the chip at res-id rcModeSelector in the toolbar.
-        // Tapping it opens a PopupMenu with entries: Default / Plan mode /
-        // Accept all edits / Bypass all permissions. The chip text after
-        // selection becomes one of: Default / Plan / Accept / Bypass.
-        // Session was launched in bypassAll => chip starts as "Bypass".
-        val chipBefore = device.findObject(By.res(PKG, "rcModeSelector"))
-        val chipBeforeText = chipBefore?.let { it.text }
-        assertNotNull("rcModeSelector chip must exist", chipBefore)
-
-        val toggled = harness.changeMode(
-            popupEntryText = "Plan mode",
-            expectedChipText = "Plan"
-        )
-        assertTrue(
-            "Mode chip should have transitioned to 'Plan' after tapping Plan mode " +
-                "(before='$chipBeforeText')",
-            toggled
-        )
-
-        // Hold the visible Plan-mode state for >=2s so the recording captures
-        // the toolbar chip change.
-        Thread.sleep(2_500)
-
-        val chipAfter = device.findObject(By.res(PKG, "rcModeSelector"))
-        val chipAfterText = chipAfter?.let { it.text }
-        assertEquals(
-            "Mode chip text should now be 'Plan'",
-            "Plan", chipAfterText
-        )
-
-        val ignore2 = harness.assistantTexts().toSet()
-        harness.sendMessage("Reply only with: beta-after-plan")
-        val reply2 = harness.awaitAssistantReply(
-            matchSubstring = "beta-after-plan",
-            ignoreTexts = ignore2,
-            timeoutMs = SHORT_REPLY_TIMEOUT_MS
-        )
-        assertTrue(
-            "Second reply (in Plan mode) should contain 'beta-after-plan' (was: '$reply2')",
-            reply2.contains("beta-after-plan", ignoreCase = true)
-        )
-    }
-
     // ------------------------------------------------------------------
     // Group 3 - Edge cases
     // ------------------------------------------------------------------

@@ -105,9 +105,10 @@ class RemoteControlUITest {
         // Top bar shows basename of workDir
         assertTextVisible("project", "Title should contain 'project'")
 
-        // Mode chip should be present (actual text depends on server-restored mode)
-        val modeChip = device.findObject(By.res(PKG, "rcModeSelector"))
-        assertNotNull("Mode chip should be visible", modeChip)
+        // Input field should be present (the mode chip was removed -- RC
+        // sessions always run in bypass mode).
+        val rcInput = device.findObject(By.res(PKG, "rcInput"))
+        assertNotNull("Input field should be visible", rcInput)
 
         ScreenshotHelper.take("01_activity_launches")
     }

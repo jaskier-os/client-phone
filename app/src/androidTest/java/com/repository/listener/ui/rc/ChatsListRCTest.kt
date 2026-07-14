@@ -172,9 +172,9 @@ class ChatsListRCTest {
         rcItem.click()
         Thread.sleep(1000)
 
-        // Verify RemoteControlActivity opened by checking for the mode chip
-        val modeChip = device.wait(Until.findObject(By.res("com.repository.listener", "rcModeSelector")), UI_TIMEOUT)
-        assertNotNull("RemoteControlActivity mode chip should be visible after click", modeChip)
+        // Verify RemoteControlActivity opened by checking for the input field
+        val rcInput = device.wait(Until.findObject(By.res("com.repository.listener", "rcInput")), UI_TIMEOUT)
+        assertNotNull("RemoteControlActivity input field should be visible after click", rcInput)
 
         ScreenshotHelper.take("chats_rc_activity_opened")
 

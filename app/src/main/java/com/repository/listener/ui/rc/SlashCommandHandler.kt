@@ -68,7 +68,6 @@ object SlashCommandRegistry {
         register(StatusCommand())
         register(HelpCommand())
         register(ExitCommand())
-        register(PermissionsCommand())
 
         // Blocked commands
         for (name in listOf("mcp", "config", "memory", "tasks", "theme", "plan")) {
@@ -205,17 +204,6 @@ private class ExitCommand : SlashCommandHandler("exit", "End the session") {
         callback: (CommandResult) -> Unit
     ) {
         activity.finish()
-        callback(CommandResult.Handled)
-    }
-}
-
-private class PermissionsCommand : SlashCommandHandler("permissions", "Open permission mode selector") {
-    override fun execute(
-        activity: RemoteControlActivity,
-        args: String,
-        callback: (CommandResult) -> Unit
-    ) {
-        activity.showModePopup()
         callback(CommandResult.Handled)
     }
 }

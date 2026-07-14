@@ -516,10 +516,6 @@ class ChatsListFragment : Fragment() {
         rebuildFolderChips()
 
         fab.setOnClickListener { onFabClicked() }
-        fab.setOnLongClickListener {
-            showPermissionModePicker()
-            true
-        }
 
         fabNewChat.setOnClickListener {
             val intent = Intent(requireContext(), ChatDetailActivity::class.java)
@@ -824,7 +820,11 @@ class ChatsListFragment : Fragment() {
                     return@onSuccess
                 }
                 sheet.onDirSelected = { workDir ->
-                    showConversationPicker(remoteClient, workDir, AppConfig.getDefaultPermissionMode(ctx))
+                    // RC sessions always run in bypass mode (no phone-side mode
+                    // picker). Send it explicitly so the orchestrator spawns the
+                    // CLI with --dangerously-skip-permissions rather than falling
+                    // back to its ask-on-safe default when the phone sends null.
+                    showConversationPicker(remoteClient, workDir, "bypassAll")
                 }
                 sheet.showDirs(response.dirs)
             }
@@ -887,39 +887,6 @@ class ChatsListFragment : Fragment() {
                     .show()
             }
         }
-    }
-
-    /**
-     * Picker for the default RC permission mode (orchestrator-side names persisted verbatim).
-     * Index 0 = "(default)" -- no value set, orchestrator applies its canonical default.
-     * Triggered via long-press on the remote-session FAB.
-     */
-    private fun showPermissionModePicker() {
-        val ctx = context ?: return
-        val labels = arrayOf(
-            "(default)",
-            "Ask on potentially unsafe (ask_on_potentially_safe)",
-            "Accept edits (acceptAll)",
-            "Bypass all prompts (bypassAll)",
-            "Plan only (plan)"
-        )
-        val values = arrayOf<String?>(
-            null,
-            "ask_on_potentially_safe",
-            "acceptAll",
-            "bypassAll",
-            "plan"
-        )
-        val current = AppConfig.getDefaultPermissionMode(ctx)
-        val checked = values.indexOf(current).let { if (it < 0) 0 else it }
-        MaterialAlertDialogBuilder(ctx)
-            .setTitle("Default permission mode")
-            .setSingleChoiceItems(labels, checked) { dialog, which ->
-                AppConfig.setDefaultPermissionMode(ctx, values[which])
-                dialog.dismiss()
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
     }
 
     private fun loadSessions() {

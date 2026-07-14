@@ -30,7 +30,6 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.GridLayout
 import android.widget.ImageView
-import android.widget.PopupMenu
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
@@ -69,7 +68,6 @@ class RemoteControlActivity : AppCompatActivity() {
     private lateinit var recordingOverlay: RecordingOverlay
     private lateinit var titleText: TextView
     private lateinit var statusDot: View
-    private lateinit var modeSelector: TextView
     private lateinit var endedBanner: TextView
     private lateinit var scrollToBottomBtn: ImageView
     private lateinit var stopButton: ImageView
@@ -79,7 +77,10 @@ class RemoteControlActivity : AppCompatActivity() {
 
     private var sessionId: String = ""
     private var workDir: String = ""
-    private var currentMode: String = "bypassAll"
+    // RC sessions always run in bypass mode. The mode is not user-selectable on
+    // the phone -- the orchestrator maps this to the CLI's bypassPermissions
+    // (--dangerously-skip-permissions) at spawn, for both fresh and --resume.
+    private val currentMode: String = "bypassAll"
     private val permissionQueue = ArrayDeque<RcMessage.PermissionRequest>()
     private var currentPermissionRequest: RcMessage.PermissionRequest? = null
     private lateinit var actionButtonsContainer: GridLayout
@@ -529,8 +530,8 @@ class RemoteControlActivity : AppCompatActivity() {
             val newMode = intent.getStringExtra(ListenerService.EXTRA_RC_DATA) ?: return
             runOnUiThread {
                 hideThinkingAnimation()
-                currentMode = newMode
-                updateModeSelector()
+                // Mode is fixed to bypass on the phone; just surface the change
+                // as an informational bubble (e.g. a CLI-driven plan-mode toggle).
                 adapter.addMessage(RcMessage.ModeChange(
                     id = UUID.randomUUID().toString(),
                     timestamp = System.currentTimeMillis(),
@@ -751,8 +752,15 @@ class RemoteControlActivity : AppCompatActivity() {
                         if (data != null) {
                             val text = data.optString("text", "")
                             val isFinal = data.optBoolean("isFinal", false)
-                            // Skip final markers (empty text) and non-final streaming updates
-                            // Only keep messages whose text isn't a prefix of any later rc_message
+                            // Collapse legacy streaming partials: an entry is
+                            // superseded only when the next rc_message CONTINUES
+                            // it (its text starts with this text), i.e. a longer
+                            // snapshot of the same turn. A length-only check
+                            // wrongly dropped a short turn followed by a longer
+                            // *different* turn -- the exact multi-device-resume
+                            // "old transcript" bug. Consolidated turns (persisted
+                            // once on 'result') are never prefixes of each other,
+                            // so each survives.
                             if (text.isNotEmpty()) {
                                 var isSuperseded = false
                                 for (j in (i + 1) until arr.length()) {
@@ -760,7 +768,7 @@ class RemoteControlActivity : AppCompatActivity() {
                                     if (nextObj.optString("type") == "rc_message") {
                                         val nextData = nextObj.optJSONObject("data")
                                         val nextText = nextData?.optString("text", "") ?: ""
-                                        if (nextText.isNotEmpty() && nextText.length >= text.length) {
+                                        if (nextText.length > text.length && nextText.startsWith(text)) {
                                             isSuperseded = true
                                         }
                                         break
@@ -935,9 +943,8 @@ class RemoteControlActivity : AppCompatActivity() {
 
         sessionId = intent.getStringExtra(EXTRA_SESSION_ID) ?: ""
         workDir = intent.getStringExtra(EXTRA_WORK_DIR) ?: ""
-        intent.getStringExtra(EXTRA_PERMISSION_MODE)?.let { mode ->
-            currentMode = mode
-        }
+        // RC sessions always run in bypass mode; the mode is never user-selectable
+        // on the phone, so ignore any EXTRA_PERMISSION_MODE the caller passed.
 
         recyclerView = findViewById(R.id.rcMessageList)
         inputField = findViewById(R.id.rcInput)
@@ -946,7 +953,6 @@ class RemoteControlActivity : AppCompatActivity() {
         recordingOverlay = findViewById(R.id.rcRecordingOverlay)
         titleText = findViewById(R.id.rcTitle)
         statusDot = findViewById(R.id.rcStatusDot)
-        modeSelector = findViewById(R.id.rcModeSelector)
         endedBanner = findViewById(R.id.rcEndedBanner)
         stopButton = findViewById(R.id.rcStopButton)
         actionButtonsContainer = findViewById(R.id.rcActionButtons)
@@ -1078,9 +1084,7 @@ class RemoteControlActivity : AppCompatActivity() {
         // Build slash command popup (hidden initially)
         buildSlashPopup()
 
-        // Mode selector popup
-        modeSelector.setOnClickListener { showModePopup() }
-        updateModeSelector()
+        // Permission-mode selector removed: sessions always run in bypass mode.
 
         // Status dot -- set based on initial status
         val initialStatus = intent.getStringExtra(EXTRA_SESSION_STATUS) ?: "active"
@@ -1170,22 +1174,8 @@ class RemoteControlActivity : AppCompatActivity() {
                         )
                     }
                 }
-                // Restore permission mode from server (orchestrator stores
-                // canonical names; map to phone short names for the UI).
-                val serverMode = live.permissionMode
-                if (serverMode != null) {
-                    val phoneMode = when (serverMode) {
-                        "ask_on_potentially_safe" -> "bypassAll"
-                        "acceptAll" -> "acceptEdits"
-                        "bypassAll" -> "bypassAll"
-                        "plan" -> "plan"
-                        else -> serverMode
-                    }
-                    runOnUiThread {
-                        currentMode = phoneMode
-                        updateModeSelector()
-                    }
-                }
+                // Permission mode is fixed to bypass on the phone; nothing to
+                // restore or display from the server's stored mode.
             }
             result.onFailure { err ->
                 LogCollector.e(TAG, "refreshSessionStatus failed: ${err.message}")
@@ -1419,40 +1409,6 @@ class RemoteControlActivity : AppCompatActivity() {
                 }
             }
         }
-    }
-
-    internal fun showModePopup() {
-        val popup = PopupMenu(this, modeSelector)
-        popup.menu.add(0, 0, 0, "Plan mode")
-        popup.menu.add(0, 1, 1, "Accept all edits")
-        popup.menu.add(0, 2, 2, "Bypass all permissions")
-        popup.setOnMenuItemClickListener { item ->
-            val mode = when (item.itemId) {
-                0 -> "plan"
-                1 -> "acceptEdits"
-                2 -> "bypassAll"
-                else -> "bypassAll"
-            }
-            sendBroadcast(Intent(ListenerService.ACTION_RC_MODE_REQ).apply {
-                setPackage(packageName)
-                putExtra(ListenerService.EXTRA_RC_SESSION_ID, sessionId)
-                putExtra("rc_mode", mode)
-            })
-            currentMode = mode
-            updateModeSelector()
-            true
-        }
-        popup.show()
-    }
-
-    private fun updateModeSelector() {
-        val label = when (currentMode) {
-            "plan" -> "Plan"
-            "acceptEdits" -> "Accept"
-            "bypassAll" -> "Bypass"
-            else -> currentMode
-        }
-        modeSelector.text = label
     }
 
     private fun showNextPermissionPrompt() {
@@ -1707,11 +1663,6 @@ class RemoteControlActivity : AppCompatActivity() {
             inputField.hint = "Send a message..."
         }
 
-        // Update mode selector chip if mode changed
-        if (modeChange != null) {
-            currentMode = modeChange
-            updateModeSelector()
-        }
 
         // Hide action buttons, show input bar
         actionButtonsContainer.visibility = View.GONE

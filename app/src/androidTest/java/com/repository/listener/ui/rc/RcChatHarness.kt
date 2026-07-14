@@ -205,37 +205,6 @@ class RcChatHarness(val device: UiDevice) {
         Thread.sleep(300)
     }
 
-    /**
-     * Tap the rcModeSelector chip and pick a mode entry from the popup menu.
-     * `popupEntryText` is the visible PopupMenu item label (e.g. "Plan mode",
-     * "Bypass all permissions"). `expectedChipText` is the post-selection chip
-     * label ("Plan", "Bypass", etc.) -- waits up to 5s for the chip text to
-     * change to it. Returns true if the chip transitioned.
-     */
-    fun changeMode(popupEntryText: String, expectedChipText: String): Boolean {
-        val chip = device.findObject(By.res(PKG, "rcModeSelector"))
-            ?: error("rcModeSelector not found")
-        val before = chip.text
-        chip.click()
-        Thread.sleep(900)
-        val entry = device.wait(Until.findObject(By.text(popupEntryText)), 4_000L)
-            ?: error("Mode popup entry '$popupEntryText' not found (canonical exact-text match required)")
-        entry.click()
-        Thread.sleep(600)
-        val deadline = System.currentTimeMillis() + 5_000L
-        while (System.currentTimeMillis() < deadline) {
-            val now = device.findObject(By.res(PKG, "rcModeSelector"))
-            val txt = now?.text
-            if (txt != null && txt.equals(expectedChipText, ignoreCase = true)) return true
-            Thread.sleep(200)
-        }
-        val finalTxt = device.findObject(By.res(PKG, "rcModeSelector"))?.text
-        throw AssertionError(
-            "changeMode: chip text did not become '$expectedChipText' " +
-                "(before='$before', after='$finalTxt')"
-        )
-    }
-
     fun tapStop() {
         val stop = device.findObject(By.res(PKG, "rcStopButton"))
             ?: error("rcStopButton not found")
