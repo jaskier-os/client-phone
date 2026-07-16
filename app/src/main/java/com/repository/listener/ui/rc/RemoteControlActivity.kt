@@ -665,15 +665,17 @@ class RemoteControlActivity : AppCompatActivity() {
 
     private val rcTranscriptReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (!matchesSession(intent)) return
+            if (!matchesSession(intent)) {
+                LogCollector.i(TAG, "rcTranscriptReceiver: session mismatch, skipping")
+                return
+            }
             val sid = intent.getStringExtra(ListenerService.EXTRA_RC_SESSION_ID) ?: return
-            // Transcript JSON is fetched from an in-process cache rather than
-            // ridden in an Intent extra: payloads >1MB blow the Binder
-            // transaction limit and the OS kills us with "Can't deliver
-            // broadcast". Cache is populated by ListenerService.onRcTranscript.
-            val transcript = ListenerService.rcTranscriptCache[sid] ?: return
-            // Parse off the main thread -- O(n^2) supersession check on a
-            // 100KB+ string can otherwise blow the broadcast deadline.
+            val transcript = ListenerService.rcTranscriptCache[sid]
+            if (transcript == null) {
+                LogCollector.i(TAG, "rcTranscriptReceiver: cache miss for $sid")
+                return
+            }
+            LogCollector.i(TAG, "rcTranscriptReceiver: got ${transcript.length} chars for $sid, parsing")
             Thread({
                 try { parseAndLoadTranscript(transcript) }
                 catch (e: Exception) { LogCollector.e(TAG, "Transcript parse failed: ${e.message}") }
@@ -915,13 +917,13 @@ class RemoteControlActivity : AppCompatActivity() {
                 }
             }
             runOnUiThread {
-                android.util.Log.d("RcTranscript", "fetched=${arr.length()} merged=${merged.size} adapterBefore=${adapter.getMessages().size}")
-                // Only replace if transcript has real content. Never clear an existing
-                // adapter to empty -- a subsequent WS catch-up may yet populate it,
-                // and live events will fill it as they arrive.
+                LogCollector.i(TAG, "parseAndLoadTranscript: fetched=${arr.length()} merged=${merged.size} adapterBefore=${adapter.getMessages().size}")
                 if (merged.isNotEmpty()) {
                     adapter.submitMessages(merged)
                     scrollToBottom()
+                    LogCollector.i(TAG, "parseAndLoadTranscript: adapter updated, adapterAfter=${adapter.getMessages().size}")
+                } else {
+                    LogCollector.i(TAG, "parseAndLoadTranscript: merged is empty, adapter NOT updated")
                 }
                 // Pending permissions are NOT queued from the transcript --
                 // only live re-sends from the orchestrator (via rcPermissionReceiver)
