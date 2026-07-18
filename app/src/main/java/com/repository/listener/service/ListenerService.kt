@@ -53,6 +53,8 @@ import com.repository.listener.config.AppConfig
 import com.repository.listener.scanner.NetworkScanner
 import com.repository.listener.network.AzureTranslationSession
 import com.repository.listener.network.ChatHistoryClient
+import com.repository.listener.network.DesktopRelayLocator
+import com.repository.listener.network.LanRelayClient
 import com.repository.listener.network.OrchestratorClient
 import com.repository.listener.network.ReidAnalyticsClient
 import com.repository.listener.network.WebRTCClient
@@ -439,6 +441,64 @@ class ListenerService : LifecycleService(),
     private var audioRelayRetryCount = 0
     private val audioRelayRetryDelays = longArrayOf(2_000, 5_000, 15_000)
     private var audioRelayRetryRunnable: Runnable? = null
+    // The stream id of the offer we are currently answering. A WebRTC disconnect
+    // for any other (stale) stream is ignored so peer-swap closes don't trigger
+    // spurious retries.
+    @Volatile
+    private var currentAudioStreamId = -1
+    // Coalescing guard: true while a start attempt is in flight (from any driver)
+    // so concurrent starts don't stampede. Cleared on connect, failure, or window.
+    @Volatile
+    private var audioRelayStartInFlight = false
+    private var audioRelayStartWatchdog: Runnable? = null
+    private val AUDIO_RELAY_START_WINDOW_MS = 12_000L
+
+    // LAN-direct audio relay: when the phone and PC are on the same network the
+    // audio-relay signaling connects straight to the desktop's local server
+    // (discovered via mDNS), skipping the cloud orchestrator hop. When no PC is
+    // discovered / reachable it transparently falls back to the cloud path.
+    private var desktopRelayLocator: DesktopRelayLocator? = null
+    private var lanRelayClient: LanRelayClient? = null
+    // True while the current audio-relay session is signaling over the LAN
+    // channel. Determines whether WebRTC answer/ICE go to lanRelayClient or the
+    // cloud orchestratorClient.
+    @Volatile
+    private var audioRelayViaLan = false
+
+    // Held while WebRTC audio is streaming. Without it Android WiFi power-save
+    // duty-cycles the radio (especially on 2.4 GHz), adding periodic 100-300ms
+    // latency spikes to the UDP media flow that are audible as regular hiccups.
+    private var audioRelayWifiLock: android.net.wifi.WifiManager.WifiLock? = null
+
+    private fun acquireAudioRelayWifiLock() {
+        try {
+            if (audioRelayWifiLock == null) {
+                val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+                    android.net.wifi.WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                else
+                    @Suppress("DEPRECATION") android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF
+                audioRelayWifiLock = wm.createWifiLock(mode, "listener:audioRelay")
+            }
+            audioRelayWifiLock?.takeIf { !it.isHeld }?.let {
+                it.acquire()
+                LogCollector.i(TAG, "Audio relay: WiFi low-latency lock acquired")
+            }
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "Audio relay: WiFi lock acquire failed: ${e.message}")
+        }
+    }
+
+    private fun releaseAudioRelayWifiLock() {
+        try {
+            audioRelayWifiLock?.takeIf { it.isHeld }?.let {
+                it.release()
+                LogCollector.i(TAG, "Audio relay: WiFi low-latency lock released")
+            }
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "Audio relay: WiFi lock release failed: ${e.message}")
+        }
+    }
     private lateinit var screenCapturer: ScreenCapturer
     private lateinit var cameraCapturer: CameraCapturer
     private lateinit var locationProvider: LocationProvider
@@ -788,17 +848,13 @@ class ListenerService : LifecycleService(),
                     orchestratorClient.sendStreamSwitchMonitor(streamId, monitor)
                 }
                 ACTION_AUDIO_RELAY_START -> {
-                    val targetDeviceId = intent.getStringExtra("target_device_id") ?: return
                     val bitrate = intent.getIntExtra("bitrate", 64000)
-                    LogCollector.i(TAG, "Audio relay start for $targetDeviceId bitrate=$bitrate")
-                    orchestratorClient.sendAudioRelayStart(targetDeviceId, bitrate)
+                    LogCollector.i(TAG, "Audio relay start bitrate=$bitrate")
+                    startAudioRelay(bitrate)
                 }
                 ACTION_AUDIO_RELAY_STOP -> {
-                    val targetDeviceId = intent.getStringExtra("target_device_id") ?: return
-                    LogCollector.i(TAG, "Audio relay stop for $targetDeviceId")
-                    webRTCClient?.close()
-                    audioRelayActive = false
-                    orchestratorClient.sendAudioRelayStop(targetDeviceId)
+                    LogCollector.i(TAG, "Audio relay stop")
+                    stopAudioRelay()
                 }
             }
         }
@@ -1058,7 +1114,11 @@ class ListenerService : LifecycleService(),
 
     private val webRTCListener = object : WebRTCClient.Listener {
         override fun onWebRTCAnswer(streamId: Int, sdp: String) {
-            orchestratorClient.sendWebRTCAnswer(streamId, sdp)
+            if (audioRelayViaLan) {
+                lanRelayClient?.sendWebRTCAnswer(streamId, sdp)
+            } else {
+                orchestratorClient.sendWebRTCAnswer(streamId, sdp)
+            }
         }
         override fun onWebRTCAudioConnected(streamId: Int) {
             LogCollector.i(TAG, "WebRTC audio connected for stream $streamId")
@@ -1066,13 +1126,25 @@ class ListenerService : LifecycleService(),
             audioRelayRetryCount = 0
             audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
             audioRelayRetryRunnable = null
+            clearAudioRelayStartInFlight()
+            acquireAudioRelayWifiLock()
             sendBroadcast(Intent(ACTION_AUDIO_RELAY_ACK).apply {
                 setPackage(packageName)
             })
         }
         override fun onWebRTCDisconnected(streamId: Int) {
+            // Ignore disconnects for a stream that is no longer the current one:
+            // when a new offer arrives, WebRTCClient closes the old peer, which
+            // fires this for the STALE streamId. Retrying on that stale close is
+            // what spawned the reconnect storm.
+            if (streamId != currentAudioStreamId) {
+                LogCollector.i(TAG, "WebRTC disconnect for stale stream $streamId (current=$currentAudioStreamId), ignoring")
+                return
+            }
             LogCollector.i(TAG, "WebRTC audio disconnected for stream $streamId")
             audioRelayActive = false
+            clearAudioRelayStartInFlight()
+            releaseAudioRelayWifiLock()
             scheduleAudioRelayRetry()
         }
     }
@@ -2821,6 +2893,11 @@ class ListenerService : LifecycleService(),
 
         orchestratorClient = OrchestratorClient(orchestratorUrl, deviceId, apiKey)
         orchestratorClient.setListener(this)
+
+        // Discover the desktop's LAN-direct relay server (mDNS) so audio relay can
+        // skip the cloud hop when phone and PC share a network. Best-effort; the
+        // audio-relay path falls back to the cloud when nothing is discovered.
+        desktopRelayLocator = DesktopRelayLocator(this).also { it.start() }
 
         // WebRTCClient initialized lazily on first webrtc_offer via getOrCreateWebRTCClient()
 
@@ -5848,16 +5925,14 @@ class ListenerService : LifecycleService(),
                             return
                         }
                         val bitrate = params.optInt("bitrate", 64000)
-                        orchestratorClient.sendAudioRelayStart("desktop-listener", bitrate)
+                        startAudioRelay(bitrate)
                         AdbResultWriter.writeSuccess(this, commandId, type, JSONObject().apply {
                             put("action", "start")
                             put("bitrate", bitrate)
                         })
                     }
                     "stop" -> {
-                        webRTCClient?.close()
-                        audioRelayActive = false
-                        orchestratorClient.sendAudioRelayStop("desktop-listener")
+                        stopAudioRelay()
                         AdbResultWriter.writeSuccess(this, commandId, type, JSONObject().apply {
                             put("action", "stop")
                         })
@@ -7640,11 +7715,16 @@ class ListenerService : LifecycleService(),
         orchestratorClient.sendTodoList()
         phoneBtHost.sendSystemStatus(true)
 
-        // Auto-restart audio relay if it was active before disconnect/restart
-        if (AppConfig.getAudioRelayDesired(this)) {
+        // Auto-restart audio relay ONLY if it isn't already streaming. The audio
+        // path (LAN-direct or cloud WebRTC) is independent of this cloud-control
+        // WebSocket: a brief 2.4GHz stall can bounce this WS while the LAN audio
+        // stream is perfectly healthy. Blindly restarting here would tear down a
+        // working stream and trigger a reconnect storm. Only restart when audio
+        // is actually down.
+        if (AppConfig.getAudioRelayDesired(this) && !audioRelayActive) {
             val bitrate = AppConfig.getAudioBitrate(this)
-            LogCollector.i(TAG, "Audio relay: auto-restarting (desired=true, ${bitrate}bps)")
-            orchestratorClient.sendAudioRelayStart("desktop-listener", bitrate)
+            LogCollector.i(TAG, "Audio relay: auto-restarting (desired=true, not active, ${bitrate}bps)")
+            startAudioRelay(bitrate)
         }
 
         // Retry pending glasses request after reconnect
@@ -7744,10 +7824,139 @@ class ListenerService : LifecycleService(),
         })
     }
 
+    /**
+     * Single decision point for starting audio relay. If the desktop's local
+     * relay server is discovered on the LAN (same WiFi), signals directly to it
+     * over [lanRelayClient]; otherwise routes through the cloud
+     * [orchestratorClient]. All six call sites (UI intent, ADB, reconnect,
+     * retry) funnel through here so the LAN-vs-cloud choice lives in one place.
+     */
+    private fun startAudioRelay(bitrate: Int) {
+        // Coalesce concurrent start drivers (UI intent, ADB, cloud onConnected
+        // auto-restart, and the retry chain can all fire near-simultaneously on a
+        // flaky link). Without this guard each caller spins up its own
+        // LanRelayClient / cloud-start that tears down the others -- the reconnect
+        // storm. Once a start is in flight we ignore further starts until it
+        // connects (audioRelayActive) or the attempt window elapses.
+        if (audioRelayActive) {
+            LogCollector.i(TAG, "Audio relay start ignored: already active")
+            return
+        }
+        if (audioRelayStartInFlight) {
+            LogCollector.i(TAG, "Audio relay start ignored: attempt already in flight")
+            return
+        }
+        audioRelayStartInFlight = true
+        audioRelayStartWatchdog?.let { mainHandler.removeCallbacks(it) }
+        val watchdog = Runnable { audioRelayStartInFlight = false }
+        audioRelayStartWatchdog = watchdog
+        mainHandler.postDelayed(watchdog, AUDIO_RELAY_START_WINDOW_MS)
+
+        val endpoint = if (primaryWifiNetwork() != null) desktopRelayLocator?.endpoint() else null
+        if (endpoint != null) {
+            startAudioRelayViaLan(endpoint, bitrate)
+        } else {
+            startAudioRelayViaCloud(bitrate)
+        }
+    }
+
+    private fun clearAudioRelayStartInFlight() {
+        audioRelayStartInFlight = false
+        audioRelayStartWatchdog?.let { mainHandler.removeCallbacks(it) }
+        audioRelayStartWatchdog = null
+    }
+
+    private fun startAudioRelayViaCloud(bitrate: Int) {
+        // Only one transport may feed the desktop's shared audio capture at a
+        // time -- kill any LAN session so two peers never split the PCM stream.
+        lanRelayClient?.let { it.listener = null; it.close() }
+        lanRelayClient = null
+        audioRelayViaLan = false
+        LogCollector.i(TAG, "Audio relay: starting via cloud (${bitrate}bps)")
+        orchestratorClient.sendAudioRelayStart("desktop-listener", bitrate)
+    }
+
+    private fun startAudioRelayViaLan(endpoint: DesktopRelayLocator.Endpoint, bitrate: Int) {
+        // Only one transport may feed the desktop's shared audio capture at a
+        // time. A cloud session may exist from an earlier fallback -- stop it
+        // server-side, otherwise its desktop peer keeps consuming PCM frames
+        // (consent checks are disabled) and the LAN stream loses every other
+        // frame, which sounds like constant stutter.
+        orchestratorClient.sendAudioRelayStop("desktop-listener")
+        // Tear down any prior LAN attempt before starting a new one.
+        lanRelayClient?.let { it.listener = null; it.close() }
+        val url = "ws://${endpoint.host}:${endpoint.port}/ws/device"
+        LogCollector.i(TAG, "Audio relay: starting via LAN $url (${bitrate}bps)")
+        audioRelayViaLan = true
+        val client = LanRelayClient(url, AppConfig.getDeviceId(this))
+        client.listener = object : LanRelayClient.Listener {
+            override fun onConnected() {
+                client.sendAudioRelayStart(bitrate)
+            }
+            override fun onClosed(reason: String) {
+                // If the LAN session dropped before audio was flowing, fall back
+                // to the cloud path so the user still gets audio. Clear the
+                // in-flight guard first so the fallback start is allowed through.
+                if (audioRelayViaLan && !audioRelayActive && AppConfig.getAudioRelayDesired(this@ListenerService)) {
+                    LogCollector.w(TAG, "Audio relay: LAN closed ($reason) before active, falling back to cloud")
+                    clearAudioRelayStartInFlight()
+                    mainHandler.post { startAudioRelayViaCloud(bitrate) }
+                }
+            }
+            override fun onAudioRelayAck(sampleRate: Int, channels: Int, br: Int, frameSize: Int, frameDurationMs: Int) {
+                this@ListenerService.onAudioRelayAck(sampleRate, channels, br, frameSize, frameDurationMs)
+            }
+            override fun onAudioRelayError(reason: String) {
+                this@ListenerService.onAudioRelayError(reason)
+            }
+            override fun onWebRTCOffer(streamId: Int, sdp: String) {
+                // LAN-path offer: bind the answer transport to LAN as we accept it.
+                audioRelayViaLan = true
+                handleWebRTCOffer(streamId, sdp)
+            }
+        }
+        lanRelayClient = client
+        client.connect()
+    }
+
+    /** Single decision point for stopping audio relay (LAN or cloud). */
+    private fun stopAudioRelay() {
+        webRTCClient?.close()
+        audioRelayActive = false
+        clearAudioRelayStartInFlight()
+        audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        audioRelayRetryRunnable = null
+        audioRelayRetryCount = 0
+        releaseAudioRelayWifiLock()
+        if (audioRelayViaLan) {
+            lanRelayClient?.sendAudioRelayStop()
+            lanRelayClient?.let { it.listener = null; it.close() }
+            lanRelayClient = null
+            audioRelayViaLan = false
+        } else {
+            orchestratorClient.sendAudioRelayStop("desktop-listener")
+        }
+    }
+
+    /** A transport is available if the cloud is connected OR a LAN PC is discovered. */
+    private fun audioRelayTransportAvailable(): Boolean =
+        orchestratorConnected || (primaryWifiNetwork() != null && desktopRelayLocator?.endpoint() != null)
+
     private fun scheduleAudioRelayRetry() {
+        // Single-flight: cancel any already-pending retry so rapid disconnects
+        // (e.g. WebRTCClient closing the old peer when a new offer arrives) can't
+        // pile up parallel retry chains that each spawn a new LanRelayClient and
+        // tear each other down -- that feedback loop was the reconnect storm.
+        audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        audioRelayRetryRunnable = null
+
         val desired = AppConfig.getAudioRelayDesired(this)
-        if (!desired || !orchestratorConnected) {
-            LogCollector.i(TAG, "Audio relay retry skipped: desired=$desired, orchestrator=$orchestratorConnected")
+        if (!desired || !audioRelayTransportAvailable()) {
+            LogCollector.i(TAG, "Audio relay retry skipped: desired=$desired, transport=${audioRelayTransportAvailable()}")
+            return
+        }
+        if (audioRelayActive) {
+            LogCollector.i(TAG, "Audio relay retry skipped: already active")
             return
         }
         if (audioRelayRetryCount >= audioRelayRetryDelays.size) {
@@ -7759,11 +7968,11 @@ class ListenerService : LifecycleService(),
         LogCollector.i(TAG, "Audio relay: scheduling retry #${audioRelayRetryCount + 1} in ${delay}ms")
         val runnable = Runnable {
             audioRelayRetryRunnable = null
-            if (AppConfig.getAudioRelayDesired(this) && orchestratorConnected && !audioRelayActive) {
+            if (AppConfig.getAudioRelayDesired(this) && audioRelayTransportAvailable() && !audioRelayActive) {
                 audioRelayRetryCount++
                 val bitrate = AppConfig.getAudioBitrate(this)
                 LogCollector.i(TAG, "Audio relay: auto-restarting (attempt $audioRelayRetryCount)")
-                orchestratorClient.sendAudioRelayStart("desktop-listener", bitrate)
+                startAudioRelay(bitrate)
                 scheduleAudioRelayRetry()
             }
         }
@@ -7785,6 +7994,7 @@ class ListenerService : LifecycleService(),
     override fun onAudioRelayError(reason: String) {
         LogCollector.e(TAG, "Audio relay error from desktop: $reason")
         audioRelayActive = false
+        clearAudioRelayStartInFlight()
         audioRelayRetryCount = 0
         audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
         audioRelayRetryRunnable = null
@@ -7813,7 +8023,17 @@ class ListenerService : LifecycleService(),
     }
 
     override fun onWebRTCOffer(streamId: Int, sdp: String) {
-        LogCollector.i(TAG, "WebRTC offer received for stream $streamId")
+        // Cloud-path offer. Bind the answer transport to the cloud as we accept
+        // the offer so a late LAN offer can't misroute this stream's answer.
+        audioRelayViaLan = false
+        handleWebRTCOffer(streamId, sdp)
+    }
+
+    private fun handleWebRTCOffer(streamId: Int, sdp: String) {
+        LogCollector.i(TAG, "WebRTC offer received for stream $streamId (viaLan=$audioRelayViaLan)")
+        // This is now the stream we care about; disconnects for older streams
+        // (from the peer swap below) will be ignored.
+        currentAudioStreamId = streamId
         getOrCreateWebRTCClient().handleOffer(streamId, sdp)
     }
 
@@ -10503,6 +10723,11 @@ class ListenerService : LifecycleService(),
         keyboardEventListener = null
         webRTCClient?.release()
         webRTCClient = null
+        lanRelayClient?.let { it.listener = null; it.close() }
+        lanRelayClient = null
+        desktopRelayLocator?.stop()
+        desktopRelayLocator = null
+        releaseAudioRelayWifiLock()
         audioRelayActive = false
         unregisterCallStateListener()
         serviceScope.cancel()

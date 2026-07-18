@@ -273,6 +273,10 @@ class MapRfcommClient(private val context: Context) {
      * thread. Does not block and does not queue the frame.
      */
     private fun maybeSelfHeal() {
+        // Skip RFCOMM pages while the desktop audio relay streams -- each page
+        // to absent glasses blocks the shared BT/2.4GHz radio and stutters the
+        // WebRTC audio. BLE wake reconnects the link when the glasses appear.
+        if (com.repository.listener.service.ListenerService.audioRelayActive) return
         val now = android.os.SystemClock.uptimeMillis()
         val last = lastSelfHealMs.get()
         if (now - last < SELF_HEAL_THROTTLE_MS) return

@@ -42,6 +42,10 @@ class PhoneBtHost(private val context: Context) {
     companion object {
         private const val TAG = "PhoneBtHost"
         private const val RETRY_INTERVAL_MS = 5000L
+        /** Slower BT retry while desktop audio relay streams: BT page attempts and
+         *  2.4 GHz WiFi share the radio, and each failed RFCOMM connect to absent
+         *  glasses steals airtime that audibly stutters the WebRTC audio. */
+        private const val RETRY_INTERVAL_RELAY_ACTIVE_MS = 30_000L
         /** Bonded-but-RFCOMM-down cycles before we presume the listener is dead and cold-start it. */
         private const val COLD_START_AFTER_FAILURES = 2
         private const val MAX_CAPS_CHARS = 10_000  // Safe limit: worst-case 3 bytes/char in JNI modified UTF-8
@@ -645,6 +649,17 @@ class PhoneBtHost(private val context: Context) {
         // the BLE wake link is armed; cold-start the listener over 0x07 if it keeps failing.
         val bondedGlasses = findBondedGlasses()
         if (bondedGlasses != null) {
+            // While the desktop audio relay streams, skip the blind RFCOMM page
+            // attempts: each page to absent glasses blocks the shared BT/2.4GHz
+            // radio for ~13s and audibly stutters the WebRTC audio. Glasses
+            // reconnect stays event-driven -- the BLE wake link (kept armed
+            // below) fires requestImmediateReconnect the moment they power on.
+            if (com.repository.listener.service.ListenerService.audioRelayActive) {
+                log("Glasses bonded (${bondedGlasses.address}) -- audio relay active, skipping RFCOMM page (BLE wake armed)")
+                ensureBleWakeStarted()
+                scheduleRetry()
+                return
+            }
             log("Glasses bonded (${bondedGlasses.address}) -- kicking RFCOMM message relay + map socket + BLE wake")
             maybeColdStartGlassesListener("bonded")
             rfcommClient.requestImmediateReconnect("bonded")
@@ -718,13 +733,15 @@ class PhoneBtHost(private val context: Context) {
     }
 
     private fun scheduleRetry() {
+        val interval = if (com.repository.listener.service.ListenerService.audioRelayActive)
+            RETRY_INTERVAL_RELAY_ACTIVE_MS else RETRY_INTERVAL_MS
         mainHandler.removeCallbacks(reconnectRunnable)
-        mainHandler.postDelayed(reconnectRunnable, RETRY_INTERVAL_MS)
+        mainHandler.postDelayed(reconnectRunnable, interval)
         // Start countdown ticker
-        retryTargetTime = System.currentTimeMillis() + RETRY_INTERVAL_MS
+        retryTargetTime = System.currentTimeMillis() + interval
         mainHandler.removeCallbacks(countdownRunnable)
         countdownRunnable.run()
-        log("Next scan retry in ${RETRY_INTERVAL_MS}ms")
+        log("Next scan retry in ${interval}ms")
     }
 
     private fun cancelCountdown() {

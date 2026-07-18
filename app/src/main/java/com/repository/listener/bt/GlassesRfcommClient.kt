@@ -168,12 +168,21 @@ class GlassesRfcommClient(private val context: Context) {
         if (isConnected) {
             return sendNow(channel, args)
         }
-        // Outbound demand: wake glasses via BLE (if hooked) and request an
-        // immediate reconnect. Then queue the frame for delivery once RFCOMM
-        // is up. Order matters: wake first, reconnect second, queue third --
-        // so the wake signal is in flight before the queue grows.
-        try { onSendWhileDisconnected?.invoke(channel) } catch (_: Exception) {}
-        requestImmediateReconnect("send:$channel")
+        // While the desktop audio relay streams, a blind RFCOMM page to absent
+        // glasses blocks the shared BT/2.4GHz radio for ~13s and stutters the
+        // WebRTC audio. Queue the frame but skip the page attempt; the BLE wake
+        // event fires a reconnect (and drains the queue) when the glasses
+        // actually appear.
+        if (com.repository.listener.service.ListenerService.audioRelayActive) {
+            listener?.onLog("send($channel) while relay active -- queueing without RFCOMM page")
+        } else {
+            // Outbound demand: wake glasses via BLE (if hooked) and request an
+            // immediate reconnect. Then queue the frame for delivery once RFCOMM
+            // is up. Order matters: wake first, reconnect second, queue third --
+            // so the wake signal is in flight before the queue grows.
+            try { onSendWhileDisconnected?.invoke(channel) } catch (_: Exception) {}
+            requestImmediateReconnect("send:$channel")
+        }
         val entry = QueuedFrame(channel, args)
         val accepted = outboundQueue.offerLast(entry)
         if (!accepted) {

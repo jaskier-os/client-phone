@@ -44,6 +44,65 @@ class WebRTCClient(context: Context) {
     private var disconnectRunnable: Runnable? = null
     var listener: Listener? = null
 
+    // Periodic inbound-audio stats: NetEq concealment counters directly measure
+    // audible glitches and attribute them to packet loss (network) vs jitter
+    // (late arrival) vs device underruns.
+    private var statsRunnable: Runnable? = null
+    private var lastPacketsReceived = 0L
+    private var lastPacketsLost = 0L
+    private var lastConcealmentEvents = 0L
+    private var lastConcealedSamples = 0L
+    private var lastInsertedForDecel = 0L
+    private var lastRemovedForAccel = 0L
+
+    private fun startStatsLogging() {
+        stopStatsLogging()
+        val runnable = object : Runnable {
+            override fun run() {
+                val pc = peerConnection ?: return
+                pc.getStats { report ->
+                    for (stats in report.statsMap.values) {
+                        if (stats.type != "inbound-rtp") continue
+                        if ((stats.members["kind"] as? String) != "audio") continue
+                        val received = (stats.members["packetsReceived"] as? Number)?.toLong() ?: 0
+                        val lost = (stats.members["packetsLost"] as? Number)?.toLong() ?: 0
+                        val jitter = (stats.members["jitter"] as? Number)?.toDouble() ?: 0.0
+                        val jbDelay = (stats.members["jitterBufferDelay"] as? Number)?.toDouble() ?: 0.0
+                        val jbEmitted = (stats.members["jitterBufferEmittedCount"] as? Number)?.toLong() ?: 0
+                        val concealEv = (stats.members["concealmentEvents"] as? Number)?.toLong() ?: 0
+                        val concealed = (stats.members["concealedSamples"] as? Number)?.toLong() ?: 0
+                        val decel = (stats.members["insertedSamplesForDeceleration"] as? Number)?.toLong() ?: 0
+                        val accel = (stats.members["removedSamplesForAcceleration"] as? Number)?.toLong() ?: 0
+                        val dRecv = received - lastPacketsReceived
+                        val dLost = lost - lastPacketsLost
+                        val dConcealEv = concealEv - lastConcealmentEvents
+                        val dConcealed = concealed - lastConcealedSamples
+                        val dDecel = decel - lastInsertedForDecel
+                        val dAccel = accel - lastRemovedForAccel
+                        lastPacketsReceived = received; lastPacketsLost = lost
+                        lastConcealmentEvents = concealEv; lastConcealedSamples = concealed
+                        lastInsertedForDecel = decel; lastRemovedForAccel = accel
+                        val jbAvgMs = if (jbEmitted > 0) jbDelay / jbEmitted * 1000 else 0.0
+                        LogCollector.i(TAG, "audio-stats: recv=+$dRecv lost=+$dLost jitter=${"%.1f".format(jitter * 1000)}ms " +
+                            "jbAvg=${"%.0f".format(jbAvgMs)}ms concealEv=+$dConcealEv concealed=+${dConcealed}smp " +
+                            "decel=+${dDecel}smp accel=+${dAccel}smp")
+                    }
+                }
+                handler.postDelayed(this, 5000)
+            }
+        }
+        statsRunnable = runnable
+        handler.postDelayed(runnable, 5000)
+    }
+
+    private fun stopStatsLogging() {
+        statsRunnable?.let { handler.removeCallbacks(it) }
+        statsRunnable = null
+        lastPacketsReceived = 0; lastPacketsLost = 0
+        lastConcealmentEvents = 0; lastConcealedSamples = 0
+        lastInsertedForDecel = 0; lastRemovedForAccel = 0
+    }
+
     init {
         val initOptions = PeerConnectionFactory.InitializationOptions.builder(context)
             .setEnableInternalTracer(false)
@@ -99,6 +158,7 @@ class WebRTCClient(context: Context) {
                             LogCollector.i(TAG, "ICE recovered to $state, cancelled disconnect timer")
                         }
                         listener?.onWebRTCAudioConnected(currentStreamId)
+                        startStatsLogging()
                     }
                     PeerConnection.IceConnectionState.DISCONNECTED -> {
                         if (disconnectRunnable == null) {
@@ -213,6 +273,7 @@ class WebRTCClient(context: Context) {
     }
 
     fun close() {
+        stopStatsLogging()
         disconnectRunnable?.let {
             handler.removeCallbacks(it)
             disconnectRunnable = null
