@@ -18,7 +18,7 @@ output: float32 [1, 3, H, W]   denoised RGB
 
 `PhotoEnhancer.kt` tiles each capture at 512x512 with 32 px overlap and
 linearly blends the seams. `NOISE_SIGMA = 15/255` is a sensible default for
-Rokid AR Lite frames after the HAL's HQ denoise pass; bump toward 25/255
+Rokid Glasses frames after the HAL's HQ denoise pass; bump toward 25/255
 for noisier low-light shots.
 
 ## If you want to replace the model
