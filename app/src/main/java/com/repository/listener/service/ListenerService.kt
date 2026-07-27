@@ -437,9 +437,17 @@ class ListenerService : LifecycleService(),
     private var transcriberStreamClient: TranscriberStreamClient? = null
     private var transcriberUrl: String? = null
     private var reidAnalyticsClient: ReidAnalyticsClient? = null
+    @Volatile
     private var webRTCClient: WebRTCClient? = null
+    // Set in onDestroy so callbacks already queued on the main looper (posted from
+    // the OkHttp/WebRTC threads) don't resurrect a dead service by building a new
+    // PeerConnectionFactory or re-arming relay state.
+    @Volatile
+    private var serviceDestroyed = false
+    @Volatile
     private var audioRelayRetryCount = 0
     private val audioRelayRetryDelays = longArrayOf(2_000, 5_000, 15_000)
+    @Volatile
     private var audioRelayRetryRunnable: Runnable? = null
     // The stream id of the offer we are currently answering. A WebRTC disconnect
     // for any other (stale) stream is ignored so peer-swap closes don't trigger
@@ -450,20 +458,38 @@ class ListenerService : LifecycleService(),
     // so concurrent starts don't stampede. Cleared on connect, failure, or window.
     @Volatile
     private var audioRelayStartInFlight = false
+    @Volatile
     private var audioRelayStartWatchdog: Runnable? = null
-    private val AUDIO_RELAY_START_WINDOW_MS = 12_000L
+    // Must exceed a realistic worst-case start (LAN connect ~4s + ICE_GATHER_TIMEOUT_MS
+    // 10s in WebRTCClient); a shorter window drops the guard mid-attempt and lets a
+    // second client in to tear down the first.
+    private val AUDIO_RELAY_START_WINDOW_MS = 25_000L
 
     // LAN-direct audio relay: when the phone and PC are on the same network the
     // audio-relay signaling connects straight to the desktop's local server
     // (discovered via mDNS), skipping the cloud orchestrator hop. When no PC is
     // discovered / reachable it transparently falls back to the cloud path.
+    @Volatile
     private var desktopRelayLocator: DesktopRelayLocator? = null
+    @Volatile
     private var lanRelayClient: LanRelayClient? = null
     // True while the current audio-relay session is signaling over the LAN
     // channel. Determines whether WebRTC answer/ICE go to lanRelayClient or the
     // cloud orchestratorClient.
     @Volatile
     private var audioRelayViaLan = false
+    // Transport the current offer arrived on, so its answer is routed back the same way
+    // even if the active transport flips during the up-to-10s ICE gather.
+    @Volatile
+    private var audioRelayAnswerStreamId = -1
+    @Volatile
+    private var audioRelayAnswerViaLan = false
+    // Watches VPN up/down so a toggle migrates the session to the transport that still works.
+    private var audioRelayVpnCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    @Volatile
+    private var audioRelayNetworkRecheck: Runnable? = null
+    private var audioRelayVpnDeferrals = 0
+    private val MAX_VPN_RECHECK_DEFERRALS = 12
 
     // Held while WebRTC audio is streaming. Without it Android WiFi power-save
     // duty-cycles the radio (especially on 2.4 GHz), adding periodic 100-300ms
@@ -1114,7 +1140,16 @@ class ListenerService : LifecycleService(),
 
     private val webRTCListener = object : WebRTCClient.Listener {
         override fun onWebRTCAnswer(streamId: Int, sdp: String) {
-            if (audioRelayViaLan) {
+            // Route by the transport this stream's OFFER arrived on, not by the current
+            // flag: ICE gathering can take up to 10s, and a transport switch in that
+            // window would otherwise send this answer to the wrong peer, so the offering
+            // side never gets it and the session dies.
+            val viaLan = if (streamId == audioRelayAnswerStreamId) {
+                audioRelayAnswerViaLan
+            } else {
+                audioRelayViaLan
+            }
+            if (viaLan) {
                 lanRelayClient?.sendWebRTCAnswer(streamId, sdp)
             } else {
                 orchestratorClient.sendWebRTCAnswer(streamId, sdp)
@@ -2898,6 +2933,8 @@ class ListenerService : LifecycleService(),
         // skip the cloud hop when phone and PC share a network. Best-effort; the
         // audio-relay path falls back to the cloud when nothing is discovered.
         desktopRelayLocator = DesktopRelayLocator(this).also { it.start() }
+
+        registerAudioRelayVpnWatcher()
 
         // WebRTCClient initialized lazily on first webrtc_offer via getOrCreateWebRTCClient()
 
@@ -7682,15 +7719,34 @@ class ListenerService : LifecycleService(),
     override fun onServerError(message: String) {
         LogCollector.e(TAG, "Orchestrator error: $message")
 
-        // If error is about desktop not connected, treat as audio relay error
-        if (message.contains("not connected", ignoreCase = true)) {
+        // If error is about desktop not connected, treat as audio relay error. This is
+        // about the CLOUD link only -- a LAN-direct session talks to the desktop
+        // straight and stays healthy, so tearing it down here would kill working audio
+        // (and the reconnect that follows could leave two sessions on the desktop).
+        // The orchestrator sends an identical "Target device '<id>' not connected" for
+        // BOTH audio-relay and screen-stream requests, so the text cannot tell them
+        // apart. Only react while OUR start is in flight and not yet established --
+        // otherwise a failed screen-stream request would tear down healthy audio.
+        val desktopOffline = message.contains("not connected", ignoreCase = true) &&
+            message.contains("desktop", ignoreCase = true)
+        if (desktopOffline && !audioRelayViaLan && audioRelayStartInFlight && !audioRelayActive) {
             audioRelayActive = false
+            currentAudioStreamId = -1
+            clearAudioRelayStartInFlight()
             audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
             audioRelayRetryRunnable = null
+            // Close the dead peer: retiring the stream id above means its own
+            // disconnect callback is now swallowed by the stale-stream guard, so
+            // nothing else would tear it down or arm a retry -- audio would stay
+            // silently dead until the user toggled it, with the desktop still
+            // consuming its shared capture.
+            webRTCClient?.close()
+            releaseAudioRelayWifiLock()
             sendBroadcast(Intent(ACTION_AUDIO_RELAY_ERROR).apply {
                 setPackage(packageName)
                 putExtra(EXTRA_ERROR_REASON, "desktop_offline")
             })
+            scheduleAudioRelayRetry()
         }
 
         // Show error on glasses if in an active state
@@ -7832,6 +7888,7 @@ class ListenerService : LifecycleService(),
      * retry) funnel through here so the LAN-vs-cloud choice lives in one place.
      */
     private fun startAudioRelay(bitrate: Int) {
+        if (serviceDestroyed) return
         // Coalesce concurrent start drivers (UI intent, ADB, cloud onConnected
         // auto-restart, and the retry chain can all fire near-simultaneously on a
         // flaky link). Without this guard each caller spins up its own
@@ -7846,18 +7903,173 @@ class ListenerService : LifecycleService(),
             LogCollector.i(TAG, "Audio relay start ignored: attempt already in flight")
             return
         }
-        audioRelayStartInFlight = true
-        audioRelayStartWatchdog?.let { mainHandler.removeCallbacks(it) }
-        val watchdog = Runnable { audioRelayStartInFlight = false }
-        audioRelayStartWatchdog = watchdog
-        mainHandler.postDelayed(watchdog, AUDIO_RELAY_START_WINDOW_MS)
+        armAudioRelayStartGuard()
 
-        val endpoint = if (primaryWifiNetwork() != null) desktopRelayLocator?.endpoint() else null
+        // A non-bypassable VPN captures this app's UDP, so WebRTC gathers no usable
+        // wlan candidate and only offers loopback + TCP ones. LAN signaling still
+        // connects (the WS socket is bound to wlan), the desktop still offers, but
+        // ICE can never pair -- audio silently never starts. The cloud path works
+        // because it relays through TURN, so prefer it while such a VPN is up.
+        val endpoint = if (primaryWifiNetwork() != null && !vpnCapturesAudioRelay()) {
+            desktopRelayLocator?.endpoint()
+        } else {
+            null
+        }
+        LogCollector.i(
+            TAG,
+            "Audio relay transport: ${if (endpoint != null) "LAN" else "cloud"} " +
+                "(wifi=${primaryWifiNetwork() != null} vpnCaptures=${vpnCapturesAudioRelay()} " +
+                "endpoint=${desktopRelayLocator?.endpoint() != null})"
+        )
         if (endpoint != null) {
             startAudioRelayViaLan(endpoint, bitrate)
         } else {
             startAudioRelayViaCloud(bitrate)
         }
+    }
+
+    /**
+     * Watch for the VPN coming up or going down. Toggling it invalidates the transport the
+     * live session picked: the tun swallows LAN media (LAN session goes silent) and coming
+     * back down strands the session on the slower cloud relay. WebRTC only notices via a
+     * 15s ICE grace, and the retry that follows may re-pick the wrong transport -- which is
+     * the flaky, half-broken audio. Detect the transition directly and migrate immediately.
+     */
+    private fun registerAudioRelayVpnWatcher() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    reevaluate()
+                }
+
+                override fun onLost(network: android.net.Network) {
+                    reevaluate()
+                }
+
+                override fun onCapabilitiesChanged(
+                    network: android.net.Network,
+                    caps: android.net.NetworkCapabilities
+                ) {
+                    reevaluate()
+                }
+
+                private fun reevaluate() {
+                    // onCapabilitiesChanged fires often (signal strength, validation);
+                    // coalesce so a burst causes at most one transport re-evaluation.
+                    // Runs on a ConnectivityManager thread -- hop to main, which owns
+                    // the recheck field.
+                    mainHandler.post { scheduleAudioRelayNetworkRecheck(500) }
+                }
+            }
+            // Watch this app's DEFAULT network: a VPN coming up or going down swaps it,
+            // which is exactly the transition that invalidates the chosen transport.
+            cm.registerDefaultNetworkCallback(callback)
+            audioRelayVpnCallback = callback
+            LogCollector.i(TAG, "Audio relay: VPN watcher registered")
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "Audio relay: VPN watcher registration failed: ${e.message}")
+        }
+    }
+
+    /**
+     * Re-pick the audio-relay transport when the VPN flips. Only acts when the transport the
+     * session is actually using no longer matches what the current network state allows, so a
+     * VPN toggle that doesn't affect the choice leaves working audio untouched.
+     */
+    /**
+     * Single owner of [audioRelayNetworkRecheck]. Both the capabilities debounce and the
+     * in-flight deferral go through here (main thread only) so neither silently
+     * reschedules the other's pending pass at the wrong delay.
+     */
+    private fun scheduleAudioRelayNetworkRecheck(delayMs: Long) {
+        if (serviceDestroyed) return
+        audioRelayNetworkRecheck?.let { mainHandler.removeCallbacks(it) }
+        val r = Runnable {
+            audioRelayNetworkRecheck = null
+            onAudioRelayVpnStateChanged()
+        }
+        audioRelayNetworkRecheck = r
+        mainHandler.postDelayed(r, delayMs)
+    }
+
+    private fun onAudioRelayVpnStateChanged() {
+        if (serviceDestroyed) return
+        if (!AppConfig.getAudioRelayDesired(this)) return
+        // Defer while an attempt is under way, and also while nothing is established yet
+        // but a start is expected to produce a session: dropping the transition would
+        // leave that session on the transport the VPN change just invalidated. After the
+        // cap, stop waiting but still evaluate rather than discarding the transition.
+        val startPending = audioRelayStartInFlight ||
+            (!audioRelayActive && audioRelayRetryRunnable != null)
+        if (startPending && audioRelayVpnDeferrals < MAX_VPN_RECHECK_DEFERRALS) {
+            audioRelayVpnDeferrals++
+            LogCollector.i(TAG, "Audio relay: VPN recheck deferred (#$audioRelayVpnDeferrals)")
+            scheduleAudioRelayNetworkRecheck(3_000)
+            return
+        }
+        audioRelayVpnDeferrals = 0
+        val wantLan = primaryWifiNetwork() != null &&
+            !vpnCapturesAudioRelay() &&
+            desktopRelayLocator?.endpoint() != null
+        if (wantLan == audioRelayViaLan) return
+        // Nothing established and no attempt pending -> nothing to migrate. (Without
+        // this we would start a relay the user never asked for, since audioRelayViaLan
+        // is false whenever the relay is idle.)
+        if (!audioRelayActive && !startPending) return
+        LogCollector.i(
+            TAG,
+            "Audio relay: VPN state changed, switching transport (viaLan=$audioRelayViaLan -> $wantLan)"
+        )
+        // Drop the doomed session and restart on the correct transport right away rather
+        // than waiting out the ICE grace period.
+        stopAudioRelay()
+        startAudioRelay(AppConfig.getAudioBitrate(this))
+    }
+
+    /**
+     * True when a VPN is active that this app's media traffic cannot escape, which makes
+     * LAN-direct WebRTC unusable (no host candidate on wlan). A bypassable VPN is fine --
+     * WebRTC can still gather wlan candidates through it.
+     */
+    private fun vpnCapturesAudioRelay(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            // Ask about THIS app's own default network rather than scanning every network.
+            // If a VPN is bypassable or excludes our UID, the app's active network is the
+            // real wlan and LAN-direct still works; only when our own default IS the tun
+            // is our media actually captured.
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
+            caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) &&
+                !caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "vpnCapturesAudioRelay failed: ${e.message}")
+            false
+        }
+    }
+
+    /**
+     * Mark a start attempt in flight and arm the window watchdog. Every path that
+     * begins an attempt must use this: the guard stops concurrent drivers from opening
+     * a second session toward the desktop (which would split its shared capture), and
+     * the watchdog is the only thing that retries an attempt which never produced a
+     * peer (no peer => no disconnect callback => no retry).
+     */
+    private fun armAudioRelayStartGuard() {
+        audioRelayStartInFlight = true
+        audioRelayStartWatchdog?.let { mainHandler.removeCallbacks(it) }
+        val watchdog = Runnable {
+            audioRelayStartInFlight = false
+            audioRelayStartWatchdog = null
+            if (!audioRelayActive && AppConfig.getAudioRelayDesired(this)) {
+                LogCollector.w(TAG, "Audio relay: start window elapsed with no session, retrying")
+                scheduleAudioRelayRetry()
+            }
+        }
+        audioRelayStartWatchdog = watchdog
+        mainHandler.postDelayed(watchdog, AUDIO_RELAY_START_WINDOW_MS)
     }
 
     private fun clearAudioRelayStartInFlight() {
@@ -7869,7 +8081,13 @@ class ListenerService : LifecycleService(),
     private fun startAudioRelayViaCloud(bitrate: Int) {
         // Only one transport may feed the desktop's shared audio capture at a
         // time -- kill any LAN session so two peers never split the PCM stream.
-        lanRelayClient?.let { it.listener = null; it.close() }
+        // Tell the desktop to drop it too: closing the socket alone leaves its LAN
+        // peer consuming the shared capture, halving this session's frame rate.
+        lanRelayClient?.let {
+            it.sendAudioRelayStop()
+            it.listener = null
+            it.close()
+        }
         lanRelayClient = null
         audioRelayViaLan = false
         LogCollector.i(TAG, "Audio relay: starting via cloud (${bitrate}bps)")
@@ -7883,8 +8101,14 @@ class ListenerService : LifecycleService(),
         // (consent checks are disabled) and the LAN stream loses every other
         // frame, which sounds like constant stutter.
         orchestratorClient.sendAudioRelayStop("desktop-listener")
-        // Tear down any prior LAN attempt before starting a new one.
-        lanRelayClient?.let { it.listener = null; it.close() }
+        // Tear down any prior LAN attempt before starting a new one. Tell the desktop
+        // too: closing the socket alone leaves its old LAN peer consuming the shared
+        // capture, so this new session would only get half the frames.
+        lanRelayClient?.let {
+            it.sendAudioRelayStop()
+            it.listener = null
+            it.close()
+        }
         val url = "ws://${endpoint.host}:${endpoint.port}/ws/device"
         LogCollector.i(TAG, "Audio relay: starting via LAN $url (${bitrate}bps)")
         audioRelayViaLan = true
@@ -7894,25 +8118,45 @@ class ListenerService : LifecycleService(),
                 client.sendAudioRelayStart(bitrate)
             }
             override fun onClosed(reason: String) {
-                // If the LAN session dropped before audio was flowing, fall back
-                // to the cloud path so the user still gets audio. Clear the
-                // in-flight guard first so the fallback start is allowed through.
-                if (audioRelayViaLan && !audioRelayActive && AppConfig.getAudioRelayDesired(this@ListenerService)) {
-                    LogCollector.w(TAG, "Audio relay: LAN closed ($reason) before active, falling back to cloud")
-                    clearAudioRelayStartInFlight()
-                    mainHandler.post { startAudioRelayViaCloud(bitrate) }
+                // Runs on an OkHttp thread. Do the whole check-and-act on the main
+                // thread: clearAudioRelayStartInFlight() touches mainHandler callbacks,
+                // and reading the guards off-thread races the start path.
+                mainHandler.post {
+                    // If the LAN session dropped before audio was flowing, fall back
+                    // to the cloud path so the user still gets audio. Clear the
+                    // in-flight guard first so the fallback start is allowed through.
+                    if (audioRelayViaLan && !audioRelayActive &&
+                        AppConfig.getAudioRelayDesired(this@ListenerService)
+                    ) {
+                        LogCollector.w(TAG, "Audio relay: LAN closed ($reason) before active, falling back to cloud")
+                        // Deliberately NOT startAudioRelay(): it would re-pick the LAN
+                        // endpoint that just failed. But the fallback still needs the
+                        // in-flight guard and the start watchdog -- without them a
+                        // concurrent retry could launch a SECOND session toward the
+                        // desktop (splitting its capture), and an attempt that produced
+                        // no offer would never be retried.
+                        armAudioRelayStartGuard()
+                        startAudioRelayViaCloud(bitrate)
+                    }
                 }
             }
+            // All of these arrive on the OkHttp reader thread but touch main-thread state
+            // (peer construction, mainHandler callbacks, the audio-relay guards), so hop
+            // to the main thread first.
             override fun onAudioRelayAck(sampleRate: Int, channels: Int, br: Int, frameSize: Int, frameDurationMs: Int) {
-                this@ListenerService.onAudioRelayAck(sampleRate, channels, br, frameSize, frameDurationMs)
+                mainHandler.post {
+                    this@ListenerService.onAudioRelayAck(sampleRate, channels, br, frameSize, frameDurationMs)
+                }
             }
             override fun onAudioRelayError(reason: String) {
-                this@ListenerService.onAudioRelayError(reason)
+                mainHandler.post { this@ListenerService.onAudioRelayError(reason) }
             }
             override fun onWebRTCOffer(streamId: Int, sdp: String) {
-                // LAN-path offer: bind the answer transport to LAN as we accept it.
-                audioRelayViaLan = true
-                handleWebRTCOffer(streamId, sdp)
+                mainHandler.post {
+                    // LAN-path offer: bind the answer transport to LAN as we accept it.
+                    audioRelayViaLan = true
+                    handleWebRTCOffer(streamId, sdp)
+                }
             }
         }
         lanRelayClient = client
@@ -7921,6 +8165,11 @@ class ListenerService : LifecycleService(),
 
     /** Single decision point for stopping audio relay (LAN or cloud). */
     private fun stopAudioRelay() {
+        // Retire the stream id BEFORE closing: close() drives the peer to CLOSED, which
+        // reports a disconnect for that id. With the id still live the stale-stream guard
+        // passes and a retry chain is armed right after we cancel it below -- that chain
+        // then races the deliberate restart (e.g. the VPN transport switch).
+        currentAudioStreamId = -1
         webRTCClient?.close()
         audioRelayActive = false
         clearAudioRelayStartInFlight()
@@ -7943,6 +8192,7 @@ class ListenerService : LifecycleService(),
         orchestratorConnected || (primaryWifiNetwork() != null && desktopRelayLocator?.endpoint() != null)
 
     private fun scheduleAudioRelayRetry() {
+        if (serviceDestroyed) return
         // Single-flight: cancel any already-pending retry so rapid disconnects
         // (e.g. WebRTCClient closing the old peer when a new offer arrives) can't
         // pile up parallel retry chains that each spawn a new LanRelayClient and
@@ -7969,11 +8219,19 @@ class ListenerService : LifecycleService(),
         val runnable = Runnable {
             audioRelayRetryRunnable = null
             if (AppConfig.getAudioRelayDesired(this) && audioRelayTransportAvailable() && !audioRelayActive) {
+                // A start that is coalesced away (one already in flight) must not burn a
+                // retry: all three delays could elapse inside a single in-flight window,
+                // exhausting the budget and leaving the relay dead for good. Re-arm and
+                // wait instead -- real failures come back through onWebRTCDisconnected.
+                if (audioRelayStartInFlight) {
+                    LogCollector.i(TAG, "Audio relay: retry deferred, start already in flight")
+                    scheduleAudioRelayRetry()
+                    return@Runnable
+                }
                 audioRelayRetryCount++
                 val bitrate = AppConfig.getAudioBitrate(this)
                 LogCollector.i(TAG, "Audio relay: auto-restarting (attempt $audioRelayRetryCount)")
                 startAudioRelay(bitrate)
-                scheduleAudioRelayRetry()
             }
         }
         audioRelayRetryRunnable = runnable
@@ -7992,12 +8250,24 @@ class ListenerService : LifecycleService(),
     }
 
     override fun onAudioRelayError(reason: String) {
+        if (serviceDestroyed) return
         LogCollector.e(TAG, "Audio relay error from desktop: $reason")
         audioRelayActive = false
         clearAudioRelayStartInFlight()
         audioRelayRetryCount = 0
         audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
         audioRelayRetryRunnable = null
+        // Release the failed session's transport. Leaving the LAN socket open keeps the
+        // desktop's peer consuming its shared capture, halving the next session's rate.
+        currentAudioStreamId = -1
+        webRTCClient?.close()
+        lanRelayClient?.let {
+            it.sendAudioRelayStop()
+            it.listener = null
+            it.close()
+        }
+        lanRelayClient = null
+        audioRelayViaLan = false
         sendBroadcast(Intent(ACTION_AUDIO_RELAY_ERROR).apply {
             setPackage(packageName)
             putExtra(EXTRA_ERROR_REASON, reason)
@@ -8030,7 +8300,17 @@ class ListenerService : LifecycleService(),
     }
 
     private fun handleWebRTCOffer(streamId: Int, sdp: String) {
+        if (serviceDestroyed) {
+            LogCollector.w(TAG, "Ignoring WebRTC offer for stream $streamId: service destroyed")
+            return
+        }
         LogCollector.i(TAG, "WebRTC offer received for stream $streamId (viaLan=$audioRelayViaLan)")
+        // Pin the transport for this stream so its answer cannot be misrouted if the
+        // transport flips while ICE gathers. Only the current stream is ever answered,
+        // so one pair is enough -- and stream ids restart low on BOTH transports, so a
+        // keyed map would let a stale entry from one misroute the other.
+        audioRelayAnswerStreamId = streamId
+        audioRelayAnswerViaLan = audioRelayViaLan
         // This is now the stream we care about; disconnects for older streams
         // (from the peer swap below) will be ignored.
         currentAudioStreamId = streamId
@@ -8038,6 +8318,20 @@ class ListenerService : LifecycleService(),
     }
 
     override fun onWebRTCIce(streamId: Int, candidate: String, sdpMid: String, sdpMLineIndex: Int) {
+        if (serviceDestroyed) return
+        // Candidates are delivered via the main looper, so one for an older stream can
+        // be dequeued after a newer offer swapped the peer. Feeding stale remote
+        // candidates to the new peer breaks ICE pairing -> silent no-audio.
+        // Ids restart low on BOTH transports, so a stale cloud candidate can carry the
+        // same id as the current LAN stream. Only the cloud path ever trickles ICE, so
+        // any candidate for a LAN-answered stream is stale by definition.
+        if (streamId != currentAudioStreamId || audioRelayAnswerViaLan) {
+            LogCollector.i(
+                TAG,
+                "Ignoring ICE for stream $streamId (current=$currentAudioStreamId viaLan=$audioRelayAnswerViaLan)"
+            )
+            return
+        }
         webRTCClient?.addIceCandidate(candidate, sdpMid, sdpMLineIndex)
     }
 
@@ -10661,6 +10955,10 @@ class ListenerService : LifecycleService(),
 
     override fun onDestroy() {
         LogCollector.i(TAG, "Service destroying")
+        // Set FIRST: callbacks posted from the OkHttp/WebRTC threads may already be
+        // queued on the main looper and would otherwise rebuild a PeerConnectionFactory
+        // or re-arm relay state on a dead service (leaked peer + audio device).
+        serviceDestroyed = true
         // Lone mode: cancel the phone scan loop; do NOT send lone_stop so the glasses keep
         // detecting standalone. Off-switch is the explicit in-app stop or a glasses reboot.
         loneActive = false
@@ -10700,6 +10998,12 @@ class ListenerService : LifecycleService(),
         stopSystemAudioCapture()
         locationProvider.shutdown()
         orchestratorClient.closeStreamConnections()
+        // Release the desktop's shared audio capture before dropping the socket. Without
+        // this a cloud session outlives the service and the desktop keeps that peer
+        // consuming the capture, halving the next session's frame rate.
+        if (!audioRelayViaLan && (audioRelayActive || audioRelayStartInFlight)) {
+            orchestratorClient.sendAudioRelayStop("desktop-listener")
+        }
         orchestratorClient.disconnect()
         activatePlayer?.release()
         activatePlayer = null
@@ -10723,10 +11027,29 @@ class ListenerService : LifecycleService(),
         keyboardEventListener = null
         webRTCClient?.release()
         webRTCClient = null
-        lanRelayClient?.let { it.listener = null; it.close() }
+        // Tell the desktop to release its capture consumer before dropping the socket,
+        // otherwise it keeps streaming into a dead session.
+        lanRelayClient?.let {
+            it.sendAudioRelayStop()
+            it.listener = null
+            it.close()
+        }
         lanRelayClient = null
         desktopRelayLocator?.stop()
         desktopRelayLocator = null
+        audioRelayVpnCallback?.let { cb ->
+            try {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+                cm.unregisterNetworkCallback(cb)
+            } catch (_: Exception) {}
+        }
+        audioRelayVpnCallback = null
+        audioRelayNetworkRecheck?.let { mainHandler.removeCallbacks(it) }
+        audioRelayNetworkRecheck = null
+        audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+        audioRelayRetryRunnable = null
+        audioRelayStartWatchdog?.let { mainHandler.removeCallbacks(it) }
+        audioRelayStartWatchdog = null
         releaseAudioRelayWifiLock()
         audioRelayActive = false
         unregisterCallStateListener()

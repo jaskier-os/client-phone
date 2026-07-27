@@ -402,12 +402,12 @@ class OrchestratorClient(
                             val frameSize = envelope.optInt("frameSize", 2880)
                             val frameDurationMs = envelope.optInt("frameDurationMs", 60)
                             LogCollector.i(TAG, "Audio relay ACK: ${sampleRate}Hz ${channels}ch ${bitrate}bps frame=${frameDurationMs}ms")
-                            listener?.onAudioRelayAck(sampleRate, channels, bitrate, frameSize, frameDurationMs)
+                            handler.post { listener?.onAudioRelayAck(sampleRate, channels, bitrate, frameSize, frameDurationMs) }
                         }
                         Protocol.TYPE_AUDIO_RELAY_ERROR -> {
                             val reason = envelope.optString("reason", "unknown")
                             LogCollector.e(TAG, "Audio relay error: $reason")
-                            listener?.onAudioRelayError(reason)
+                            handler.post { listener?.onAudioRelayError(reason) }
                         }
                         Protocol.TYPE_STREAM_ERROR -> {
                             val reason = envelope.optString("reason", "unknown")
@@ -504,7 +504,7 @@ class OrchestratorClient(
                             val streamId = envelope.optInt("streamId", 0)
                             val sdp = envelope.optString("sdp", "")
                             if (sdp.isNotEmpty()) {
-                                listener?.onWebRTCOffer(streamId, sdp)
+                                handler.post { listener?.onWebRTCOffer(streamId, sdp) }
                             }
                         }
                         Protocol.TYPE_WEBRTC_ICE -> {
@@ -513,7 +513,7 @@ class OrchestratorClient(
                             val sdpMid = envelope.optString("sdpMid", "")
                             val sdpMLineIndex = envelope.optInt("sdpMLineIndex", 0)
                             if (candidate.isNotEmpty()) {
-                                listener?.onWebRTCIce(streamId, candidate, sdpMid, sdpMLineIndex)
+                                handler.post { listener?.onWebRTCIce(streamId, candidate, sdpMid, sdpMLineIndex) }
                             }
                         }
                         // Remote Control
@@ -629,7 +629,7 @@ class OrchestratorClient(
                         Protocol.TYPE_ERROR -> {
                             val msg = envelope.optString("message", "unknown error")
                             LogCollector.e(TAG, "Server error: $msg")
-                            listener?.onServerError(msg)
+                            handler.post { listener?.onServerError(msg) }
                         }
                     }
                 } catch (e: Exception) {

@@ -67,6 +67,15 @@ class LanRelayClient(
         LogCollector.i(TAG, "Connecting to LAN relay at $url")
         ws = http.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                // close() during the handshake cannot cancel it -- ws.close() is a no-op
+                // while still connecting. Without this check the handshake completes
+                // anyway and identify registers a session on the desktop that nothing
+                // will ever reap, which then splits the shared capture with the next one.
+                if (closed) {
+                    LogCollector.i(TAG, "LAN relay opened after close, dropping session")
+                    webSocket.close(1000, null)
+                    return
+                }
                 isConnected = true
                 webSocket.send(Protocol.createIdentifyMessage(deviceId).toString())
                 LogCollector.i(TAG, "LAN relay connected, sent identify")
@@ -146,6 +155,13 @@ class LanRelayClient(
         } catch (_: Exception) {
         }
         ws = null
+        // close() does not abort a socket still handshaking, and shutdown() only stops
+        // NEW work -- cancelAll() aborts the in-flight connect so it can't complete
+        // behind our back and leave a session the desktop never reaps.
+        try {
+            client?.dispatcher?.cancelAll()
+        } catch (_: Exception) {
+        }
         client?.dispatcher?.executorService?.shutdown()
         client = null
     }
