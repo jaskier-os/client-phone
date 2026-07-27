@@ -7806,10 +7806,18 @@ class ListenerService : LifecycleService(),
         // stream is perfectly healthy. Blindly restarting here would tear down a
         // working stream and trigger a reconnect storm. Only restart when audio
         // is actually down.
-        if (AppConfig.getAudioRelayDesired(this) && !audioRelayActive) {
-            val bitrate = AppConfig.getAudioBitrate(this)
-            LogCollector.i(TAG, "Audio relay: auto-restarting (desired=true, not active, ${bitrate}bps)")
-            startAudioRelay(bitrate)
+        // This callback runs on the OkHttp reader thread, unlike every other relay
+        // entry point. Starting from here would race the retry chain on main: both
+        // read audioRelayStartInFlight before either arms it, so two sessions open
+        // toward the desktop and only the second is tracked -- the first is a socket
+        // the phone can never release, and the desktop's capture is split in half.
+        mainHandler.post {
+            if (serviceDestroyed) return@post
+            if (AppConfig.getAudioRelayDesired(this) && !audioRelayActive) {
+                val bitrate = AppConfig.getAudioBitrate(this)
+                LogCollector.i(TAG, "Audio relay: auto-restarting (desired=true, not active, ${bitrate}bps)")
+                startAudioRelay(bitrate)
+            }
         }
 
         // Retry pending glasses request after reconnect
