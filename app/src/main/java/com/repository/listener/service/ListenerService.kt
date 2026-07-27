@@ -7741,6 +7741,7 @@ class ListenerService : LifecycleService(),
     }
 
     override fun onServerError(message: String, epoch: Int) {
+        if (serviceDestroyed) return
         LogCollector.e(TAG, "Orchestrator error: $message")
 
         // If error is about desktop not connected, treat as audio relay error. This is
@@ -7759,6 +7760,7 @@ class ListenerService : LifecycleService(),
         if (desktopOffline && epoch == audioRelaySessionEpoch &&
             !audioRelayViaLan && audioRelayStartInFlight && !audioRelayActive
         ) {
+            retireAudioRelaySession()
             audioRelayActive = false
             currentAudioStreamId = -1
             clearAudioRelayStartInFlight()
@@ -8237,6 +8239,10 @@ class ListenerService : LifecycleService(),
                         currentAudioStreamId = -1
                         webRTCClient?.close()
                         releaseAudioRelayWifiLock()
+                        // Close it, do not just drop it: only close() cancels the
+                        // dispatcher and shuts its executor down, so a bare null
+                        // orphaned the OkHttp threads and socket on every bounce.
+                        lanRelayClient?.let { c -> c.listener = null; c.close() }
                         lanRelayClient = null
                         audioRelayViaLan = false
                         scheduleAudioRelayRetry()
@@ -8294,7 +8300,18 @@ class ListenerService : LifecycleService(),
     }
 
     /** Single decision point for stopping audio relay (LAN or cloud). */
+    /**
+     * Retire the current session so anything the desktop already queued for it (an offer
+     * in particular) is recognised as stale. Only arming a start bumped this, so a
+     * teardown left the epoch intact and a late offer could resurrect a session the user
+     * had just stopped -- with no in-flight guard and no watchdog to ever release it.
+     */
+    private fun retireAudioRelaySession() {
+        audioRelaySessionEpoch++
+    }
+
     private fun stopAudioRelay() {
+        retireAudioRelaySession()
         // Retire the stream id BEFORE closing: close() drives the peer to CLOSED, which
         // reports a disconnect for that id. With the id still live the stale-stream guard
         // passes and a retry chain is armed right after we cancel it below -- that chain
@@ -8433,6 +8450,7 @@ class ListenerService : LifecycleService(),
             return
         }
         LogCollector.e(TAG, "Audio relay error from desktop: $reason")
+        retireAudioRelaySession()
         audioRelayActive = false
         clearAudioRelayStartInFlight()
         // Do NOT reset audioRelayRetryCount here: this path arms a retry at the end, so
@@ -8491,6 +8509,10 @@ class ListenerService : LifecycleService(),
         // peer that is gone -- dead audio until the start watchdog fires.
         if (epoch != audioRelaySessionEpoch) {
             LogCollector.i(TAG, "Ignoring cloud offer for superseded session (epoch $epoch)")
+            return
+        }
+        if (!AppConfig.getAudioRelayDesired(this)) {
+            LogCollector.i(TAG, "Ignoring cloud offer for stream $streamId: relay not desired")
             return
         }
         // A cloud offer emitted before we switched to LAN can arrive after the LAN
