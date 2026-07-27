@@ -8099,6 +8099,12 @@ class ListenerService : LifecycleService(),
                 // still consuming its shared capture with the socket open. Release it or
                 // the retry's session runs alongside it and both get half the frames.
                 releaseAudioRelaySessionOnDesktop()
+                // Close our side too. Its ICE may still pair later, and that connect
+                // would mark this released session active and cancel the retry -- the
+                // phone would think audio is live while the desktop has already let go.
+                currentAudioStreamId = -1
+                webRTCClient?.close()
+                releaseAudioRelayWifiLock()
                 scheduleAudioRelayRetry()
             }
         }
@@ -8194,7 +8200,20 @@ class ListenerService : LifecycleService(),
                     // If the LAN session dropped before audio was flowing, fall back
                     // to the cloud path so the user still gets audio. Clear the
                     // in-flight guard first so the fallback start is allowed through.
-                    if (audioRelayViaLan && !audioRelayActive &&
+                    if (audioRelayViaLan && audioRelayActive &&
+                        AppConfig.getAudioRelayDesired(this@ListenerService)
+                    ) {
+                        // The socket of a LIVE session dropped. Waiting for the 15s ICE
+                        // grace just delays recovery; the session is already gone.
+                        LogCollector.w(TAG, "Audio relay: LAN socket closed under a live session ($reason)")
+                        audioRelayActive = false
+                        currentAudioStreamId = -1
+                        webRTCClient?.close()
+                        releaseAudioRelayWifiLock()
+                        lanRelayClient = null
+                        audioRelayViaLan = false
+                        scheduleAudioRelayRetry()
+                    } else if (audioRelayViaLan && !audioRelayActive &&
                         AppConfig.getAudioRelayDesired(this@ListenerService)
                     ) {
                         LogCollector.w(TAG, "Audio relay: LAN closed ($reason) before active, falling back to cloud")
@@ -8221,6 +8240,7 @@ class ListenerService : LifecycleService(),
                 }
             }
             override fun onAudioRelayError(reason: String) {
+                // Sampled on the OkHttp thread, before any main-thread bump can land.
                 val epoch = audioRelaySessionEpoch
                 mainHandler.post {
                     if (isStaleLanClient(client)) return@post

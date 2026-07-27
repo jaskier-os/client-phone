@@ -836,10 +836,13 @@ class OrchestratorClient(
     private var sentAudioRelayEpoch = -1
 
     fun sendAudioRelayStart(targetDeviceId: String, bitrate: Int): Boolean {
-        sentAudioRelayEpoch = listener?.currentAudioRelayEpoch() ?: -1
         val msg = Protocol.createAudioRelayStart(targetDeviceId, bitrate)
         val sent = ws?.send(msg.toString()) ?: false
         if (sent) {
+            // Stamp only AFTER the send is accepted. Stamping first would also brand an
+            // error already queued on the wire for the PREVIOUS session with this
+            // epoch, and the guard would then tear down the attempt we just started.
+            sentAudioRelayEpoch = listener?.currentAudioRelayEpoch() ?: -1
             LogCollector.i(TAG, "Sent audio relay start to $targetDeviceId (${bitrate}bps)")
         } else {
             LogCollector.e(TAG, "Failed to send audio relay start (WebSocket not connected)")
