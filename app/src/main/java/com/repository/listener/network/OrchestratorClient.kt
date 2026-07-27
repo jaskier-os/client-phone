@@ -412,7 +412,7 @@ class OrchestratorClient(
                             // Capture the epoch on the READER thread, before the post is
                             // queued: reading it on main would sample it after a newer
                             // session had already started, defeating the correlation.
-                            val errEpoch = listener?.currentAudioRelayEpoch() ?: 0
+                            val errEpoch = sentAudioRelayEpoch
                             handler.post { listener?.onAudioRelayError(reason, errEpoch) }
                         }
                         Protocol.TYPE_STREAM_ERROR -> {
@@ -638,7 +638,7 @@ class OrchestratorClient(
                             // Capture the epoch on the READER thread: this error may be
                             // the reply to a stop we sent for a session that has since
                             // been superseded.
-                            val srvEpoch = listener?.currentAudioRelayEpoch() ?: 0
+                            val srvEpoch = sentAudioRelayEpoch
                             handler.post { listener?.onServerError(msg, srvEpoch) }
                         }
                     }
@@ -828,7 +828,15 @@ class OrchestratorClient(
         return sent
     }
 
+    // Epoch of the audio-relay START we most recently sent. An inbound error concerns a
+    // session only if it is still that one; capturing the epoch when the error ARRIVES
+    // would always match (any bump in between is already reflected) and so would never
+    // filter anything.
+    @Volatile
+    private var sentAudioRelayEpoch = -1
+
     fun sendAudioRelayStart(targetDeviceId: String, bitrate: Int): Boolean {
+        sentAudioRelayEpoch = listener?.currentAudioRelayEpoch() ?: -1
         val msg = Protocol.createAudioRelayStart(targetDeviceId, bitrate)
         val sent = ws?.send(msg.toString()) ?: false
         if (sent) {

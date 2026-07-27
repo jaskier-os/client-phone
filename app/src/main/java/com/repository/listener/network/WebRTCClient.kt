@@ -295,6 +295,13 @@ class WebRTCClient(context: Context) {
     }
 
     fun close() {
+        // Retire the peer sequence: close() drives the observer to CLOSED, whose
+        // disconnect post is enqueued AFTER the callback purge below and therefore
+        // survives it. Without advancing the sequence that post still matches the live
+        // peer, so it would tear down whatever session starts next -- clearing its
+        // in-flight guard and arming a retry that opens a SECOND session to the desktop.
+        peerSeqCounter += 1
+        currentPeerSeq = peerSeqCounter
         stopStatsLogging()
         disconnectRunnable?.let {
             handler.removeCallbacks(it)

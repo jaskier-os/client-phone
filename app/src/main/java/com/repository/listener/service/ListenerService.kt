@@ -1172,6 +1172,7 @@ class ListenerService : LifecycleService(),
             // Same staleness rule as the disconnect path: a connect posted by a peer we
             // have already replaced must not mark the session active or clear the retry
             // chain, or a dead session looks healthy and nothing ever recovers it.
+            if (serviceDestroyed) return
             val livePeerSeq = webRTCClient?.currentPeerSeq ?: -1L
             if (peerSeq != livePeerSeq) {
                 LogCollector.i(TAG, "WebRTC connect for stale peer $peerSeq (live=$livePeerSeq), ignoring")
@@ -8289,6 +8290,10 @@ class ListenerService : LifecycleService(),
             LogCollector.i(TAG, "Audio relay retry skipped: not desired")
             return
         }
+        if (audioRelayActive) {
+            LogCollector.i(TAG, "Audio relay retry skipped: already active")
+            return
+        }
         if (!audioRelayTransportAvailable()) {
             // Do not give up: nothing else re-arms us. The orchestrator reconnect only
             // fires if the CLOUD socket bounces, and mDNS rediscovery does not kick a
@@ -8301,10 +8306,6 @@ class ListenerService : LifecycleService(),
             }
             audioRelayRetryRunnable = recheck
             mainHandler.postDelayed(recheck, AUDIO_RELAY_BACKSTOP_DELAY_MS)
-            return
-        }
-        if (audioRelayActive) {
-            LogCollector.i(TAG, "Audio relay retry skipped: already active")
             return
         }
         // Past the backoff ladder, keep retrying on a long interval instead of giving up.
