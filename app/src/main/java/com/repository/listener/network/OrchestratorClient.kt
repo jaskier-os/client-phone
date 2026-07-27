@@ -80,7 +80,7 @@ class OrchestratorClient(
         fun onAssistantResult(requestId: String, cards: org.json.JSONArray, dismiss: org.json.JSONArray) {}
         fun onTtsAudio(requestId: String, audioBase64: String, sentenceIndex: Int, totalSentences: Int, text: String, isFinal: Boolean)
         fun onToolStatus(requestId: String, toolName: String, status: String, toolArgs: JSONObject?, toolCallId: String)
-        fun onServerError(message: String)
+        fun onServerError(message: String, epoch: Int)
         fun onConnected()
         fun onDisconnected()
         fun onBinaryFrame(data: ByteArray) {}
@@ -635,7 +635,11 @@ class OrchestratorClient(
                         Protocol.TYPE_ERROR -> {
                             val msg = envelope.optString("message", "unknown error")
                             LogCollector.e(TAG, "Server error: $msg")
-                            handler.post { listener?.onServerError(msg) }
+                            // Capture the epoch on the READER thread: this error may be
+                            // the reply to a stop we sent for a session that has since
+                            // been superseded.
+                            val srvEpoch = listener?.currentAudioRelayEpoch() ?: 0
+                            handler.post { listener?.onServerError(msg, srvEpoch) }
                         }
                     }
                 } catch (e: Exception) {

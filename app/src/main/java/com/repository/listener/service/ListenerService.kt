@@ -1168,7 +1168,7 @@ class ListenerService : LifecycleService(),
                 orchestratorClient.sendWebRTCAnswer(streamId, sdp)
             }
         }
-        override fun onWebRTCAudioConnected(streamId: Int) {
+        override fun onWebRTCAudioConnected(streamId: Int, peerSeq: Long) {
             LogCollector.i(TAG, "WebRTC audio connected for stream $streamId")
             audioRelayActive = true
             audioRelayRetryCount = 0
@@ -1180,13 +1180,17 @@ class ListenerService : LifecycleService(),
                 setPackage(packageName)
             })
         }
-        override fun onWebRTCDisconnected(streamId: Int) {
+        override fun onWebRTCDisconnected(streamId: Int, peerSeq: Long) {
             // Ignore disconnects for a stream that is no longer the current one:
             // when a new offer arrives, WebRTCClient closes the old peer, which
             // fires this for the STALE streamId. Retrying on that stale close is
             // what spawned the reconnect storm.
-            if (streamId != currentAudioStreamId) {
-                LogCollector.i(TAG, "WebRTC disconnect for stale stream $streamId (current=$currentAudioStreamId), ignoring")
+            // Guard on the peer sequence, not the stream id: ids restart low on each
+            // transport, so a replaced peer's disconnect can carry the same id as the
+            // session that replaced it and would tear down a healthy connection.
+            val livePeerSeq = webRTCClient?.currentPeerSeq ?: -1L
+            if (peerSeq != livePeerSeq) {
+                LogCollector.i(TAG, "WebRTC disconnect for stale peer $peerSeq (live=$livePeerSeq), ignoring")
                 return
             }
             LogCollector.i(TAG, "WebRTC audio disconnected for stream $streamId")
@@ -7729,7 +7733,7 @@ class ListenerService : LifecycleService(),
         notificationQueue.onTtsAudio(notifId, audioBase64, isFinal)
     }
 
-    override fun onServerError(message: String) {
+    override fun onServerError(message: String, epoch: Int) {
         LogCollector.e(TAG, "Orchestrator error: $message")
 
         // If error is about desktop not connected, treat as audio relay error. This is
@@ -7742,7 +7746,12 @@ class ListenerService : LifecycleService(),
         // otherwise a failed screen-stream request would tear down healthy audio.
         val desktopOffline = message.contains("not connected", ignoreCase = true) &&
             message.contains("desktop", ignoreCase = true)
-        if (desktopOffline && !audioRelayViaLan && audioRelayStartInFlight && !audioRelayActive) {
+        // Epoch-guard as well: this may be the reply to a stop we sent for a session
+        // that has since been superseded (the LAN->cloud fallback starts a new attempt
+        // immediately), and acting on it would tear down that fresh attempt.
+        if (desktopOffline && epoch == audioRelaySessionEpoch &&
+            !audioRelayViaLan && audioRelayStartInFlight && !audioRelayActive
+        ) {
             audioRelayActive = false
             currentAudioStreamId = -1
             clearAudioRelayStartInFlight()
@@ -8270,8 +8279,22 @@ class ListenerService : LifecycleService(),
         audioRelayRetryRunnable = null
 
         val desired = AppConfig.getAudioRelayDesired(this)
-        if (!desired || !audioRelayTransportAvailable()) {
-            LogCollector.i(TAG, "Audio relay retry skipped: desired=$desired, transport=${audioRelayTransportAvailable()}")
+        if (!desired) {
+            LogCollector.i(TAG, "Audio relay retry skipped: not desired")
+            return
+        }
+        if (!audioRelayTransportAvailable()) {
+            // Do not give up: nothing else re-arms us. The orchestrator reconnect only
+            // fires if the CLOUD socket bounces, and mDNS rediscovery does not kick a
+            // retry -- so a Wi-Fi bounce on a LAN-only phone meant silence until the
+            // user toggled the relay by hand. Re-check on the backstop interval.
+            LogCollector.i(TAG, "Audio relay: no transport available, re-checking in ${AUDIO_RELAY_BACKSTOP_DELAY_MS}ms")
+            val recheck = Runnable {
+                audioRelayRetryRunnable = null
+                scheduleAudioRelayRetry()
+            }
+            audioRelayRetryRunnable = recheck
+            mainHandler.postDelayed(recheck, AUDIO_RELAY_BACKSTOP_DELAY_MS)
             return
         }
         if (audioRelayActive) {

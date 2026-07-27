@@ -32,14 +32,22 @@ class WebRTCClient(context: Context) {
 
     interface Listener {
         fun onWebRTCAnswer(streamId: Int, sdp: String)
-        fun onWebRTCAudioConnected(streamId: Int)
-        fun onWebRTCDisconnected(streamId: Int)
+        fun onWebRTCAudioConnected(streamId: Int, peerSeq: Long)
+        fun onWebRTCDisconnected(streamId: Int, peerSeq: Long)
     }
 
     private val factory: PeerConnectionFactory
     private val handler = Handler(Looper.getMainLooper())
     @Volatile
     private var peerConnection: PeerConnection? = null
+
+    // Monotonic per-peer id. Stream ids restart low on each transport, so a new offer
+    // can reuse the id of the peer it replaces; the closing peer's disconnect would then
+    // match the new session's id and tear it down. This never repeats.
+    private var peerSeqCounter = 0L
+    @Volatile
+    var currentPeerSeq = 0L
+        private set
     private var currentStreamId = 0
     private var answerSent = false
     private var disconnectRunnable: Runnable? = null
@@ -139,6 +147,9 @@ class WebRTCClient(context: Context) {
         // Report events against the stream this peer was created for, never the shared
         // mutable field that a newer offer may already have overwritten.
         val peerStreamId = streamId
+        peerSeqCounter += 1
+        val peerSeq = peerSeqCounter
+        currentPeerSeq = peerSeq
 
         val rtcConfig = PeerConnection.RTCConfiguration(ICE_SERVERS).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
@@ -168,7 +179,7 @@ class WebRTCClient(context: Context) {
                         }
                         // Observer callbacks arrive on the WebRTC signaling thread; the
                         // listener mutates audio-relay state owned by the main thread.
-                        handler.post { listener?.onWebRTCAudioConnected(peerStreamId) }
+                        handler.post { listener?.onWebRTCAudioConnected(peerStreamId, peerSeq) }
                         startStatsLogging()
                     }
                     PeerConnection.IceConnectionState.DISCONNECTED -> {
@@ -178,7 +189,7 @@ class WebRTCClient(context: Context) {
                             val runnable = Runnable {
                                 disconnectRunnable = null
                                 LogCollector.w(TAG, "ICE did not recover within grace period, firing disconnect for stream $streamIdSnapshot")
-                                listener?.onWebRTCDisconnected(streamIdSnapshot)
+                                listener?.onWebRTCDisconnected(streamIdSnapshot, peerSeq)
                             }
                             disconnectRunnable = runnable
                             handler.postDelayed(runnable, ICE_DISCONNECT_GRACE_MS)
@@ -190,7 +201,7 @@ class WebRTCClient(context: Context) {
                             handler.removeCallbacks(it)
                             disconnectRunnable = null
                         }
-                        handler.post { listener?.onWebRTCDisconnected(peerStreamId) }
+                        handler.post { listener?.onWebRTCDisconnected(peerStreamId, peerSeq) }
                     }
                     else -> {}
                 }
