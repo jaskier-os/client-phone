@@ -1169,6 +1169,14 @@ class ListenerService : LifecycleService(),
             }
         }
         override fun onWebRTCAudioConnected(streamId: Int, peerSeq: Long) {
+            // Same staleness rule as the disconnect path: a connect posted by a peer we
+            // have already replaced must not mark the session active or clear the retry
+            // chain, or a dead session looks healthy and nothing ever recovers it.
+            val livePeerSeq = webRTCClient?.currentPeerSeq ?: -1L
+            if (peerSeq != livePeerSeq) {
+                LogCollector.i(TAG, "WebRTC connect for stale peer $peerSeq (live=$livePeerSeq), ignoring")
+                return
+            }
             LogCollector.i(TAG, "WebRTC audio connected for stream $streamId")
             audioRelayActive = true
             audioRelayRetryCount = 0
@@ -1181,10 +1189,8 @@ class ListenerService : LifecycleService(),
             })
         }
         override fun onWebRTCDisconnected(streamId: Int, peerSeq: Long) {
-            // Ignore disconnects for a stream that is no longer the current one:
-            // when a new offer arrives, WebRTCClient closes the old peer, which
-            // fires this for the STALE streamId. Retrying on that stale close is
-            // what spawned the reconnect storm.
+            // Ignore disconnects from a peer we have already replaced -- retrying on
+            // such a stale close is what spawned the reconnect storm.
             // Guard on the peer sequence, not the stream id: ids restart low on each
             // transport, so a replaced peer's disconnect can carry the same id as the
             // session that replaced it and would tear down a healthy connection.
