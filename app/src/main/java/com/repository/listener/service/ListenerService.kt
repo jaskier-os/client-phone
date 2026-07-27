@@ -8094,6 +8094,21 @@ class ListenerService : LifecycleService(),
         orchestratorClient.sendAudioRelayStart("desktop-listener", bitrate)
     }
 
+    /**
+     * True when a callback belongs to a LanRelayClient that is no longer the live one
+     * (or the service is gone). Callbacks are posted from the OkHttp reader thread, so
+     * by the time they run a newer client may have replaced this one -- acting on them
+     * tears down a healthy session or leaves the transport flags describing a client
+     * that no longer exists.
+     */
+    private fun isStaleLanClient(client: LanRelayClient): Boolean {
+        if (serviceDestroyed || lanRelayClient !== client) {
+            LogCollector.i(TAG, "Audio relay: ignoring callback from superseded LAN client")
+            return true
+        }
+        return false
+    }
+
     private fun startAudioRelayViaLan(endpoint: DesktopRelayLocator.Endpoint, bitrate: Int) {
         // Only one transport may feed the desktop's shared audio capture at a
         // time. A cloud session may exist from an earlier fallback -- stop it
@@ -8126,10 +8141,7 @@ class ListenerService : LifecycleService(),
                     // newer LanRelayClient may have been installed (e.g. a VPN-driven
                     // restart); falling back then would kill a healthy fresh attempt and
                     // clobber its watchdog.
-                    if (serviceDestroyed || lanRelayClient !== client) {
-                        LogCollector.i(TAG, "Audio relay: ignoring close of superseded LAN client")
-                        return@post
-                    }
+                    if (isStaleLanClient(client)) return@post
                     // If the LAN session dropped before audio was flowing, fall back
                     // to the cloud path so the user still gets audio. Clear the
                     // in-flight guard first so the fallback start is allowed through.
@@ -8144,7 +8156,9 @@ class ListenerService : LifecycleService(),
                         // desktop (splitting its capture), and an attempt that produced
                         // no offer would never be retried.
                         armAudioRelayStartGuard()
-                        startAudioRelayViaCloud(bitrate)
+                        // Read the bitrate fresh: the captured one is from when this LAN
+                        // attempt started and may predate a settings change.
+                        startAudioRelayViaCloud(AppConfig.getAudioBitrate(this@ListenerService))
                     }
                 }
             }
@@ -8153,14 +8167,24 @@ class ListenerService : LifecycleService(),
             // to the main thread first.
             override fun onAudioRelayAck(sampleRate: Int, channels: Int, br: Int, frameSize: Int, frameDurationMs: Int) {
                 mainHandler.post {
+                    if (isStaleLanClient(client)) return@post
                     this@ListenerService.onAudioRelayAck(sampleRate, channels, br, frameSize, frameDurationMs)
                 }
             }
             override fun onAudioRelayError(reason: String) {
-                mainHandler.post { this@ListenerService.onAudioRelayError(reason) }
+                mainHandler.post {
+                    if (isStaleLanClient(client)) return@post
+                    this@ListenerService.onAudioRelayError(reason)
+                }
             }
             override fun onWebRTCOffer(streamId: Int, sdp: String) {
                 mainHandler.post {
+                    // A superseded client's offer must not be accepted: it would set
+                    // audioRelayViaLan=true with lanRelayClient already null, and the
+                    // answer would then be dropped. That state makes every later stop
+                    // take the LAN branch, so the live CLOUD session is never released
+                    // and the desktop keeps two consumers on its shared capture.
+                    if (isStaleLanClient(client)) return@post
                     // LAN-path offer: bind the answer transport to LAN as we accept it.
                     audioRelayViaLan = true
                     handleWebRTCOffer(streamId, sdp)
@@ -8269,17 +8293,27 @@ class ListenerService : LifecycleService(),
         // desktop's peer consuming its shared capture, halving the next session's rate.
         currentAudioStreamId = -1
         webRTCClient?.close()
-        lanRelayClient?.let {
-            it.sendAudioRelayStop()
-            it.listener = null
-            it.close()
+        if (audioRelayViaLan) {
+            lanRelayClient?.let {
+                it.sendAudioRelayStop()
+                it.listener = null
+                it.close()
+            }
+            lanRelayClient = null
+            audioRelayViaLan = false
+        } else {
+            // Cloud session: tell the desktop to drop its consumer. Tearing down the LAN
+            // client here instead would kill a healthy LAN session over a cloud error --
+            // the LAN start itself provokes one by pre-emptively stopping the cloud.
+            orchestratorClient.sendAudioRelayStop("desktop-listener")
         }
-        lanRelayClient = null
-        audioRelayViaLan = false
         sendBroadcast(Intent(ACTION_AUDIO_RELAY_ERROR).apply {
             setPackage(packageName)
             putExtra(EXTRA_ERROR_REASON, reason)
         })
+        // Nothing else will retry: the peer is closed, so no disconnect callback is
+        // coming, and the retry chain was just cleared above.
+        scheduleAudioRelayRetry()
     }
 
     override fun onStreamError(reason: String, streamId: Int) {
