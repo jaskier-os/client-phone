@@ -8105,6 +8105,13 @@ class ListenerService : LifecycleService(),
                 currentAudioStreamId = -1
                 webRTCClient?.close()
                 releaseAudioRelayWifiLock()
+                // Clear the transport too. Leaving viaLan set with a live client makes
+                // the cloud-offer guard drop an in-flight offer, so that cloud session
+                // is never answered nor released and keeps consuming the desktop's
+                // shared capture alongside the retry -- half frame rate.
+                lanRelayClient?.let { it.listener = null; it.close() }
+                lanRelayClient = null
+                audioRelayViaLan = false
                 scheduleAudioRelayRetry()
             }
         }
@@ -8120,10 +8127,15 @@ class ListenerService : LifecycleService(),
      * desktop's shared capture and halve the next session's frame rate.
      */
     private fun releaseAudioRelaySessionOnDesktop() {
-        if (audioRelayViaLan) {
-            lanRelayClient?.sendAudioRelayStop()
+        val sent = if (audioRelayViaLan) {
+            lanRelayClient?.sendAudioRelayStop() ?: false
         } else {
             orchestratorClient.sendAudioRelayStop("desktop-listener")
+        }
+        if (!sent) {
+            // The desktop reaps on socket close, so this is recoverable, but a silently
+            // dropped release is worth seeing when diagnosing a halved frame rate.
+            LogCollector.w(TAG, "Audio relay: could not send session release (viaLan=$audioRelayViaLan)")
         }
     }
 
@@ -8240,11 +8252,12 @@ class ListenerService : LifecycleService(),
                 }
             }
             override fun onAudioRelayError(reason: String) {
-                // Sampled on the OkHttp thread, before any main-thread bump can land.
-                val epoch = audioRelaySessionEpoch
                 mainHandler.post {
+                    // The LAN socket IS the session, so client identity correlates
+                    // exactly -- a superseded client's error is already rejected here.
+                    // Pass the live epoch so the epoch check does not double-gate it.
                     if (isStaleLanClient(client)) return@post
-                    handleAudioRelayError(reason, fromLan = true, epoch = epoch)
+                    handleAudioRelayError(reason, fromLan = true, epoch = audioRelaySessionEpoch)
                 }
             }
             override fun onWebRTCOffer(streamId: Int, sdp: String) {

@@ -832,6 +832,12 @@ class OrchestratorClient(
     // session only if it is still that one; capturing the epoch when the error ARRIVES
     // would always match (any bump in between is already reflected) and so would never
     // filter anything.
+    //
+    // This narrows the window but cannot close it: send() only queues, so an error for
+    // the previous session can still be dequeued after the next stamp. Closing it fully
+    // needs the orchestrator to echo a correlation id, which it does not forward today
+    // (it relays only `reason`). The LAN path does not rely on this -- its client socket
+    // identifies the session exactly.
     @Volatile
     private var sentAudioRelayEpoch = -1
 
