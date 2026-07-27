@@ -8166,7 +8166,14 @@ class ListenerService : LifecycleService(),
         lanRelayClient = null
         audioRelayViaLan = false
         LogCollector.i(TAG, "Audio relay: starting via cloud (${bitrate}bps)")
-        orchestratorClient.sendAudioRelayStart("desktop-listener", bitrate)
+        if (!orchestratorClient.sendAudioRelayStart("desktop-listener", bitrate)) {
+            // The socket died between the transport check and here. The in-flight guard
+            // is already armed, so without this the relay sits dead for the full start
+            // window before the watchdog notices. Release it and retry now.
+            LogCollector.w(TAG, "Audio relay: cloud start could not be sent, retrying")
+            clearAudioRelayStartInFlight()
+            scheduleAudioRelayRetry()
+        }
     }
 
     /**
@@ -8478,7 +8485,14 @@ class ListenerService : LifecycleService(),
         }
     }
 
-    override fun onWebRTCOffer(streamId: Int, sdp: String) {
+    override fun onWebRTCOffer(streamId: Int, sdp: String, epoch: Int) {
+        // An offer for a session we have already replaced must not be adopted: it would
+        // close the healthy peer, take over the stale stream id and answer a desktop
+        // peer that is gone -- dead audio until the start watchdog fires.
+        if (epoch != audioRelaySessionEpoch) {
+            LogCollector.i(TAG, "Ignoring cloud offer for superseded session (epoch $epoch)")
+            return
+        }
         // A cloud offer emitted before we switched to LAN can arrive after the LAN
         // session is up. Accepting it would flip the transport flag and swap the peer
         // while leaving lanRelayClient live with its socket open -- every later

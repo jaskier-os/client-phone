@@ -105,7 +105,7 @@ class OrchestratorClient(
         fun onTelegramUserStatus(userId: String, isOnline: Boolean, lastSeen: String?) {}
         fun onNotificationTtsAudio(notifId: String, audioBase64: String, isFinal: Boolean) {}
         fun onReidMerge(sourcePersonId: String, targetPersonId: String, targetDisplayName: String) {}
-        fun onWebRTCOffer(streamId: Int, sdp: String) {}
+        fun onWebRTCOffer(streamId: Int, sdp: String, epoch: Int) {}
         fun onWebRTCIce(streamId: Int, candidate: String, sdpMid: String, sdpMLineIndex: Int) {}
 
         // Remote Control callbacks
@@ -510,7 +510,11 @@ class OrchestratorClient(
                             val streamId = envelope.optInt("streamId", 0)
                             val sdp = envelope.optString("sdp", "")
                             if (sdp.isNotEmpty()) {
-                                handler.post { listener?.onWebRTCOffer(streamId, sdp) }
+                                // Epoch sampled on the reader thread, matching the
+                                // error path: an offer for a superseded session must be
+                                // recognisable as stale once it reaches main.
+                                val offEpoch = sentAudioRelayEpoch
+                                handler.post { listener?.onWebRTCOffer(streamId, sdp, offEpoch) }
                             }
                         }
                         Protocol.TYPE_WEBRTC_ICE -> {
