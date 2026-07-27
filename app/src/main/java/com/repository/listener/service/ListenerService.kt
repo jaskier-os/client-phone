@@ -8105,6 +8105,12 @@ class ListenerService : LifecycleService(),
             audioRelayStartWatchdog = null
             if (!audioRelayActive && AppConfig.getAudioRelayDesired(this)) {
                 LogCollector.w(TAG, "Audio relay: start window elapsed with no session, retrying")
+                // Retire FIRST. This teardown also clears the two guards that would
+                // otherwise reject a late offer, so without retiring, an offer the
+                // desktop queued for this session is adopted during the retry gap and
+                // the retry then opens a SECOND session alongside it -- both consuming
+                // the desktop's capture, each getting half the frames.
+                retireAudioRelaySession()
                 // The desktop may have acked and opened a peer that never paired; it is
                 // still consuming its shared capture with the socket open. Release it or
                 // the retry's session runs alongside it and both get half the frames.
@@ -8214,7 +8220,14 @@ class ListenerService : LifecycleService(),
         val client = LanRelayClient(url, AppConfig.getDeviceId(this))
         client.listener = object : LanRelayClient.Listener {
             override fun onConnected() {
-                client.sendAudioRelayStart(bitrate)
+                // The only relay callback that was neither hopped to main nor checked
+                // for staleness: a client superseded while connecting would still send
+                // a start on a socket about to close, briefly giving the desktop a
+                // session nothing on this side owns.
+                mainHandler.post {
+                    if (isStaleLanClient(client)) return@post
+                    client.sendAudioRelayStart(bitrate)
+                }
             }
             override fun onClosed(reason: String) {
                 // Runs on an OkHttp thread. Do the whole check-and-act on the main
