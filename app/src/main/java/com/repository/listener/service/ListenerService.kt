@@ -8122,6 +8122,14 @@ class ListenerService : LifecycleService(),
                 // thread: clearAudioRelayStartInFlight() touches mainHandler callbacks,
                 // and reading the guards off-thread races the start path.
                 mainHandler.post {
+                    // Only act for the client that actually died. By the time this runs a
+                    // newer LanRelayClient may have been installed (e.g. a VPN-driven
+                    // restart); falling back then would kill a healthy fresh attempt and
+                    // clobber its watchdog.
+                    if (serviceDestroyed || lanRelayClient !== client) {
+                        LogCollector.i(TAG, "Audio relay: ignoring close of superseded LAN client")
+                        return@post
+                    }
                     // If the LAN session dropped before audio was flowing, fall back
                     // to the cloud path so the user still gets audio. Clear the
                     // in-flight guard first so the fallback start is allowed through.
@@ -8293,6 +8301,15 @@ class ListenerService : LifecycleService(),
     }
 
     override fun onWebRTCOffer(streamId: Int, sdp: String) {
+        // A cloud offer emitted before we switched to LAN can arrive after the LAN
+        // session is up. Accepting it would flip the transport flag and swap the peer
+        // while leaving lanRelayClient live with its socket open -- every later
+        // stopAudioRelay() would then take the cloud branch and never close it, so the
+        // desktop keeps two consumers on its shared capture (half frame rate).
+        if (audioRelayViaLan && lanRelayClient != null) {
+            LogCollector.i(TAG, "Ignoring cloud offer for stream $streamId: LAN session is live")
+            return
+        }
         // Cloud-path offer. Bind the answer transport to the cloud as we accept
         // the offer so a late LAN offer can't misroute this stream's answer.
         audioRelayViaLan = false
