@@ -8174,7 +8174,7 @@ class ListenerService : LifecycleService(),
             override fun onAudioRelayError(reason: String) {
                 mainHandler.post {
                     if (isStaleLanClient(client)) return@post
-                    this@ListenerService.onAudioRelayError(reason)
+                    handleAudioRelayError(reason, fromLan = true)
                 }
             }
             override fun onWebRTCOffer(streamId: Int, sdp: String) {
@@ -8202,6 +8202,9 @@ class ListenerService : LifecycleService(),
         // passes and a retry chain is armed right after we cancel it below -- that chain
         // then races the deliberate restart (e.g. the VPN transport switch).
         currentAudioStreamId = -1
+        // Unpin the answer routing too: ids restart low on both transports, so a stale
+        // pinned pair could match a future stream and route its answer to the wrong peer.
+        audioRelayAnswerStreamId = -1
         webRTCClient?.close()
         audioRelayActive = false
         clearAudioRelayStartInFlight()
@@ -8281,12 +8284,31 @@ class ListenerService : LifecycleService(),
         })
     }
 
+    /** Cloud-transport error (OrchestratorClient). */
     override fun onAudioRelayError(reason: String) {
+        handleAudioRelayError(reason, fromLan = false)
+    }
+
+    /**
+     * Act only on the transport that DELIVERED the error. Branching on the currently
+     * live transport instead meant the cloud error provoked by startAudioRelayViaLan's
+     * own pre-emptive cloud stop arrived after audioRelayViaLan flipped true, and tore
+     * down the LAN session it had just started.
+     */
+    private fun handleAudioRelayError(reason: String, fromLan: Boolean) {
         if (serviceDestroyed) return
+        // Ignore an error for a transport that is no longer the live one; it refers to
+        // a session we already replaced.
+        if (fromLan != audioRelayViaLan) {
+            LogCollector.i(TAG, "Ignoring audio relay error from ${if (fromLan) "LAN" else "cloud"} (not the live transport): $reason")
+            return
+        }
         LogCollector.e(TAG, "Audio relay error from desktop: $reason")
         audioRelayActive = false
         clearAudioRelayStartInFlight()
-        audioRelayRetryCount = 0
+        // Do NOT reset audioRelayRetryCount here: this path arms a retry at the end, so
+        // resetting the budget every time makes the chain unbounded (error -> teardown
+        // -> retry -> error ...) with nothing to pace it but the start watchdog.
         audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
         audioRelayRetryRunnable = null
         // Release the failed session's transport. Leaving the LAN socket open keeps the
