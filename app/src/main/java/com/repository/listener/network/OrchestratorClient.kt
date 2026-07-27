@@ -87,7 +87,9 @@ class OrchestratorClient(
         fun onStreamAck(streamId: Int, width: Int, height: Int, fps: Int, monitorCount: Int) {}
         fun onStreamEnded(streamId: Int) {}
         fun onAudioRelayAck(sampleRate: Int, channels: Int, bitrate: Int, frameSize: Int, frameDurationMs: Int) {}
-        fun onAudioRelayError(reason: String) {}
+        fun onAudioRelayError(reason: String, epoch: Int) {}
+        /** Epoch of the audio-relay attempt currently in progress. */
+        fun currentAudioRelayEpoch(): Int = 0
         fun onStreamError(reason: String, streamId: Int) {}
         fun onStreamConnect(streamId: Int, streamType: String, endpoint: String, token: String) {}
         fun onTodoResult(data: String) {}
@@ -407,7 +409,11 @@ class OrchestratorClient(
                         Protocol.TYPE_AUDIO_RELAY_ERROR -> {
                             val reason = envelope.optString("reason", "unknown")
                             LogCollector.e(TAG, "Audio relay error: $reason")
-                            handler.post { listener?.onAudioRelayError(reason) }
+                            // Capture the epoch on the READER thread, before the post is
+                            // queued: reading it on main would sample it after a newer
+                            // session had already started, defeating the correlation.
+                            val errEpoch = listener?.currentAudioRelayEpoch() ?: 0
+                            handler.post { listener?.onAudioRelayError(reason, errEpoch) }
                         }
                         Protocol.TYPE_STREAM_ERROR -> {
                             val reason = envelope.optString("reason", "unknown")

@@ -447,6 +447,12 @@ class ListenerService : LifecycleService(),
     @Volatile
     private var audioRelayRetryCount = 0
     private val audioRelayRetryDelays = longArrayOf(2_000, 5_000, 15_000)
+    // Steady-state interval once the backoff ladder is exhausted, so a relay that keeps
+    // failing still recovers on its own when the desktop comes back.
+    private val AUDIO_RELAY_BACKSTOP_DELAY_MS = 60_000L
+    // Incremented per start attempt so late errors can be attributed to their session.
+    @Volatile
+    private var audioRelaySessionEpoch = 0
     @Volatile
     private var audioRelayRetryRunnable: Runnable? = null
     // The stream id of the offer we are currently answering. A WebRTC disconnect
@@ -1144,6 +1150,13 @@ class ListenerService : LifecycleService(),
             // flag: ICE gathering can take up to 10s, and a transport switch in that
             // window would otherwise send this answer to the wrong peer, so the offering
             // side never gets it and the session dies.
+            // Drop an answer for a stream we already abandoned. ICE gathering can take
+            // ~10s, so an answer for a torn-down stream can still surface; sending it
+            // would set up a peer on the desktop for a session this phone no longer has.
+            if (streamId != currentAudioStreamId) {
+                LogCollector.i(TAG, "Dropping answer for stale stream $streamId (current=$currentAudioStreamId)")
+                return
+            }
             val viaLan = if (streamId == audioRelayAnswerStreamId) {
                 audioRelayAnswerViaLan
             } else {
@@ -8058,6 +8071,7 @@ class ListenerService : LifecycleService(),
      * peer (no peer => no disconnect callback => no retry).
      */
     private fun armAudioRelayStartGuard() {
+        audioRelaySessionEpoch++
         audioRelayStartInFlight = true
         audioRelayStartWatchdog?.let { mainHandler.removeCallbacks(it) }
         val watchdog = Runnable {
@@ -8065,11 +8079,30 @@ class ListenerService : LifecycleService(),
             audioRelayStartWatchdog = null
             if (!audioRelayActive && AppConfig.getAudioRelayDesired(this)) {
                 LogCollector.w(TAG, "Audio relay: start window elapsed with no session, retrying")
+                // The desktop may have acked and opened a peer that never paired; it is
+                // still consuming its shared capture with the socket open. Release it or
+                // the retry's session runs alongside it and both get half the frames.
+                releaseAudioRelaySessionOnDesktop()
                 scheduleAudioRelayRetry()
             }
         }
         audioRelayStartWatchdog = watchdog
         mainHandler.postDelayed(watchdog, AUDIO_RELAY_START_WINDOW_MS)
+    }
+
+    /**
+     * Tell the desktop to drop whatever audio-relay session it holds for us on the
+     * currently selected transport. The desktop reaps on socket close, but the cloud
+     * socket is the long-lived orchestrator one and a LAN socket can outlive a failed
+     * handshake -- so a session that never paired would otherwise keep consuming the
+     * desktop's shared capture and halve the next session's frame rate.
+     */
+    private fun releaseAudioRelaySessionOnDesktop() {
+        if (audioRelayViaLan) {
+            lanRelayClient?.sendAudioRelayStop()
+        } else {
+            orchestratorClient.sendAudioRelayStop("desktop-listener")
+        }
     }
 
     private fun clearAudioRelayStartInFlight() {
@@ -8172,9 +8205,10 @@ class ListenerService : LifecycleService(),
                 }
             }
             override fun onAudioRelayError(reason: String) {
+                val epoch = audioRelaySessionEpoch
                 mainHandler.post {
                     if (isStaleLanClient(client)) return@post
-                    handleAudioRelayError(reason, fromLan = true)
+                    handleAudioRelayError(reason, fromLan = true, epoch = epoch)
                 }
             }
             override fun onWebRTCOffer(streamId: Int, sdp: String) {
@@ -8201,10 +8235,10 @@ class ListenerService : LifecycleService(),
         // reports a disconnect for that id. With the id still live the stale-stream guard
         // passes and a retry chain is armed right after we cancel it below -- that chain
         // then races the deliberate restart (e.g. the VPN transport switch).
+        // Retiring the stream id is what makes a late answer/ICE for this session stale;
+        // the answer pin is deliberately left in place so a late answer can still be
+        // routed to the transport it belongs to if it does slip through.
         currentAudioStreamId = -1
-        // Unpin the answer routing too: ids restart low on both transports, so a stale
-        // pinned pair could match a future stream and route its answer to the wrong peer.
-        audioRelayAnswerStreamId = -1
         webRTCClient?.close()
         audioRelayActive = false
         clearAudioRelayStartInFlight()
@@ -8244,12 +8278,17 @@ class ListenerService : LifecycleService(),
             LogCollector.i(TAG, "Audio relay retry skipped: already active")
             return
         }
-        if (audioRelayRetryCount >= audioRelayRetryDelays.size) {
-            LogCollector.w(TAG, "Audio relay: max retries reached ($audioRelayRetryCount), giving up")
-            audioRelayRetryCount = 0
-            return
+        // Past the backoff ladder, keep retrying on a long interval instead of giving up.
+        // Nothing else would resurrect the relay: a disconnect callback needs a live
+        // peer, the start watchdog needs an attempt in flight, and the orchestrator
+        // reconnect only fires if the cloud WS itself bounces -- which it does not when
+        // the DESKTOP is the flaky party, and never on the LAN path. Exhausting the
+        // ladder therefore meant silence until the user toggled the relay by hand.
+        val delay = if (audioRelayRetryCount >= audioRelayRetryDelays.size) {
+            AUDIO_RELAY_BACKSTOP_DELAY_MS
+        } else {
+            audioRelayRetryDelays[audioRelayRetryCount]
         }
-        val delay = audioRelayRetryDelays[audioRelayRetryCount]
         LogCollector.i(TAG, "Audio relay: scheduling retry #${audioRelayRetryCount + 1} in ${delay}ms")
         val runnable = Runnable {
             audioRelayRetryRunnable = null
@@ -8263,7 +8302,9 @@ class ListenerService : LifecycleService(),
                     scheduleAudioRelayRetry()
                     return@Runnable
                 }
-                audioRelayRetryCount++
+                // Clamp: past the ladder the delay is the fixed backstop, so there is no
+                // reason to keep incrementing (and overflowing) the counter.
+                if (audioRelayRetryCount < audioRelayRetryDelays.size) audioRelayRetryCount++
                 val bitrate = AppConfig.getAudioBitrate(this)
                 LogCollector.i(TAG, "Audio relay: auto-restarting (attempt $audioRelayRetryCount)")
                 startAudioRelay(bitrate)
@@ -8285,8 +8326,10 @@ class ListenerService : LifecycleService(),
     }
 
     /** Cloud-transport error (OrchestratorClient). */
-    override fun onAudioRelayError(reason: String) {
-        handleAudioRelayError(reason, fromLan = false)
+    override fun currentAudioRelayEpoch(): Int = audioRelaySessionEpoch
+
+    override fun onAudioRelayError(reason: String, epoch: Int) {
+        handleAudioRelayError(reason, fromLan = false, epoch = epoch)
     }
 
     /**
@@ -8295,8 +8338,16 @@ class ListenerService : LifecycleService(),
      * own pre-emptive cloud stop arrived after audioRelayViaLan flipped true, and tore
      * down the LAN session it had just started.
      */
-    private fun handleAudioRelayError(reason: String, fromLan: Boolean) {
+    private fun handleAudioRelayError(reason: String, fromLan: Boolean, epoch: Int) {
         if (serviceDestroyed) return
+        // Drop an error belonging to a session we have already replaced. Transport
+        // identity alone is not enough: a pre-emptive stop for the PREVIOUS session can
+        // be answered with an error that arrives after a new session of the SAME
+        // transport started, and tearing that one down would kill a healthy session.
+        if (epoch != audioRelaySessionEpoch) {
+            LogCollector.i(TAG, "Ignoring audio relay error from a superseded session: $reason")
+            return
+        }
         // Ignore an error for a transport that is no longer the live one; it refers to
         // a session we already replaced.
         if (fromLan != audioRelayViaLan) {
