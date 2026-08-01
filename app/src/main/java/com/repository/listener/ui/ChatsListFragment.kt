@@ -96,6 +96,7 @@ class ChatsListFragment : Fragment() {
     private var isSearching = false
     private val searchDebounceRunnable = Runnable { performSearch() }
     private val rcSessions = mutableMapOf<String, ChatListItem.RemoteControlSession>()
+    private var vscodeProjects: List<ChatListItem.VscodeProject> = emptyList()
     private var currentOffset = 0
     private var totalChats = 0
     private var isLoadingMore = false
@@ -290,6 +291,14 @@ class ChatsListFragment : Fragment() {
                     .putExtra("copilot_conversation_id", summary.id)
                     .putExtra("copilot_title", summary.title)
                 startActivity(intent)
+            },
+            onVscodeProjectClick = { project ->
+                val ctx = context ?: return@ChatsListAdapter
+                val wsUrl = AppConfig.getOrchestratorUrl(ctx)
+                val apiKey = AppConfig.getApiKey(ctx)
+                val deviceId = AppConfig.getDeviceId(ctx)
+                val remoteClient = RemoteSessionClient(wsUrl, apiKey, deviceId)
+                showConversationPicker(remoteClient, project.path, "bypassAll")
             },
             onRcSessionClick = { rcSession ->
                 // Tell the service this session has been read so the dot flips red
@@ -797,7 +806,9 @@ class ChatsListFragment : Fragment() {
             adapter.pinnedIds = context?.let { AppConfig.getPinnedChatIds(it) } ?: emptySet()
             adapter.respondingChatIds = ListenerService.respondingChatIds.toSet()
             adapter.thinkingRcSessionIds = ListenerService.thinkingRcStartTimes.keys.toSet()
+            val scrollState = recyclerView.layoutManager?.onSaveInstanceState()
             adapter.submitList(items)
+            scrollState?.let { recyclerView.layoutManager?.onRestoreInstanceState(it) }
         }
     }
 
@@ -904,6 +915,22 @@ class ChatsListFragment : Fragment() {
             result.onFailure { err ->
                 LogCollector.e(TAG, "Failed to load sessions: ${err.message}")
             }
+        }
+
+        remoteClient.getDirs { result ->
+            result.onSuccess { response ->
+                if (response.available && response.dirs.isNotEmpty()) {
+                    vscodeProjects = response.dirs.map { dirPath ->
+                        val clean = dirPath.trimEnd('/')
+                        val base = clean.substringAfterLast('/')
+                        val parent = clean.substringBeforeLast('/').substringAfterLast('/')
+                        val label = if (parent.isNotEmpty()) "$parent/$base" else base
+                        ChatListItem.VscodeProject(path = dirPath, label = label)
+                    }
+                    rebuildList()
+                }
+            }
+            result.onFailure { /* vscode dirs are optional, ignore */ }
         }
 
         remoteClient.listRcSessions { result ->
@@ -1112,7 +1139,20 @@ class ChatsListFragment : Fragment() {
             out
         }
 
-        return pinned + rest
+        // Append VS Code project shortcuts at the bottom (excluding dirs
+        // that have an active RC session, since those already appear above).
+        val activeRcWorkDirs = rcSessions.values
+            .filter { it.status == "active" }
+            .map { it.workDir }.toSet()
+        val projectItems: List<ChatListItem> = if (filterType == "chats" || vscodeProjects.isEmpty()) {
+            emptyList()
+        } else {
+            val filtered = vscodeProjects.filter { it.path !in activeRcWorkDirs }
+            if (filtered.isEmpty()) emptyList()
+            else listOf(ChatListItem.FolderHeader("Projects")) + filtered
+        }
+
+        return pinned + rest + projectItems
     }
 
     private val isoParserStrict = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US).apply {

@@ -40,6 +40,7 @@ sealed class ChatListItem {
     data class DateHeader(val label: String) : ChatListItem()
     data class FolderHeader(val label: String) : ChatListItem()
     data class CopilotConversation(val summary: CopilotSummary) : ChatListItem()
+    data class VscodeProject(val path: String, val label: String) : ChatListItem()
 }
 
 class ChatsListAdapter(
@@ -47,7 +48,8 @@ class ChatsListAdapter(
     private val onChatLongClick: (ChatSummary) -> Unit,
     private val onSessionLongClick: (LiveSession) -> Unit,
     private val onRcSessionClick: ((ChatListItem.RemoteControlSession) -> Unit)? = null,
-    private val onCopilotClick: ((CopilotSummary) -> Unit)? = null
+    private val onCopilotClick: ((CopilotSummary) -> Unit)? = null,
+    private val onVscodeProjectClick: ((ChatListItem.VscodeProject) -> Unit)? = null
 ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
 
     companion object {
@@ -57,6 +59,7 @@ class ChatsListAdapter(
         private const val TYPE_DATE_HEADER = 3
         private const val TYPE_FOLDER_HEADER = 4
         private const val TYPE_COPILOT = 5
+        private const val TYPE_VSCODE_PROJECT = 6
     }
 
     private val items = mutableListOf<ChatListItem>()
@@ -109,6 +112,12 @@ class ChatsListAdapter(
         val textView: TextView
     ) : RecyclerView.ViewHolder(container)
 
+    class VscodeProjectViewHolder(
+        val container: LinearLayout,
+        val titleView: TextView,
+        val subtitleView: TextView
+    ) : RecyclerView.ViewHolder(container)
+
     override fun getItemViewType(position: Int): Int {
         return when (items[position]) {
             is ChatListItem.Conversation -> TYPE_CONVERSATION
@@ -117,6 +126,7 @@ class ChatsListAdapter(
             is ChatListItem.DateHeader -> TYPE_DATE_HEADER
             is ChatListItem.FolderHeader -> TYPE_FOLDER_HEADER
             is ChatListItem.CopilotConversation -> TYPE_COPILOT
+            is ChatListItem.VscodeProject -> TYPE_VSCODE_PROJECT
         }
     }
 
@@ -127,6 +137,7 @@ class ChatsListAdapter(
             TYPE_DATE_HEADER -> createDateHeaderHolder(parent)
             TYPE_FOLDER_HEADER -> createFolderHeaderHolder(parent)
             TYPE_COPILOT -> createCopilotHolder(parent)
+            TYPE_VSCODE_PROJECT -> createVscodeProjectHolder(parent)
             else -> createChatHolder(parent)
         }
     }
@@ -549,6 +560,85 @@ class ChatsListAdapter(
         return RcSessionViewHolder(container, statusDot, titleView, subtitleView, rcThinkingChip)
     }
 
+    private fun createVscodeProjectHolder(parent: ViewGroup): VscodeProjectViewHolder {
+        val ctx = parent.context
+        val dp = { value: Int -> dpToPx(ctx, value) }
+
+        val leftBorder = View(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(4), ViewGroup.LayoutParams.MATCH_PARENT)
+            setBackgroundColor(color(ctx, R.color.gbx_green))
+        }
+
+        val folderIcon = TextView(ctx).apply {
+            text = "[]"
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(color(ctx, R.color.gbx_green))
+            setPadding(0, 0, dpToPx(ctx, 8), 0)
+        }
+
+        val titleView = TextView(ctx).apply {
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(color(ctx, R.color.gbx_green))
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val titleRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            addView(folderIcon)
+            addView(titleView)
+        }
+
+        val subtitleView = TextView(ctx).apply {
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(color(ctx, R.color.gbx_gray))
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(2) }
+        }
+
+        val textContent = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(dp(12), dp(16), dp(16), dp(16))
+            addView(titleRow)
+            addView(subtitleView)
+        }
+
+        val container = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = RecyclerView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                marginStart = dp(12)
+                marginEnd = dp(12)
+                topMargin = dp(6)
+                bottomMargin = dp(6)
+            }
+            isClickable = true
+            isFocusable = true
+            setBackgroundResource(R.drawable.bg_chat_card)
+            clipToOutline = true
+            addView(leftBorder)
+            addView(textContent)
+        }
+
+        return VscodeProjectViewHolder(container, titleView, subtitleView)
+    }
+
     override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
         when (val item = items[position]) {
             is ChatListItem.Conversation -> {
@@ -682,6 +772,12 @@ class ChatsListAdapter(
             is ChatListItem.FolderHeader -> {
                 val h = holder as FolderHeaderViewHolder
                 h.textView.text = item.label
+            }
+            is ChatListItem.VscodeProject -> {
+                val h = holder as VscodeProjectViewHolder
+                h.titleView.text = item.label
+                h.subtitleView.text = item.path
+                h.container.setOnClickListener { onVscodeProjectClick?.invoke(item) }
             }
         }
     }
