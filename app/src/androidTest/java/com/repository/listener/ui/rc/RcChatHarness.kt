@@ -77,7 +77,25 @@ class RcChatHarness(val device: UiDevice) {
      * @param permissionMode orchestrator permission mode (default "bypassAll")
      * @return the real sessionId returned by the orchestrator
      */
-    fun launchRcSession(workDir: String, permissionMode: String = "bypassAll"): String {
+    fun launchRcSession(workDir: String, permissionMode: String = "bypassAll"): String =
+        launchRcSession(workDir, permissionMode, resumeSessionId = null).first
+
+    /**
+     * Same as [launchRcSession] but for a KNOWN conversation id: passes
+     * `sessionId` to the orchestrator, which is the request shape that makes
+     * pc-agent look for a live interactive CLI to attach to (and otherwise spawn
+     * with `--resume`). This is the entry point the live-attach tests need; the
+     * no-arg overload above cannot express it because a fresh start mints a new
+     * id server-side.
+     *
+     * @return (sessionId, elapsedMs) -- the elapsed time is what the
+     *   90s-replay-stall regression asserts on.
+     */
+    fun launchRcSession(
+        workDir: String,
+        permissionMode: String,
+        resumeSessionId: String?
+    ): Pair<String, Long> {
         launchApp()
 
         val wsUrl = AppConfig.getOrchestratorUrl(ctx)
@@ -89,8 +107,9 @@ class RcChatHarness(val device: UiDevice) {
         var sessionId: String? = null
         var realWorkDir: String? = null
         var error: Throwable? = null
+        val startedAtMs = System.currentTimeMillis()
 
-        client.startSession(workDir, permissionMode) { result ->
+        client.startSession(workDir, permissionMode, resumeSessionId) { result ->
             result.onSuccess {
                 sessionId = it.sessionId
                 realWorkDir = it.workDir
@@ -105,6 +124,7 @@ class RcChatHarness(val device: UiDevice) {
         error?.let { throw IllegalStateException("startSession failed: ${it.message}", it) }
         val sid = sessionId ?: error("startSession returned null sessionId")
         val wd = realWorkDir ?: workDir
+        val elapsedMs = System.currentTimeMillis() - startedAtMs
 
         // Give pc-agent a moment to spawn the CLI process and the orchestrator a
         // moment to be ready to forward messages for this sessionId.
@@ -120,7 +140,7 @@ class RcChatHarness(val device: UiDevice) {
         val launched = device.wait(Until.hasObject(By.textContains(basename)), DEFAULT_TIMEOUT)
         check(launched) { "RemoteControlActivity did not launch (workDir basename '$basename' not visible)" }
         Thread.sleep(500)
-        return sid
+        return sid to elapsedMs
     }
 
     /**
@@ -289,6 +309,63 @@ class RcChatHarness(val device: UiDevice) {
         return device.findObjects(By.desc("rcAssistantText"))
             .mapNotNull { runCatching { it.text }.getOrNull()?.trim() }
             .filter { it.isNotEmpty() }
+    }
+
+    /** Snapshot all currently visible user message texts. */
+    fun userTexts(): List<String> {
+        return device.findObjects(By.desc("rcUserText"))
+            .mapNotNull { runCatching { it.text }.getOrNull()?.trim() }
+            .filter { it.isNotEmpty() }
+    }
+
+    /**
+     * Poll every rendered chat bubble (user AND assistant) for a substring.
+     *
+     * The live-attach direction "PC types -> phone shows it" arrives as a `user`
+     * frame and renders as a user bubble, so awaitAssistantReply cannot see it.
+     *
+     * @return the matched bubble text
+     * @throws AssertionError on timeout, quoting what WAS rendered
+     */
+    fun awaitAnyMessage(matchSubstring: String, timeoutMs: Long = 90_000L): String {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var seen: List<String> = emptyList()
+        while (System.currentTimeMillis() < deadline) {
+            seen = userTexts() + assistantTexts()
+            val hit = seen.firstOrNull { it.contains(matchSubstring, ignoreCase = true) }
+            if (hit != null) return hit
+            Thread.sleep(400)
+        }
+        throw AssertionError(
+            "Timed out after ${timeoutMs}ms waiting for any chat bubble containing " +
+                "'$matchSubstring'; rendered=${seen.take(20)}"
+        )
+    }
+
+    /**
+     * Open the in-session /resume picker and select the row for [sessionId].
+     *
+     * Selection is by contentDescription ("rcConvRow:<sessionId>", set in
+     * ConversationPickerBottomSheet) -- never by coordinates, and never by the
+     * row's human label, which is derived from conversation content and would
+     * make the test depend on what the model happened to say.
+     */
+    fun openConversationFromPicker(sessionId: String, timeoutMs: Long = 30_000L) {
+        sendSlashCommand("/resume")
+        val appeared = device.wait(Until.hasObject(By.textContains("Resume Conversation")), 15_000L)
+        check(appeared) { "Resume picker did not appear" }
+
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var row: UiObject2? = null
+        while (System.currentTimeMillis() < deadline && row == null) {
+            row = device.findObject(By.desc("rcConvRow:$sessionId"))
+            if (row == null) Thread.sleep(500)
+        }
+        checkNotNull(row) {
+            "Conversation $sessionId was not listed in the resume picker; " +
+                "visible rows=${device.findObjects(By.descStartsWith("rcConvRow:")).map { it.contentDescription }}"
+        }
+        row.click()
     }
 
     // ------------------------------------------------------------------

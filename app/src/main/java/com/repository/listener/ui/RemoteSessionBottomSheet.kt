@@ -15,6 +15,8 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.core.content.ContextCompat
+import androidx.core.widget.NestedScrollView
+import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialogFragment
 import com.repository.listener.R
 
@@ -46,7 +48,20 @@ class RemoteSessionBottomSheet : BottomSheetDialogFragment() {
         }
         this.container = root
         buildContent(root)
-        return root
+
+        // The directory list grows with the number of workdirs, so it must
+        // scroll -- without this, every entry past the sheet's height is simply
+        // unreachable. NestedScrollView (not ScrollView) so the scroll gesture
+        // cooperates with the bottom sheet's own drag-to-dismiss instead of
+        // fighting it.
+        return NestedScrollView(requireContext()).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            isFillViewport = true
+            addView(root)
+        }
     }
 
     private fun buildContent(root: LinearLayout) {
@@ -182,6 +197,11 @@ class RemoteSessionBottomSheet : BottomSheetDialogFragment() {
     fun showError(msg: String) {
         errorMessage = msg
         isLoading = false
+        // buildContent() calls requireContext(); an async HTTP callback can land
+        // after this sheet has been detached (dismissed while the request was in
+        // flight), which would throw. Store state above first, then skip the
+        // redraw when detached; a re-attach rebuilds from the stored state.
+        if (!isAdded) return
         container?.let { buildContent(it) }
     }
 
@@ -189,6 +209,27 @@ class RemoteSessionBottomSheet : BottomSheetDialogFragment() {
         dirs = newDirs
         isLoading = false
         errorMessage = null
+        if (!isAdded) return
         container?.let { buildContent(it) }
+    }
+
+    /**
+     * Open expanded rather than at the default collapsed peek height.
+     *
+     * The directory list is loaded asynchronously, so at first layout the sheet
+     * is nearly empty and its peek height is tiny. Once the dirs arrive the
+     * content is taller than that, leaving most of the list off-screen with no
+     * obvious way to reach it. skipCollapsed keeps a drag-down from parking it
+     * back at peek height.
+     */
+    override fun onStart() {
+        super.onStart()
+        val sheet = dialog?.findViewById<View>(
+            com.google.android.material.R.id.design_bottom_sheet
+        ) ?: return
+        BottomSheetBehavior.from(sheet).apply {
+            skipCollapsed = true
+            state = BottomSheetBehavior.STATE_EXPANDED
+        }
     }
 }

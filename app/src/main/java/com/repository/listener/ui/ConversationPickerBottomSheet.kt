@@ -167,6 +167,10 @@ class ConversationPickerBottomSheet : BottomSheetDialogFragment() {
             setPadding(48, 20, 48, 20)
             isClickable = true
             isFocusable = true
+            // Stable accessibility handle so instrumented tests can select a
+            // specific conversation row without tapping screen coordinates.
+            // Same convention as RcDetailAdapter's rcAssistantText marker.
+            contentDescription = "rcConvRow:${conv.sessionId}"
             background = android.graphics.drawable.RippleDrawable(
                 android.content.res.ColorStateList.valueOf(COLOR_BG1),
                 ColorDrawable(COLOR_BG),
@@ -199,12 +203,19 @@ class ConversationPickerBottomSheet : BottomSheetDialogFragment() {
         conversations = list
         isLoading = false
         errorMessage = null
+        // Store state above first: an async HTTP callback can land after the
+        // sheet has been detached (e.g. dismissed while the request was in
+        // flight). buildContent() calls requireContext(), which throws when the
+        // fragment is no longer attached. Skip the redraw in that case; if the
+        // fragment is ever re-attached, onCreateView rebuilds from the state.
+        if (!isAdded) return
         container?.let { buildContent(it) }
     }
 
     fun showError(msg: String) {
         errorMessage = msg
         isLoading = false
+        if (!isAdded) return
         container?.let { buildContent(it) }
     }
 }
