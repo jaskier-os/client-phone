@@ -421,6 +421,19 @@ class ListenerService : LifecycleService(),
         // Audio relay active state (readable by DesktopFragment for UI)
         @Volatile var audioRelayActive = false
 
+        /**
+         * Remote input has claimed the radio and the relay is being torn down for it.
+         *
+         * Teardown is asynchronous (peer connection close plus ICE unwind), so
+         * [audioRelayActive] stays true for many milliseconds after the decision. Paths
+         * that defer to the relay must consult this too, or they spend that whole window
+         * refusing to serve the input the teardown was performed FOR -- which is the
+         * window the user is actively turning the bezel in.
+         *
+         * Cleared when the relay actually stops, or when it is started again.
+         */
+        @Volatile var audioRelayYieldedToInput = false
+
         @Volatile var audioArchiver: GlassesAudioArchiver? = null
     }
 
@@ -1180,6 +1193,9 @@ class ListenerService : LifecycleService(),
             }
             LogCollector.i(TAG, "WebRTC audio connected for stream $streamId")
             audioRelayActive = true
+            // A relay is up again, so the previous input claim is spent. Leaving it set
+            // would permanently disable the deferral for every later relay session.
+            audioRelayYieldedToInput = false
             audioRelayRetryCount = 0
             audioRelayRetryRunnable?.let { mainHandler.removeCallbacks(it) }
             audioRelayRetryRunnable = null
@@ -3031,6 +3047,10 @@ class ListenerService : LifecycleService(),
         watchInputBridge = com.repository.listener.wear.WatchInputBridge(
             inputClient = phoneBtHost.inputRfcommClient,
             statusSender = { bits -> sendWatchStatus(bits) },
+            // Remote input outranks the desktop audio relay, by explicit user
+            // decision: a bezel the user is actively turning doing nothing is worse
+            // than audio that stops. Every other feature keeps the opposite priority.
+            stopAudioRelay = { reason -> stopAudioRelayForRemoteInput(reason) },
         )
         com.repository.listener.wear.WatchMessageListenerService.bridge = watchInputBridge
         // The glasses' sink state arrives on the DEDICATED input socket, because that
@@ -3042,6 +3062,12 @@ class ListenerService : LifecycleService(),
         }
         phoneBtHost.inputRfcommClient.onRouterStatus = { _, sinkAttached, _ ->
             watchInputBridge?.setGlassesSinkAttached(sinkAttached)
+        }
+        // The glasses' UI received input and REFUSED it. Forwarded so the watch can say
+        // WHY nothing is happening: without this every refusal ended in a log line on the
+        // glasses' internal flash while the watch went on showing "Connected".
+        phoneBtHost.inputRfcommClient.onRefusal = { reason, refusedTotal ->
+            watchInputBridge?.setGlassesRefusal(reason, refusedTotal)
         }
         phoneBtHost.onGlassesCommandResult = { requestId, result ->
             onGlassesCommandResult(requestId, result)
@@ -8398,6 +8424,47 @@ class ListenerService : LifecycleService(),
         } else {
             orchestratorClient.sendAudioRelayStop("desktop-listener")
         }
+    }
+
+    /**
+     * Tears the desktop audio relay down so remote input can take the radio.
+     *
+     * The priority here is INVERTED relative to the guard in `PhoneBtHost` and
+     * `InputRfcommClient.maybeSelfHeal`, which skip RFCOMM paging while a relay
+     * streams (each page to absent glasses steals 2.4 GHz airtime and stutters the
+     * audio). That guard stays in place for every other feature; for remote input the
+     * user asked for the opposite, because a bezel turn that does nothing is worse
+     * than audio that stops.
+     *
+     * `setAudioRelayDesired(false)` is essential, not incidental: `stopAudioRelay()`
+     * alone leaves the user's standing intent set, and `scheduleAudioRelayRetry`
+     * would bring the relay straight back and re-block input a few seconds later.
+     * Clearing the intent is what makes the teardown stick, and it also means the
+     * relay does not silently resurrect the next time the transport flaps -- the user
+     * turns it back on deliberately, from the UI that turned it on.
+     *
+     * Idempotent, and safe to call from a 30 Hz burst: it returns immediately once
+     * the relay is down.
+     *
+     * @return true if a relay was actually torn down.
+     */
+    fun stopAudioRelayForRemoteInput(reason: String): Boolean {
+        if (!audioRelayActive && !audioRelayStartInFlight) return false
+        LogCollector.i(
+            TAG,
+            "Audio relay stopped to allow remote input ($reason). " +
+                "The relay will not auto-restart; re-enable it from the Desktop tab.",
+        )
+        // Mark the claim BEFORE tearing down, so paths that defer to the relay stop
+        // deferring immediately rather than waiting out the asynchronous teardown --
+        // that window is exactly when the user is turning the bezel.
+        audioRelayYieldedToInput = true
+        // Clear the standing intent FIRST. stopAudioRelay() schedules nothing itself,
+        // but the disconnect it drives reaches scheduleAudioRelayRetry, which consults
+        // this flag -- clearing it afterwards would lose that race.
+        AppConfig.setAudioRelayDesired(this, false)
+        stopAudioRelay()
+        return true
     }
 
     /** A transport is available if the cloud is connected OR a LAN PC is discovered. */

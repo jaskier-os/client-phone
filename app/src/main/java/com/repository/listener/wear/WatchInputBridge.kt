@@ -30,6 +30,12 @@ import com.repository.listener.protocol.RemoteInputProtocol.StatusFlags
 class WatchInputBridge(
     private val inputClient: InputTransport,
     private val statusSender: (ByteArray) -> Unit,
+    /**
+     * Tears down the desktop audio relay so remote input can take the radio, returning
+     * true if one was actually stopped. Injected rather than reached through a service
+     * singleton so the behaviour is testable without an Android service.
+     */
+    private val stopAudioRelay: ((reason: String) -> Boolean)? = null,
 ) {
 
     /**
@@ -101,8 +107,23 @@ class WatchInputBridge(
     @Volatile private var lastSendDropped = false
     @Volatile private var wakingGlasses = false
 
+    /** The glasses' refusal counter high-water mark, and the most recent reason. */
+    @Volatile private var lastRefusedTotal = 0L
+    @Volatile private var refusalReason: RemoteInputProtocol.RefusalReason? = null
+    @Volatile private var lastRefusalMs = 0L
+
     /** elapsedRealtime when the current wake claim started; 0 when not waking. */
     @Volatile private var wakeStartedMs = 0L
+
+    /**
+     * True once a relay teardown has been requested for the current burst.
+     *
+     * Latched rather than derived from the relay's own flag: teardown is asynchronous,
+     * so that flag stays true well after the request and would let a burst issue one
+     * request per frame. Cleared when the input link comes up, which is the point at
+     * which a future relay could legitimately be torn down again.
+     */
+    private val audioRelayStopRequested = java.util.concurrent.atomic.AtomicBoolean(false)
     @Volatile private var lastStatusPushMs = 0L
 
     init {
@@ -111,6 +132,9 @@ class WatchInputBridge(
                 wakingGlasses = false
                 wakeStartedMs = 0L
                 lastSendDropped = false
+                // The link is up, so this burst's teardown has served its purpose. Arm
+                // again for a future relay rather than latching for the process life.
+                audioRelayStopRequested.set(false)
             }
             pushStatus(force = true)
         }
@@ -142,7 +166,50 @@ class WatchInputBridge(
         if (!posted) pending.decrementAndGet()
     }
 
+    /**
+     * Drops the desktop audio relay so this event can actually be paged to the glasses.
+     *
+     * The priority is INVERTED here relative to every other feature: `PhoneBtHost` and
+     * `InputRfcommClient.maybeSelfHeal` deliberately skip RFCOMM paging while a relay
+     * streams, because each page to absent glasses steals 2.4 GHz airtime and stutters
+     * the audio. That protection stays for everything else; remote input wins, because
+     * a bezel the user is actively turning doing nothing is worse than audio stopping.
+     *
+     * Triggered ONLY by a real user action. A PING is the 10 s keepalive and arrives
+     * whether or not anyone has touched the watch, so triggering on it would tear the
+     * relay down every 10 s forever and make desktop audio permanently unusable. OPEN
+     * and CLOSE are excluded for the same reason: a session opens by itself whenever
+     * the watch app comes to the foreground.
+     */
+    private fun maybeStopAudioRelayFor(event: RemoteInputEvent) {
+        when (event.type) {
+            RemoteInputProtocol.EventType.SCROLL,
+            RemoteInputProtocol.EventType.SELECT,
+            RemoteInputProtocol.EventType.BACK -> Unit
+            else -> return
+        }
+        if (!com.repository.listener.service.ListenerService.audioRelayActive) return
+        // Own the idempotence HERE rather than leaning on the relay flag clearing in
+        // time. Teardown is asynchronous -- it closes a peer connection and unwinds ICE
+        // -- so the flag stays true for many milliseconds afterwards, during which a
+        // 30 detent/s burst delivers a dozen more frames and each would re-request a
+        // teardown already in progress. One request per burst, released when the link
+        // is back or the relay is genuinely gone.
+        if (!audioRelayStopRequested.compareAndSet(false, true)) return
+        val stopped = stopAudioRelay?.invoke("watch ${event.type}") ?: false
+        if (stopped) {
+            // Say it on the watch too. The user must be able to see that their audio
+            // was stopped for their own input, rather than discovering silence with no
+            // explanation. The link is genuinely in flux at this instant, so this rides
+            // the existing status push rather than inventing a channel for it.
+            lastSendDropped = false
+            pushStatus(force = true)
+        }
+    }
+
     private fun forward(event: RemoteInputEvent, tagHex: String) {
+        maybeStopAudioRelayFor(event)
+
         // Reorder guard, keyed on (sid, seq). MessageClient is reliable but NOT
         // order-guaranteed, so a SELECT can overtake the SCROLL that preceded it.
         // Forwarding the newer one first would make the glasses drop the older as a
@@ -237,6 +304,38 @@ class WatchInputBridge(
     }
 
     /**
+     * Called when the glasses report that their UI refused input.
+     *
+     * Keyed on the COUNT advancing rather than on the reason being present: the glasses
+     * keep reporting the last reason indefinitely, so "reason is non-null" would latch
+     * the bit on forever -- the exact failure mode this signal exists to fix. A count
+     * that has not moved means the refusal is old news and the bit ages out.
+     */
+    fun setGlassesRefusal(reasonName: String?, refusedTotal: Long) {
+        val reason = RemoteInputProtocol.RefusalReason.fromName(reasonName)
+        if (reason == null || refusedTotal <= lastRefusedTotal) {
+            // Still record the high-water mark, so a glasses restart (counter back to 0)
+            // cannot leave us ignoring every future refusal.
+            if (refusedTotal < lastRefusedTotal) lastRefusedTotal = refusedTotal
+            return
+        }
+        lastRefusedTotal = refusedTotal
+        refusalReason = reason
+        lastRefusalMs = SystemClock.elapsedRealtime()
+        Log.i(TAG, "glasses refused input: reason=$reason total=$refusedTotal")
+        pushStatus(force = true)
+    }
+
+    /**
+     * A refusal counts as current only briefly. The signal must never outlive the
+     * condition, or it becomes the next thing on this feature that lies to the user.
+     */
+    private fun isRefusalFresh(now: Long): Boolean =
+        refusalReason != null &&
+            lastRefusalMs != 0L &&
+            now - lastRefusalMs < StatusFlags.REFUSAL_FRESH_MS
+
+    /**
      * Replies to a watch PING, echoing its seq so the watch can distinguish a
      * genuine reply from an unsolicited push and time only the former.
      *
@@ -279,6 +378,7 @@ class WatchInputBridge(
         val now = SystemClock.elapsedRealtime()
         if (!force && now - lastStatusPushMs < STATUS_MIN_INTERVAL_MS) return
         lastStatusPushMs = now
+        val refusing = isRefusalFresh(now)
         val bits = StatusFlags.encode(
             glassesLinkUp = inputClient.isConnected,
             // Always true here by construction: this bridge only exists while
@@ -288,6 +388,8 @@ class WatchInputBridge(
             lastSendDropped = lastSendDropped,
             glassesSinkAttached = glassesSinkAttached,
             wakingGlasses = wakingGlasses,
+            glassesRefusingInput = refusing,
+            refusalReason = if (refusing) refusalReason else null,
         )
         val frame = if (replyToSeq != null) {
             StatusFlags.encodeWithReplyTo(bits, replyToSeq)

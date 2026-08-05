@@ -142,23 +142,16 @@ object RemoteInputProtocol {
     }
 
     /**
-     * Staleness cutoff, derived from the real measured Data Layer round trip
-     * (TTL = ceil(p95_oneway * 2.5) rounded up to 100 ms, floor 400 ms).
-     * OPEN/CLOSE/PING are TTL-exempt. Set by [TtlCalibration]; see the measurement
-     * recorded in the plan.
+     * TTL calibration arithmetic.
+     *
+     * There is deliberately no mutable `ttlMs` here and no `applyMeasuredTtl`. Both
+     * existed, and neither had a production call site: the sender never consulted the
+     * value and the glasses enforce staleness with their own constant, so the "calibration
+     * mechanism" was two independent hardcoded numbers that could silently drift apart.
+     * An inert knob is worse than none, because it invites someone to "fix" the feature by
+     * tuning a number that is not read. The enforcement point owns its own cutoff; this
+     * object is kept only for the arithmetic, which is exercised by tests.
      */
-    @Volatile
-    var ttlMs: Long = TtlCalibration.DEFAULT_TTL_MS
-        private set
-
-    /** Applies a measured TTL. Only the calibration path should call this. */
-    fun applyMeasuredTtl(value: Long) {
-        require(value >= TtlCalibration.FLOOR_MS) {
-            "TTL must be >= ${TtlCalibration.FLOOR_MS} ms, got $value"
-        }
-        ttlMs = value
-    }
-
     object TtlCalibration {
         const val FLOOR_MS = 400L
         const val MULTIPLIER = 2.5
@@ -487,6 +480,30 @@ object RemoteInputProtocol {
      * nor to clear a failure the watch observed locally -- see
      * [applyAdvisory], which is where that rule is enforced.
      */
+    /**
+     * Why the glasses are declining input, as carried to the watch.
+     *
+     * Ordinals are wire values: append only, never reorder.
+     */
+    enum class RefusalReason(val code: Int) {
+        /** Not permitted in the current UI state. The user must go back, or act on the glasses. */
+        NOT_ALLOWED(1),
+
+        /** The glasses are folded. */
+        FOLDED(2),
+
+        /** A call, recording or reply owns the glasses UI. */
+        LOCKED(3);
+
+        companion object {
+            fun fromCode(code: Int): RefusalReason? = values().firstOrNull { it.code == code }
+
+            /** Parse the name the glasses put on the wire. Null for absent/unknown. */
+            fun fromName(name: String?): RefusalReason? =
+                name?.let { n -> values().firstOrNull { it.name == n } }
+        }
+    }
+
     object StatusFlags {
         const val GLASSES_LINK_UP = 1 shl 0
         const val PHONE_SERVICE_ALIVE = 1 shl 1
@@ -494,12 +511,50 @@ object RemoteInputProtocol {
         const val GLASSES_SINK_ATTACHED = 1 shl 3
         const val WAKING_GLASSES = 1 shl 4
 
+        /**
+         * The glasses received input and REFUSED it, recently.
+         *
+         * Distinct from every other bit here, which describe the LINK. This one says the
+         * link is fine and the UI declined anyway -- the case that previously rendered as
+         * "Connected" while nothing the user did had any effect. Set while the glasses'
+         * refusal counter has advanced within [REFUSAL_FRESH_MS].
+         */
+        const val GLASSES_REFUSING_INPUT = 1 shl 5
+
+        /**
+         * How long a refusal stays "current".
+         *
+         * Long enough to survive the gap between status pushes so the bit does not
+         * flicker, short enough that it clears on its own once the user moves somewhere
+         * input is accepted -- the signal must never outlive the condition, or it becomes
+         * the next thing that lies to the user.
+         */
+        const val REFUSAL_FRESH_MS = 3_000L
+
+        /**
+         * The refusal reason, packed into the two bits above the flags.
+         *
+         * Carried in the same byte rather than a new field so an older reader, which masks
+         * only the low five bits, is unaffected.
+         */
+        const val REASON_SHIFT = 6
+        const val REASON_MASK = 0x3 shl REASON_SHIFT
+
+        fun encodeReason(bits: Int, reason: RefusalReason?): Int =
+            (bits and REASON_MASK.inv()) or
+                ((reason?.code ?: 0) shl REASON_SHIFT and REASON_MASK)
+
+        fun decodeReason(bits: Int): RefusalReason? =
+            RefusalReason.fromCode((bits and REASON_MASK) ushr REASON_SHIFT)
+
         fun encode(
             glassesLinkUp: Boolean,
             phoneServiceAlive: Boolean,
             lastSendDropped: Boolean,
             glassesSinkAttached: Boolean,
             wakingGlasses: Boolean,
+            glassesRefusingInput: Boolean = false,
+            refusalReason: RefusalReason? = null,
         ): ByteArray {
             var b = 0
             if (glassesLinkUp) b = b or GLASSES_LINK_UP
@@ -507,6 +562,8 @@ object RemoteInputProtocol {
             if (lastSendDropped) b = b or LAST_SEND_DROPPED
             if (glassesSinkAttached) b = b or GLASSES_SINK_ATTACHED
             if (wakingGlasses) b = b or WAKING_GLASSES
+            if (glassesRefusingInput) b = b or GLASSES_REFUSING_INPUT
+            if (glassesRefusingInput) b = encodeReason(b, refusalReason)
             return byteArrayOf(b.toByte())
         }
 
@@ -564,10 +621,74 @@ object RemoteInputProtocol {
         fun applyAdvisory(current: Int, received: Int, trusted: Boolean): Int {
             if (trusted) return received
             val healthMask = GLASSES_LINK_UP or PHONE_SERVICE_ALIVE or GLASSES_SINK_ATTACHED
-            val problemMask = LAST_SEND_DROPPED or WAKING_GLASSES
+            val problemMask = LAST_SEND_DROPPED or WAKING_GLASSES or GLASSES_REFUSING_INPUT
             val health = current and received and healthMask
             val problems = (current or received) and problemMask
-            return health or problems
+            // The reason belongs to whichever frame is currently asserting a refusal, so it
+            // is taken from the received frame rather than AND/OR-folded -- folding two
+            // enums bitwise would synthesize a third, wrong reason.
+            val reason = received and REASON_MASK
+            return health or problems or reason
+        }
+
+        /**
+         * Fold a status frame while GUARANTEEING every health bit stays clearable.
+         *
+         * [applyAdvisory] AND-folds the health bits so a forged frame can never assert
+         * health over a locally observed failure. The cost is that once a health bit goes
+         * to zero, no untrusted frame can ever raise it again -- and for the whole life of
+         * the watch process the ONLY caller passed `trusted = false`. A single
+         * `replyPhoneStopped` during the ordinary cold-start race therefore pinned the
+         * watch at "Phone service down" permanently, and reopening the phone app could not
+         * clear it.
+         *
+         * This is the third bug of that exact shape on this feature (the AND-fold seed and
+         * the `wakingGlasses` latch were the first two), so the fix is structural rather
+         * than another careful caller: a health bit that has been observed healthy again,
+         * on a frame we CORRELATED to our own outstanding request, is restored. A
+         * correlated reply is as trusted as this unauthenticated channel gets, and it is
+         * evidence the watch generated the demand for -- a forger cannot produce one
+         * without already being able to answer our pings.
+         *
+         * Every path that clears a health bit must therefore have a matching path that can
+         * set it, which is the invariant [assertNoAbsorbingHealthBit] pins down.
+         *
+         * @param correlated true when this frame answers the watch's own outstanding PING.
+         */
+        fun foldStatus(current: Int, received: Int, correlated: Boolean): Int =
+            applyAdvisory(
+                current = if (correlated) current or healthBitsIn(received) else current,
+                received = received,
+                trusted = false,
+            )
+
+        private fun healthBitsIn(bits: Int): Int =
+            bits and (GLASSES_LINK_UP or PHONE_SERVICE_ALIVE or GLASSES_SINK_ATTACHED)
+
+        /**
+         * Executable statement of the invariant: no health bit is absorbing.
+         *
+         * For each health bit, having lost it must not prevent regaining it once a
+         * correlated frame reports it healthy. Called from tests and from the watch's own
+         * startup, so the property is checked rather than merely documented -- a comment
+         * saying "do not latch this" is what failed the previous two times.
+         */
+        fun assertNoAbsorbingHealthBit() {
+            val healthBits = listOf(GLASSES_LINK_UP, PHONE_SERVICE_ALIVE, GLASSES_SINK_ATTACHED)
+            val allHealthy = healthBits.fold(0) { acc, b -> acc or b }
+            for (bit in healthBits) {
+                val latchedOff = allHealthy and bit.inv()
+                val recovered = foldStatus(
+                    current = latchedOff,
+                    received = allHealthy,
+                    correlated = true,
+                )
+                check(recovered and bit != 0) {
+                    "status bit $bit is absorbing: once cleared it can never be set again, " +
+                        "so the watch would be pinned in a failure state for the life of " +
+                        "the process"
+                }
+            }
         }
     }
 

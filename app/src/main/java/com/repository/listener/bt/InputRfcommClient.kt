@@ -93,6 +93,17 @@ class InputRfcommClient(private val context: Context) :
      */
     var onRouterStatus: ((Boolean, Boolean, Long) -> Unit)? = null
 
+    /**
+     * Glasses -> phone refusal report: (reasonName, refusedTotal).
+     *
+     * `reasonName` is null when the glasses report no recent refusal, or when they are
+     * an older build that does not send these fields at all. Separate from
+     * [onRouterStatus] because a refusal is a UI verdict, not a transport statistic:
+     * the glasses received the event intact and then declined it, which is the case the
+     * watch previously rendered as "Connected" while nothing happened.
+     */
+    var onRefusal: ((String?, Long) -> Unit)? = null
+
     fun requestImmediateReconnect(reason: String) {
         log("input requestImmediateReconnect: $reason")
         reconnectSignal.release()
@@ -268,8 +279,17 @@ class InputRfcommClient(private val context: Context) :
                     val sessionOpen = args.getOrNull(0) == "1"
                     val sinkAttached = args.getOrNull(1) == "1"
                     val dropped = args.getOrNull(2)?.toLongOrNull() ?: 0L
-                    log("input rx status sessionOpen=$sessionOpen sink=$sinkAttached dropped=$dropped")
+                    // Appended by newer glasses builds. Absent (or empty) means the glasses
+                    // are not reporting refusals, which must read as "no refusal" rather
+                    // than as an error -- an older glasses build has to stay usable.
+                    val reason = args.getOrNull(3)?.takeIf { it.isNotEmpty() }
+                    val refusedTotal = args.getOrNull(4)?.toLongOrNull() ?: 0L
+                    log(
+                        "input rx status sessionOpen=$sessionOpen sink=$sinkAttached " +
+                            "dropped=$dropped refused=$refusedTotal reason=${reason ?: "-"}"
+                    )
                     onRouterStatus?.invoke(sessionOpen, sinkAttached, dropped)
+                    onRefusal?.invoke(reason, refusedTotal)
                 }
                 // Anything else on this socket is not ours. Ignored rather than
                 // logged per frame: a peer controls the rate and the log is on flash.
@@ -298,9 +318,17 @@ class InputRfcommClient(private val context: Context) :
         // Skip RFCOMM pages while the desktop audio relay streams. Each page to
         // absent glasses blocks the shared BT/2.4GHz radio and stutters the
         // WebRTC audio; BLE wake reconnects the link when the glasses appear.
-        // Omitting this would re-introduce that regression whenever the user
-        // scrolls the watch during a relay session.
-        if (com.repository.listener.service.ListenerService.audioRelayActive) return
+        //
+        // This runs on the INPUT path, so reaching it means the user is actively
+        // driving the watch -- and remote input is required to win over the relay,
+        // which the bridge has already asked to be torn down. Waiting for
+        // audioRelayActive to clear would stall the reconnect for the whole
+        // asynchronous teardown (peer connection close plus ICE unwind), which is
+        // exactly the window the user is turning the bezel in. So this only defers
+        // while a teardown has NOT been requested; once input has claimed the radio,
+        // the page proceeds.
+        val svc = com.repository.listener.service.ListenerService
+        if (svc.audioRelayActive && !svc.audioRelayYieldedToInput) return
         val now = android.os.SystemClock.uptimeMillis()
         val last = lastSelfHealMs.get()
         if (now - last < SELF_HEAL_THROTTLE_MS) return

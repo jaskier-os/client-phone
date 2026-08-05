@@ -688,19 +688,25 @@ class WatchLinkService : Service() {
         // to a whole ping interval -- which would land in exactly the upper tail
         // that sets the staleness cutoff.
         val pingAt = lastPingSentMs
-        if (pingAt != 0L && replyToSeq != null && replyToSeq == lastPingSeq) {
+        // Correlation is what lets a health bit RECOVER. A frame answering our own
+        // outstanding PING is evidence we asked for, so it can restore health the watch
+        // had latched off; an unsolicited frame still cannot.
+        val correlated = replyToSeq != null && replyToSeq == lastPingSeq
+        if (pingAt != 0L && correlated) {
             val rtt = SystemClock.elapsedRealtime() - pingAt
             lastPingSentMs = 0L
-            Log.i(TAG, "RTT ms=$rtt seq=${replyToSeq.toUInt()}")
+            Log.i(TAG, "RTT ms=$rtt seq=${replyToSeq!!.toUInt()}")
         } else if (replyToSeq == null) {
             Log.i(TAG, "status push (unsolicited, not timed)")
         }
         handler.post {
-            // The status path is unauthenticated, so a frame may only ever make
-            // the watch more pessimistic. It can never assert health over a
-            // failure the watch observed for itself.
-            statusBits = RemoteInputProtocol.StatusFlags.applyAdvisory(
-                current = statusBits, received = bits, trusted = false,
+            // The status path is unauthenticated, so an UNSOLICITED frame may only ever
+            // make the watch more pessimistic. A CORRELATED one may also clear a health
+            // bit the watch latched off -- without that, one cold-start
+            // `replyPhoneStopped` pinned the watch at "Phone service down" for the life
+            // of the process and reopening the phone app could not fix it.
+            statusBits = RemoteInputProtocol.StatusFlags.foldStatus(
+                current = statusBits, received = bits, correlated = correlated,
             )
             lastStatusMs = SystemClock.elapsedRealtime()
             recomputeState()

@@ -146,4 +146,122 @@ class LinkTimingCoherenceTest {
             StatusFlags.isSet(bits, StatusFlags.LAST_SEND_DROPPED),
         )
     }
+
+    /**
+     * The third instance of the absorbing-bit class, stated as an invariant over EVERY
+     * health bit rather than as a case for the one that was reported.
+     *
+     * `applyAdvisory` is only ever called with `trusted = false`, and health was re-seeded
+     * only in `openSession()`, which runs once per process. So one `replyPhoneStopped`
+     * during the ordinary cold-start race pinned the watch at "Phone service down" for
+     * the life of the process, and reopening the phone app could not clear it.
+     */
+    @Test
+    fun noHealthBitIsAbsorbing() {
+        StatusFlags.assertNoAbsorbingHealthBit()
+    }
+
+    /**
+     * The recovery must be earned by CORRELATION, not granted to anyone who can write to
+     * the channel -- otherwise the fix for the latch would undo the containment that the
+     * AND-fold exists to provide.
+     */
+    @Test
+    fun onlyACorrelatedFrameCanClearALatchedHealthBit() {
+        val healthy = StatusFlags.decode(
+            StatusFlags.encode(
+                glassesLinkUp = true, phoneServiceAlive = true, lastSendDropped = false,
+                glassesSinkAttached = true, wakingGlasses = false,
+            )
+        )
+        val latchedOff = StatusFlags.GLASSES_LINK_UP or StatusFlags.GLASSES_SINK_ATTACHED
+
+        var uncorrelated = latchedOff
+        repeat(5) {
+            uncorrelated = StatusFlags.foldStatus(uncorrelated, healthy, correlated = false)
+        }
+        assertTrue(
+            "an unsolicited frame must not be able to assert health the watch latched off",
+            !StatusFlags.isSet(uncorrelated, StatusFlags.PHONE_SERVICE_ALIVE),
+        )
+
+        val recovered = StatusFlags.foldStatus(latchedOff, healthy, correlated = true)
+        assertTrue(
+            "a frame answering our own PING must be able to restore health, or the watch " +
+                "is stuck at 'Phone service down' until the app is killed",
+            StatusFlags.isSet(recovered, StatusFlags.PHONE_SERVICE_ALIVE),
+        )
+    }
+
+    /**
+     * The refusal signal is a PROBLEM bit, so it must OR in like the other problem bits
+     * and must survive alongside a healthy link -- the whole point is that it reports the
+     * case where the link is fine and the glasses declined anyway.
+     */
+    @Test
+    fun theRefusalSignalRidesAlongsideAHealthyLink() {
+        val refusing = StatusFlags.decode(
+            StatusFlags.encode(
+                glassesLinkUp = true, phoneServiceAlive = true, lastSendDropped = false,
+                glassesSinkAttached = true, wakingGlasses = false,
+                glassesRefusingInput = true,
+                refusalReason = RemoteInputProtocol.RefusalReason.FOLDED,
+            )
+        )
+        assertTrue(StatusFlags.isSet(refusing, StatusFlags.GLASSES_REFUSING_INPUT))
+        assertTrue(
+            "the link must still read healthy: 'refusing' is not 'disconnected'",
+            StatusFlags.isSet(refusing, StatusFlags.GLASSES_LINK_UP),
+        )
+        assertEquals(
+            RemoteInputProtocol.RefusalReason.FOLDED,
+            StatusFlags.decodeReason(refusing),
+        )
+
+        // And the reason survives the fold, so the watch can say WHY rather than just that
+        // something is wrong.
+        val folded = StatusFlags.foldStatus(
+            current = StatusFlags.GLASSES_LINK_UP or StatusFlags.PHONE_SERVICE_ALIVE or
+                StatusFlags.GLASSES_SINK_ATTACHED,
+            received = refusing,
+            correlated = true,
+        )
+        assertTrue(StatusFlags.isSet(folded, StatusFlags.GLASSES_REFUSING_INPUT))
+        assertEquals(
+            RemoteInputProtocol.RefusalReason.FOLDED,
+            StatusFlags.decodeReason(folded),
+        )
+    }
+
+    /**
+     * An older reader masks only the low five bits. Packing the reason above them must
+     * therefore leave every pre-existing bit exactly as it was.
+     */
+    @Test
+    fun theReasonBitsDoNotDisturbTheOriginalFlags() {
+        val legacyMask = StatusFlags.GLASSES_LINK_UP or StatusFlags.PHONE_SERVICE_ALIVE or
+            StatusFlags.LAST_SEND_DROPPED or StatusFlags.GLASSES_SINK_ATTACHED or
+            StatusFlags.WAKING_GLASSES
+        val withoutReason = StatusFlags.decode(
+            StatusFlags.encode(
+                glassesLinkUp = true, phoneServiceAlive = true, lastSendDropped = false,
+                glassesSinkAttached = true, wakingGlasses = false,
+            )
+        )
+        for (reason in RemoteInputProtocol.RefusalReason.values()) {
+            val withReason = StatusFlags.decode(
+                StatusFlags.encode(
+                    glassesLinkUp = true, phoneServiceAlive = true, lastSendDropped = false,
+                    glassesSinkAttached = true, wakingGlasses = false,
+                    glassesRefusingInput = true, refusalReason = reason,
+                )
+            )
+            assertEquals(
+                "packing reason $reason must not disturb the flags an older reader sees",
+                withoutReason and legacyMask,
+                withReason and legacyMask,
+            )
+            assertEquals(reason, StatusFlags.decodeReason(withReason))
+        }
+    }
 }
