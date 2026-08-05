@@ -7,7 +7,6 @@ import android.util.Log
 import com.repository.listener.bt.BtProtocol
 import com.repository.listener.bt.InputRfcommClient
 import com.repository.listener.protocol.RemoteInputProtocol
-import com.repository.listener.protocol.RemoteInputProtocol.EventType
 import com.repository.listener.protocol.RemoteInputProtocol.RemoteInputEvent
 import com.repository.listener.protocol.RemoteInputProtocol.StatusFlags
 
@@ -38,6 +37,15 @@ class WatchInputBridge(
 
         /** Minimum spacing between status pushes, so a dead link cannot flood. */
         private const val STATUS_MIN_INTERVAL_MS = 1000L
+
+        /**
+         * Max events queued toward the socket. A peer that stops reading leaves
+         * the socket CONNECTED while the write blocks on RFCOMM flow control, so
+         * an isConnected check alone does not bound anything. Beyond this depth
+         * the newest events are dropped: delivering a stale burst later is worse
+         * than dropping now, which is the same reason input is never queued.
+         */
+        private const val MAX_PENDING_EVENTS = 8
     }
 
     private val worker = HandlerThread("watch-input-bridge").apply { start() }
@@ -47,8 +55,10 @@ class WatchInputBridge(
     private var lastForwarded = 0
     private var haveForwarded = false
 
+    /** Depth of the worker queue, so a blocked write cannot grow it unboundedly. */
+    private val pending = java.util.concurrent.atomic.AtomicInteger(0)
+
     @Volatile private var glassesSinkAttached = false
-    @Volatile private var phoneServiceAlive = true
     @Volatile private var lastSendDropped = false
     @Volatile private var wakingGlasses = false
     @Volatile private var lastStatusPushMs = 0L
@@ -71,7 +81,22 @@ class WatchInputBridge(
      * authoritative authentication.
      */
     fun onEvent(event: RemoteInputEvent, tagHex: String) {
-        handler.post { forward(event, tagHex) }
+        if (pending.get() >= MAX_PENDING_EVENTS) {
+            lastSendDropped = true
+            Log.w(TAG, "queue full (${pending.get()}); dropping ${event.type}")
+            return
+        }
+        pending.incrementAndGet()
+        val posted = handler.post {
+            try {
+                forward(event, tagHex)
+            } finally {
+                pending.decrementAndGet()
+            }
+        }
+        // post() returns false once the looper has quit; without this the counter
+        // would leak upward and permanently wedge the queue at "full".
+        if (!posted) pending.decrementAndGet()
     }
 
     private fun forward(event: RemoteInputEvent, tagHex: String) {
@@ -118,22 +143,28 @@ class WatchInputBridge(
         pushStatus(force = true)
     }
 
-    fun setPhoneServiceAlive(alive: Boolean) {
-        phoneServiceAlive = alive
-    }
-
     /** Replies to a watch PING with the current status. */
     fun onPing() {
         pushStatus(force = true)
     }
 
     private fun pushStatus(force: Boolean) {
+        // Always evaluate on the worker: pushStatus is also called from the RFCOMM
+        // connect thread via the link-state callback, which would otherwise race
+        // lastStatusPushMs and the flag reads.
+        if (Thread.currentThread() != worker) {
+            handler.post { pushStatus(force) }
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         if (!force && now - lastStatusPushMs < STATUS_MIN_INTERVAL_MS) return
         lastStatusPushMs = now
         val bits = StatusFlags.encode(
             glassesLinkUp = inputClient.isConnected,
-            phoneServiceAlive = phoneServiceAlive,
+            // Always true here by construction: this bridge only exists while
+            // ListenerService is alive. The false case is reported directly by
+            // WatchMessageListenerService when it finds no bridge at all.
+            phoneServiceAlive = true,
             lastSendDropped = lastSendDropped,
             glassesSinkAttached = glassesSinkAttached,
             wakingGlasses = wakingGlasses,
@@ -146,6 +177,9 @@ class WatchInputBridge(
     }
 
     fun shutdown() {
+        // Clear first: the client outlives the bridge, and the lambda captures
+        // this bridge (and through it the destroyed service).
+        inputClient.onLinkStateChanged = null
         handler.removeCallbacksAndMessages(null)
         worker.quitSafely()
     }

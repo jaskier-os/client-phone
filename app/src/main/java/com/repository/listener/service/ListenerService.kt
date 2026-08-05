@@ -3033,6 +3033,9 @@ class ListenerService : LifecycleService(),
             statusSender = { bits -> sendWatchStatus(bits) },
         )
         com.repository.listener.wear.WatchMessageListenerService.bridge = watchInputBridge
+        phoneBtHost.onRemoteInputSinkState = { attached ->
+            watchInputBridge?.setGlassesSinkAttached(attached)
+        }
         phoneBtHost.onGlassesCommandResult = { requestId, result ->
             onGlassesCommandResult(requestId, result)
         }
@@ -11241,7 +11244,12 @@ class ListenerService : LifecycleService(),
         LogCollector.i(TAG, "Service destroying")
         // Clear the static bridge reference first: GMS can bind the listener
         // service at any moment and must not hand frames to a dead bridge.
-        com.repository.listener.wear.WatchMessageListenerService.bridge = null
+        // Identity-checked: a restart can interleave the OLD instance's onDestroy
+        // after the NEW instance's onCreate, and an unconditional null would wipe
+        // the live bridge and leave watch input permanently dead.
+        if (com.repository.listener.wear.WatchMessageListenerService.bridge === watchInputBridge) {
+            com.repository.listener.wear.WatchMessageListenerService.bridge = null
+        }
         watchInputBridge?.shutdown()
         watchInputBridge = null
         // Set FIRST: callbacks posted from the OkHttp/WebRTC threads may already be

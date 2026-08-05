@@ -245,4 +245,11 @@ object BtProtocol {
     // and wrap the whole parse in try/catch: onMessage runs on a Binder thread and
     // an uncaught throw kills the service.
     const val CH_REMOTE_INPUT = "listener_remote_input"
+
+    // Glasses -> phone: whether the glasses input sink is currently attached
+    // (their UI is foreground and able to accept injected input). Drives the
+    // watch's GLASSES_BUSY state, so the user is told "glasses screen not
+    // active" instead of seeing a connected status while events are discarded.
+    // Args: ["1" attached, "0" detached].
+    const val CH_REMOTE_INPUT_SINK = "listener_remote_input_sink"
 }

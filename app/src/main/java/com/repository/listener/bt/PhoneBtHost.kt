@@ -66,6 +66,9 @@ class PhoneBtHost(private val context: Context) {
      *  control socket so bulk frames cannot head-of-line-block input. */
     val inputRfcommClient = InputRfcommClient(context)
 
+    /** Glasses reported whether their remote-input sink is attached. */
+    var onRemoteInputSinkState: ((Boolean) -> Unit)? = null
+
     /**
      * G3: persistent BLE wake link to glasses BleWakeService. Used to wake the
      * other side when we have outbound data and RFCOMM is torn down, and to
@@ -715,6 +718,7 @@ class PhoneBtHost(private val context: Context) {
             // the old glasses and the relay reattaches to it even after a fresh pairing.
             rfcommClient.resetTarget()
             mapRfcommClient.resetTarget()
+            inputRfcommClient.resetTarget()
             log("Cleared cached MAC + reset relay target (kept old bond), starting flag-gated BLE discovery...")
         } else {
             log("Keeping cached credentials, starting BLE discovery...")
@@ -1030,6 +1034,8 @@ class PhoneBtHost(private val context: Context) {
                     when (cmd) {
                         BtProtocol.CH_STATUS -> handleStatusFromGlasses(args)
                         BtProtocol.CH_STATE_SNAPSHOT -> handleStateSnapshotFromGlasses(args)
+                        BtProtocol.CH_REMOTE_INPUT_SINK ->
+                            onRemoteInputSinkState?.invoke(args.at(0).getString() == "1")
                         BtProtocol.CH_COMMAND -> handleCommandFromGlasses(args)
                         BtProtocol.CH_HEALTH_PONG -> {
                             log("Health pong received")

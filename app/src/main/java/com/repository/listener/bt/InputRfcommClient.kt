@@ -5,7 +5,6 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import android.content.Context
-import java.io.ByteArrayOutputStream
 import java.io.OutputStream
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -34,8 +33,6 @@ import java.util.concurrent.atomic.AtomicLong
 class InputRfcommClient(private val context: Context) {
 
     companion object {
-        private const val TAG = "InputRfcomm"
-
         const val INPUT_UUID = "d4e5f6a7-b8c9-0123-def0-345678901234"
 
         /**
@@ -160,7 +157,15 @@ class InputRfcommClient(private val context: Context) {
 
     private fun connectLoop() {
         while (shouldRun) {
-            reconnectSignal.acquire()
+            try {
+                reconnectSignal.acquire()
+            } catch (e: InterruptedException) {
+                // Do not let an interrupt kill the loop permanently: shouldRun
+                // would still be true and start() would refuse to respawn it.
+                Thread.currentThread().interrupt()
+                if (!shouldRun) return
+                continue
+            }
             reconnectSignal.drainPermits()
             if (!shouldRun) return
             if (connected.get()) continue
@@ -202,7 +207,7 @@ class InputRfcommClient(private val context: Context) {
                 if (input.read(scratch) < 0) break
             }
         } catch (e: Exception) {
-            // Expected on teardown.
+            log("input socket closed: ${e.message}")
         }
     }
 
@@ -221,6 +226,12 @@ class InputRfcommClient(private val context: Context) {
     }
 
     private fun maybeSelfHeal() {
+        // Skip RFCOMM pages while the desktop audio relay streams. Each page to
+        // absent glasses blocks the shared BT/2.4GHz radio and stutters the
+        // WebRTC audio; BLE wake reconnects the link when the glasses appear.
+        // Omitting this would re-introduce that regression whenever the user
+        // scrolls the watch during a relay session.
+        if (com.repository.listener.service.ListenerService.audioRelayActive) return
         val now = android.os.SystemClock.uptimeMillis()
         val last = lastSelfHealMs.get()
         if (now - last < SELF_HEAL_THROTTLE_MS) return
@@ -232,13 +243,34 @@ class InputRfcommClient(private val context: Context) {
         return try {
             val adapter = BluetoothAdapter.getDefaultAdapter() ?: return null
             val bonded = adapter.bondedDevices ?: return null
+            // Prefer the exact paired unit (cached MAC) so a second bonded pair
+            // cannot hijack the input socket. Case-insensitive: a lowercase-stored
+            // MAC would otherwise silently fall through to the name fallback.
             val cachedMac = com.repository.listener.config.AppConfig.getGlassesMac(context)
             if (!cachedMac.isNullOrEmpty()) {
-                bonded.firstOrNull { it.address == cachedMac }?.let { return it }
+                bonded.firstOrNull { it.address.equals(cachedMac, ignoreCase = true) }?.let { return it }
             }
-            bonded.firstOrNull { (it.name ?: "").contains("glasses", ignoreCase = true) }
+            // Name fallback ONLY when exactly ONE bonded unit matches, mirroring
+            // the other relays: two bonded units must never silently pick wrong.
+            val glasses = bonded.filter {
+                val name = it.name ?: ""
+                name.contains("glasses", ignoreCase = true) ||
+                    name.startsWith("Glasses_") ||
+                    name.startsWith("RG_") ||
+                    name.contains("Rokid", ignoreCase = true)
+            }
+            glasses.singleOrNull()
         } catch (e: Exception) {
             null
         }
+    }
+
+    /** Forget the targeted device so the next reconnect re-resolves via the
+     *  cached MAC. Used on user re-pair; mirrors the other relays. */
+    fun resetTarget() {
+        currentDevice = null
+        handleDisconnect()
+        closeSocket()
+        if (shouldRun) reconnectSignal.release()
     }
 }
