@@ -10,37 +10,65 @@ import java.io.File
 /**
  * Cross-repo drift guard.
  *
- * The glasses live in a SEPARATE Gradle project written against the same written
- * spec, so no shared symbol can protect the two implementations from drifting.
- * A test where each side asserts its own literals proves nothing -- editing the
- * glasses constant and its own test leaves this side green.
+ * The glasses live in a SEPARATE Gradle project written against the same spec, so
+ * no shared symbol can stop the two implementations from drifting. A test where
+ * each side asserts its own literals proves nothing: editing the glasses constant
+ * and its own test leaves this side green.
  *
- * This file therefore generates golden vectors from the REAL codec and checks
- * them in. The glasses repo consumes the same file and asserts its parser
- * reproduces these exact bytes, args and tags. That is the only thing that
- * catches a disagreement about sign conventions, field widths, unsigned
- * rendering, or the canonical string used for the MAC.
+ * This file therefore generates vectors from the REAL codec and checks them in,
+ * and BOTH repos assert against the file.
  *
- * The key here is a FIXED TEST VECTOR, deliberately not a secret and never used
- * by a real build.
+ * ACCEPT vectors alone are structurally incapable of catching the failure that
+ * matters most. A receiver still enforcing the superseded cap of 16 reproduces
+ * every valid vector byte for byte and passes. A guard that cannot fail is worse
+ * than no guard, because it manufactures confidence. The file therefore also
+ * carries REJECT vectors, each naming the rule it violates, and the verification
+ * below READS them back from the file rather than reconstructing them in code --
+ * so deleting them from the file fails this test instead of silently weakening
+ * the guard.
+ *
+ * The fixed key below is a published test vector. It is NOT a secret and is not
+ * used by any real build.
  */
 class RemoteInputGoldenVectorsTest {
 
     private companion object {
-        /** Fixed, published test key. NOT a secret and NOT used by any real build. */
         const val GOLDEN_KEY_HEX = "000102030405060708090a0b0c0d0e0f"
-
         val GOLDEN_FILE = File("src/test/resources/golden-vectors-v1.ndjson")
+
+        /** Every reject rule the file must exercise. Deleting one fails the test. */
+        val REQUIRED_REJECT_RULES = setOf(
+            "steps_out_of_range",
+            "scroll_zero_steps",
+            "non_scroll_carries_steps",
+            "unknown_type_code",
+            "reserved_not_zero",
+            "frame_too_short",
+            "frame_too_long",
+            "src_not_allowed",
+            "bad_version",
+            "too_few_args",
+        )
     }
 
     private val key = RemoteInputProtocol.parseHexOrNull(GOLDEN_KEY_HEX, 16)!!
 
     /**
-     * The vector set. Deliberately covers the cases most likely to diverge between
-     * two implementations: both scroll directions, the cap magnitudes, every event
-     * type, and uint32 values above 2^31 where a signed rendering would differ.
+     * Ensures the file exists before a read-back test uses it. JUnit gives no
+     * ordering guarantee, so a read-back test must not depend on the generator
+     * test having run first -- otherwise the suite passes or fails by luck.
      */
-    private fun vectors(): List<RemoteInputEvent> = listOf(
+    private fun goldenLines(): List<String> {
+        if (!GOLDEN_FILE.exists()) {
+            GOLDEN_FILE.parentFile.mkdirs()
+            GOLDEN_FILE.writeText(generate())
+        }
+        return GOLDEN_FILE.readLines()
+    }
+
+    // ---- Vector definitions ----
+
+    private fun acceptVectors(): List<RemoteInputEvent> = listOf(
         RemoteInputEvent(sid = 1, seq = 0, type = EventType.OPEN, steps = 0, wms = 0),
         RemoteInputEvent(sid = 1, seq = 1, type = EventType.SCROLL, steps = 1, wms = 1000),
         RemoteInputEvent(sid = 1, seq = 2, type = EventType.SCROLL, steps = -1, wms = 1060),
@@ -63,144 +91,248 @@ class RemoteInputGoldenVectorsTest {
         ),
     )
 
-    private fun renderVector(e: RemoteInputEvent): String {
+    /** A frame that MUST be refused, with the rule it violates. */
+    private data class RejectVector(
+        val rule: String,
+        val reason: String,
+        val encoding: String,
+        val payloadHex: String? = null,
+        val rfcommArgs: List<String>? = null,
+    )
+
+    private fun rejectVectors(): List<RejectVector> {
+        val valid = RemoteInputEvent(
+            sid = 1, seq = 1, type = EventType.SCROLL, steps = 1, wms = 1000,
+        )
+        val template = RemoteInputProtocol.encodeEvent(key, valid)
+        fun mutate(block: (ByteArray) -> Unit): String =
+            RemoteInputProtocol.toHex(template.copyOf().also(block))
+
+        val out = mutableListOf<RejectVector>()
+
+        // byte[1] is steps (int8). Anything outside +/-MAX_STEPS_PER_EVENT must be
+        // refused, never accepted-and-wrapped: a wrapped magnitude inverts the
+        // scroll direction. 9 and 16 are the values a stale cap-16 receiver would
+        // wrongly accept -- they are the whole point of this section.
+        for (s in listOf<Byte>(9, 16, 17, 127, -9, -16, -17, -128)) {
+            out += RejectVector(
+                rule = "steps_out_of_range",
+                reason = "abs(steps)=${Math.abs(s.toInt())} exceeds MAX_STEPS_PER_EVENT=" +
+                    "${RemoteInputProtocol.MAX_STEPS_PER_EVENT}",
+                encoding = "A",
+                payloadHex = mutate { it[1] = s },
+            )
+        }
+        out += RejectVector(
+            "scroll_zero_steps", "SCROLL must carry a non-zero magnitude", "A",
+            payloadHex = mutate { it[1] = 0 },
+        )
+        val select = RemoteInputProtocol.encodeEvent(
+            key, valid.copy(type = EventType.SELECT, steps = 0),
+        )
+        out += RejectVector(
+            "non_scroll_carries_steps", "only SCROLL may carry steps", "A",
+            payloadHex = RemoteInputProtocol.toHex(select.copyOf().also { it[1] = 3 }),
+        )
+        for (code in listOf<Byte>(0, 7, 99, -1)) {
+            out += RejectVector(
+                "unknown_type_code",
+                "type code ${code.toInt() and 0xFF} is outside the v1 enum (1..6)",
+                "A",
+                payloadHex = mutate { it[0] = code },
+            )
+        }
+        for (i in 22..25) {
+            out += RejectVector(
+                "reserved_not_zero", "reserved byte $i must be zero", "A",
+                payloadHex = mutate { it[i] = 1 },
+            )
+        }
+        out += RejectVector(
+            "frame_too_short", "Encoding A is exactly 26 bytes, got 25", "A",
+            payloadHex = RemoteInputProtocol.toHex(template.copyOf(25)),
+        )
+        out += RejectVector(
+            "frame_too_long", "Encoding A is exactly 26 bytes, got 27", "A",
+            payloadHex = RemoteInputProtocol.toHex(template.copyOf(27)),
+        )
+
+        // Encoding B rejects.
+        val validArgs = RemoteInputProtocol.toRfcommArgs(key, valid).toList()
+        out += RejectVector(
+            "src_not_allowed", "src must be in the hard-coded allowlist", "B",
+            rfcommArgs = validArgs.toMutableList().also { it[1] = "attacker" },
+        )
+        out += RejectVector(
+            "bad_version", "receivers drop frames with v != 1", "B",
+            rfcommArgs = validArgs.toMutableList().also { it[0] = "2" },
+        )
+        out += RejectVector(
+            "too_few_args", "Encoding B requires at least 8 positional args", "B",
+            rfcommArgs = validArgs.dropLast(1),
+        )
+        return out
+    }
+
+    // ---- Rendering ----
+
+    private fun renderAccept(e: RemoteInputEvent): String {
         val tagHex = RemoteInputProtocol.computeTagHex(key, e)
         val payload = RemoteInputProtocol.toHex(RemoteInputProtocol.encodeEvent(key, e))
         val args = RemoteInputProtocol.toRfcommArgs(e, tagHex).joinToString("\",\"")
-        // Hand-rolled JSON: this module has no serializer dependency, and the
-        // shape is fixed and tiny.
-        return """{"sid":${e.sidUnsigned},"seq":${e.seqUnsigned},"type":"${e.type.name}",""" +
-            """"typeCode":${e.type.code},"steps":${e.steps},"wms":${e.wmsUnsigned},""" +
-            """"canonical":"${RemoteInputProtocol.canonicalString(e)}","tag":"$tagHex",""" +
-            """"payloadHex":"$payload","rfcommArgs":["$args"]}"""
+        // Hand-rolled JSON: this module has no serializer dependency and the shape
+        // is fixed and tiny.
+        return """{"kind":"accept","sid":${e.sidUnsigned},"seq":${e.seqUnsigned},""" +
+            """"type":"${e.type.name}","typeCode":${e.type.code},"steps":${e.steps},""" +
+            """"wms":${e.wmsUnsigned},"canonical":"${RemoteInputProtocol.canonicalString(e)}",""" +
+            """"tag":"$tagHex","payloadHex":"$payload","rfcommArgs":["$args"]}"""
     }
 
+    private fun renderReject(v: RejectVector): String {
+        val payload = v.payloadHex?.let { ""","payloadHex":"$it"""" } ?: ""
+        val args = v.rfcommArgs?.let { ""","rfcommArgs":["${it.joinToString("\",\"")}"]""" } ?: ""
+        return """{"kind":"reject","rule":"${v.rule}","encoding":"${v.encoding}",""" +
+            """"mustReject":true,"reason":"${v.reason}"$payload$args}"""
+    }
+
+    private fun generate(): String =
+        (acceptVectors().map { renderAccept(it) } + rejectVectors().map { renderReject(it) })
+            .joinToString("\n") + "\n"
+
+    // ---- Minimal readers (no serializer dependency) ----
+
+    private fun field(line: String, name: String): String? =
+        Regex(""""$name":"([^"]*)"""").find(line)?.groupValues?.get(1)
+
+    private fun argsField(line: String): List<String>? =
+        Regex(""""rfcommArgs":\[(.*?)\]""").find(line)?.groupValues?.get(1)
+            ?.let { body ->
+                if (body.isBlank()) emptyList()
+                else Regex("\"([^\"]*)\"").findAll(body).map { it.groupValues[1] }.toList()
+            }
+
+    // ---- Tests ----
+
     /**
-     * Regenerates the checked-in file when it is absent, and otherwise asserts the
-     * real codec still reproduces it byte for byte. A failure here means either
-     * this side changed the contract, or the file was edited by hand -- both of
-     * which would silently break the glasses.
+     * Regenerates the file when absent, otherwise asserts the real codec still
+     * reproduces it byte for byte. A failure means either this side changed the
+     * contract or the file was hand-edited -- both of which would break the
+     * glasses silently.
      */
     @Test
     fun goldenVectorsAreStable() {
-        val generated = vectors().joinToString("\n") { renderVector(it) } + "\n"
-
+        val generated = generate()
         if (!GOLDEN_FILE.exists()) {
             GOLDEN_FILE.parentFile.mkdirs()
             GOLDEN_FILE.writeText(generated)
             println("Generated golden vectors at ${GOLDEN_FILE.absolutePath}")
             return
         }
-
         assertEquals(
-            "The codec no longer reproduces the checked-in golden vectors. " +
-                "If this change is intentional, the glasses implementation must be " +
-                "updated in lockstep and this file regenerated.",
+            "The codec no longer reproduces the checked-in golden vectors. If this " +
+                "change is intentional, the glasses implementation must be updated in " +
+                "lockstep and this file regenerated.",
             GOLDEN_FILE.readText(),
             generated,
         )
     }
 
-    /** Every vector must survive a full round trip through BOTH encodings. */
+    /**
+     * Reads the ACCEPT vectors back FROM THE FILE and replays them through the real
+     * codec, so the file -- not this source -- is what the assertions rest on.
+     */
     @Test
-    fun everyVectorRoundTripsThroughBothEncodings() {
-        for (e in vectors()) {
-            val decodedA = RemoteInputProtocol.decodeEvent(RemoteInputProtocol.encodeEvent(key, e))
-            assertEquals("Encoding A round trip for $e", e, decodedA.event)
-            assertTrue(
-                "Encoding A tag must verify for $e",
-                RemoteInputProtocol.verifyTag(key, decodedA.event, decodedA.tag),
-            )
+    fun acceptVectorsFromFileAreAccepted() {
+        val lines = goldenLines().filter { it.contains(""""kind":"accept"""") }
+        assertTrue("no accept vectors in the file", lines.isNotEmpty())
 
-            val (decodedB, tagHexB) = RemoteInputProtocol.fromRfcommArgs(
-                RemoteInputProtocol.toRfcommArgs(key, e).toList()
-            )
-            assertEquals("Encoding B round trip for $e", e, decodedB)
-            assertTrue(
-                "Encoding B tag must verify for $e",
-                RemoteInputProtocol.verifyTagHex(key, decodedB, tagHexB),
-            )
+        for (line in lines) {
+            val payloadHex = field(line, "payloadHex")!!
+            val bytes = RemoteInputProtocol.parseHexOrNull(payloadHex, payloadHex.length / 2)!!
+            val decoded = RemoteInputProtocol.decodeEvent(bytes)
 
-            // The two encodings must authenticate the SAME tuple, or the phone's
-            // verbatim forward of a watch-signed event would not verify.
-            assertEquals(
-                "encodings must agree on the tag for $e",
-                RemoteInputProtocol.toHex(decodedA.tag), tagHexB,
-            )
+            assertEquals("canonical string drift", field(line, "canonical"), RemoteInputProtocol.canonicalString(decoded.event))
+            assertEquals("tag drift", field(line, "tag"), RemoteInputProtocol.toHex(decoded.tag))
+            assertTrue("tag must verify", RemoteInputProtocol.verifyTag(key, decoded.event, decoded.tag))
+
+            val expectedArgs = argsField(line)!!
+            val (fromB, tagB) = RemoteInputProtocol.fromRfcommArgs(expectedArgs)
+            assertEquals("encodings must agree", decoded.event, fromB)
+            assertEquals(RemoteInputProtocol.toHex(decoded.tag), tagB)
         }
     }
 
     /**
-     * REJECT vectors. The accept-only vectors above cannot catch a receiver whose
-     * range check is still the superseded `abs(steps) > 16`: such a receiver
-     * reproduces every valid vector byte for byte and passes. Drift is only caught
-     * by asserting what must be REFUSED.
-     *
-     * The glasses repo must assert each of these is rejected, not merely that the
-     * valid ones are accepted.
+     * THE guard that accept-only vectors cannot provide. Reads the REJECT vectors
+     * FROM THE FILE and asserts the decoder refuses every one. A receiver still
+     * enforcing the superseded cap of 16 fails here on `steps_out_of_range`.
      */
     @Test
-    fun rejectVectorsAreRefusedByTheDecoder() {
-        val valid = RemoteInputEvent(
-            sid = 1, seq = 1, type = EventType.SCROLL, steps = 1, wms = 1000,
-        )
-        val template = RemoteInputProtocol.encodeEvent(key, valid)
+    fun rejectVectorsFromFileAreRefused() {
+        val lines = goldenLines().filter { it.contains(""""kind":"reject"""") }
+        assertTrue("no reject vectors in the file", lines.isNotEmpty())
 
-        // byte[1] is steps (int8). Everything outside +/-MAX_STEPS_PER_EVENT must
-        // be refused rather than accepted-and-wrapped.
-        val badSteps = listOf<Byte>(9, 16, 17, 127, -9, -16, -17, -128)
-        for (s in badSteps) {
-            val frame = template.copyOf().also { it[1] = s }
-            assertRejected("steps=$s") { RemoteInputProtocol.decodeEvent(frame) }
-        }
-
-        // SCROLL must carry a non-zero magnitude.
-        assertRejected("SCROLL with zero steps") {
-            RemoteInputProtocol.decodeEvent(template.copyOf().also { it[1] = 0 })
-        }
-
-        // A non-SCROLL type must not carry steps.
-        val select = RemoteInputProtocol.encodeEvent(
-            key, valid.copy(type = EventType.SELECT, steps = 0),
-        )
-        assertRejected("SELECT carrying steps") {
-            RemoteInputProtocol.decodeEvent(select.copyOf().also { it[1] = 3 })
-        }
-
-        // Type codes outside the enum.
-        for (code in listOf<Byte>(0, 7, 99, -1)) {
-            assertRejected("type code=$code") {
-                RemoteInputProtocol.decodeEvent(template.copyOf().also { it[0] = code })
+        val seenRules = mutableSetOf<String>()
+        for (line in lines) {
+            val rule = field(line, "rule")!!
+            seenRules += rule
+            val encoding = field(line, "encoding")!!
+            var rejected = false
+            try {
+                if (encoding == "A") {
+                    val hex = field(line, "payloadHex")!!
+                    val bytes = RemoteInputProtocol.parseHexOrNull(hex, hex.length / 2)!!
+                    RemoteInputProtocol.decodeEvent(bytes)
+                } else {
+                    RemoteInputProtocol.fromRfcommArgs(argsField(line)!!)
+                }
+            } catch (expected: RemoteInputProtocol.MalformedFrameException) {
+                rejected = true
             }
+            assertTrue("vector for rule '$rule' was ACCEPTED but must be rejected", rejected)
         }
 
-        // Reserved bytes 22..25 must be zero.
-        for (i in 22..25) {
-            assertRejected("reserved byte $i set") {
-                RemoteInputProtocol.decodeEvent(template.copyOf().also { it[i] = 1 })
-            }
-        }
-
-        // Length is checked EXACTLY, not >=.
-        assertRejected("short frame") { RemoteInputProtocol.decodeEvent(template.copyOf(25)) }
-        assertRejected("long frame") { RemoteInputProtocol.decodeEvent(template.copyOf(27)) }
+        // Guard the guard: if a rule is dropped from the file, fail loudly rather
+        // than quietly covering less than before.
+        assertEquals(
+            "the reject vector file no longer covers every required rule",
+            REQUIRED_REJECT_RULES, seenRules,
+        )
     }
 
-    private fun assertRejected(label: String, block: () -> Unit) {
-        try {
-            block()
-            throw AssertionError("expected rejection but decode succeeded: $label")
-        } catch (expected: RemoteInputProtocol.MalformedFrameException) {
-            // Correct: rejected as malformed rather than silently accepted.
+    /** The cap magnitudes a stale receiver would wrongly accept must be present. */
+    @Test
+    fun rejectVectorsCoverTheSupersededCapValues() {
+        val text = goldenLines().joinToString("\n")
+        for (stale in listOf("abs(steps)=9", "abs(steps)=16")) {
+            assertTrue(
+                "the file must carry a reject vector for $stale, or a receiver " +
+                    "still using the superseded cap of 16 would pass the whole set",
+                text.contains(stale),
+            )
+        }
+    }
+
+    @Test
+    fun everyVectorRoundTripsThroughBothEncodings() {
+        for (e in acceptVectors()) {
+            val decodedA = RemoteInputProtocol.decodeEvent(RemoteInputProtocol.encodeEvent(key, e))
+            assertEquals("Encoding A round trip for $e", e, decodedA.event)
+            assertTrue(RemoteInputProtocol.verifyTag(key, decodedA.event, decodedA.tag))
+            val (decodedB, tagHexB) = RemoteInputProtocol.fromRfcommArgs(
+                RemoteInputProtocol.toRfcommArgs(key, e).toList()
+            )
+            assertEquals("Encoding B round trip for $e", e, decodedB)
+            assertTrue(RemoteInputProtocol.verifyTagHex(key, decodedB, tagHexB))
+            assertEquals(RemoteInputProtocol.toHex(decodedA.tag), tagHexB)
         }
     }
 
     @Test
     fun goldenVectorsCoverEveryEventType() {
-        val covered = vectors().map { it.type }.toSet()
         assertEquals(
-            "every event type must appear in the golden vectors",
-            EventType.entries.toSet(), covered,
+            "every event type must appear in the accept vectors",
+            EventType.entries.toSet(), acceptVectors().map { it.type }.toSet(),
         )
     }
 }
