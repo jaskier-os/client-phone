@@ -81,6 +81,14 @@ class DetentAccumulator(
      * @return signed detent count to emit now; 0 when below threshold or rate-limited.
      */
     fun onDelta(delta: Float, eventTimeMs: Long): Int {
+        // Reject non-finite samples at the door. AXIS_SCROLL arrives as a Float
+        // from the platform, and adding NaN to the running sum makes every later
+        // addition NaN too: the bezel would go dead for the rest of the session
+        // with nothing logged anywhere. An infinity is equally unrecoverable --
+        // it saturates the sum and no finite input can bring it back. Dropping a
+        // single bad sample costs nothing a user can perceive.
+        if (!delta.isFinite()) return 0
+
         if (lastEventTimeMs != Long.MIN_VALUE && eventTimeMs - lastEventTimeMs > IDLE_RESET_MS) {
             // New gesture. Drop the sub-detent remainder (it is not a step and never
             // was), but KEEP carriedSurplus -- those are real detents the user
