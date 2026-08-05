@@ -74,21 +74,26 @@ class LiveChainDriverTest {
                 Thread.sleep(2000)
             }
             "double_tap" -> {
-                // Two taps well inside the glasses' 400 ms window, measured on the
-                // WATCH's clock -- which is the whole point of stamping at the tap:
-                // the ~450 ms median transport RTT must not be able to turn this
-                // into two singles.
-                s.onTap()
-                Thread.sleep(120)
-                s.onTap()
-                Thread.sleep(2500)
+                // Two taps 150 ms apart, well inside the watch's own recognition
+                // window. The gap is SPECIFIED rather than slept for: this thread was
+                // measured stretching a sleep(150) to 552 ms under instrumentation
+                // load, which the recogniser correctly reads as two singles and would
+                // make the live evidence say the opposite of the truth. Everything
+                // downstream of the stamp -- recogniser, worker, coalescer, encoder,
+                // radio, phone relay, glasses -- is the real chain.
+                val t = SystemClock.elapsedRealtime()
+                s.onTapAt(t)
+                Thread.sleep(60)
+                s.onTapAt(t + 150)
+                Thread.sleep(3000)
             }
             "two_singles" -> {
-                // Control for the above: far apart, must stay two selects.
-                s.onTap()
+                // Control for the above: far apart, must stay two SELECTs.
+                val t = SystemClock.elapsedRealtime()
+                s.onTapAt(t)
                 Thread.sleep(1500)
-                s.onTap()
-                Thread.sleep(2000)
+                s.onTapAt(t + 1500)
+                Thread.sleep(3000)
             }
             "sustained" -> spin(+1.0f, 90, gapMs = 35)
             else -> throw IllegalArgumentException("unknown mode '$mode'")

@@ -101,6 +101,18 @@ object RemoteInputProtocol {
     /** Reorder hold deadline for an out-of-order event on the phone. */
     const val REORDER_DEADLINE_MS = 40L
 
+    /**
+     * How long a producer waits after a tap before it can call that tap a SINGLE.
+     *
+     * Owned by the SOURCE, because the source is the only place where the wait is
+     * free. See the note on [EventType] for the layering. The value matches the
+     * glasses' own physical-touchpad threshold (`MainActivity.DOUBLE_TAP_THRESHOLD_MS`)
+     * so the watch and the touchpad feel the same to the user; the two constants live
+     * in separate Gradle projects and cannot share a symbol, which is why this one
+     * states the relationship explicitly.
+     */
+    const val DOUBLE_TAP_WINDOW_MS = 400L
+
     const val PING_INTERVAL_MS = 10_000L
 
     /**
@@ -176,37 +188,53 @@ object RemoteInputProtocol {
     /**
      * Event types.
      *
-     * TAP SEMANTICS (decided 2026-08-05, binding). [SELECT] is ONE RAW PHYSICAL
-     * TAP. The watch performs NO double-tap detection: no GestureDetector
-     * onDoubleTap, no local timer, and it never synthesizes [BACK] from a tap pair.
+     * ACTION SEMANTICS (revised 2026-08-05, binding, and it REPLACES the earlier
+     * raw-tap design). Every value here is a SEMANTIC ACTION -- what the user asked
+     * for -- never a raw physical gesture. Gesture recognition belongs to the
+     * SOURCE; interpretation of the action belongs to the receiver.
      *
-     * The glasses already own tap disambiguation and it is tuned against the
-     * physical touchpad (`MainActivity.DOUBLE_TAP_THRESHOLD_MS = 400`). Running a
-     * second detector on the watch would fight it: the watch's would consume the
-     * pair and mask the glasses' logic, and the two thresholds would drift apart.
-     * Keeping disambiguation in exactly one place makes the watch feel identical to
-     * the touchpad the user has already tuned by feel, and any future input device
-     * inherits correct tap semantics for free.
+     * The layering:
+     *  - SOURCE (the watch): recognises its own gestures locally, with zero network
+     *    latency, and emits the action they mean. Single tap -> [SELECT],
+     *    double tap -> [BACK]. The disambiguation wait ([DOUBLE_TAP_WINDOW_MS]) is
+     *    paid entirely here, where it costs nothing extra.
+     *  - RELAY (the phone): forwards actions verbatim and AGNOSTICALLY. It reasons
+     *    about sessions, ordering, replay and staleness -- never about what an
+     *    action means.
+     *  - RECEIVER (the glasses): maps an action onto its own UI and gates it. It
+     *    does NOT re-derive gestures from actions.
+     *
+     * Why the earlier design (raw taps, glasses-side disambiguation) was wrong: to
+     * tell a single tap from a double, the receiver must DEFER acting on the first
+     * tap for the whole window. Stacked on ~450 ms of transport round trip that made
+     * a single tap take ~850 ms; the code that skipped the deferral instead emitted
+     * BOTH a select and a back for one double tap, which cancelled out. Recognising
+     * on the source removes the deferral from the latency path entirely, and it
+     * generalises: a future source with a real back button, a chorded gesture or a
+     * voice trigger emits the same actions and the glasses need no knowledge of its
+     * gesture vocabulary.
      *
      * Consequences for the producer, which are correctness requirements rather
      * than polish:
-     *  - Emit one SELECT per physical tap, as promptly as possible.
-     *  - NEVER put a tap through the scroll coalescing window. Coalescing exists
-     *    for detent bursts; delaying a tap corrupts the glasses' 400 ms arithmetic.
-     *  - Taps and scroll steps are never merged with each other.
-     *  - Populate [RemoteInputEvent.wms] at the MOMENT OF THE TAP, not at enqueue
-     *    or send time. The receiver may disambiguate on `wms` rather than arrival
-     *    time, so a late stamp turns a deliberate "go back" into "select twice".
+     *  - Emit exactly ONE action per user intent. A double tap is one [BACK], never
+     *    a [SELECT] followed by a [BACK].
+     *  - NEVER put an action through the scroll coalescing window. Coalescing exists
+     *    for detent bursts; actions and scroll steps are never merged, and an action
+     *    is sent the moment it is recognised.
+     *  - Populate [RemoteInputEvent.wms] at the moment of the gesture that produced
+     *    the action, not at enqueue or send time. `wms` drives the receiver's TTL and
+     *    ordering, so a late stamp makes a live action look stale and be dropped. It
+     *    no longer carries any tap-disambiguation meaning.
      */
     enum class EventType(val code: Int) {
         SCROLL(1),
 
-        /** One raw physical tap. See the note above: no local double-tap logic. */
+        /** Select / enter. On the watch this is what ONE tap resolves to. */
         SELECT(2),
 
         /**
-         * An explicit back action. Reserved for a real back affordance; it is NOT
-         * synthesized from a double tap by the producer.
+         * Back / exit. A semantic action, produced by whatever affordance the source
+         * has for "go back" -- on the watch, a locally recognised double tap.
          */
         BACK(3),
         OPEN(4),
@@ -216,8 +244,22 @@ object RemoteInputProtocol {
         /** SCROLL is the only type carrying a non-zero steps payload. */
         val carriesSteps: Boolean get() = this == SCROLL
 
+        /** OPEN/CLOSE/PING are session lifecycle, not input; exempt from staleness. */
+        val isLifecycle: Boolean get() = this == OPEN || this == CLOSE || this == PING
+
         /** OPEN/CLOSE/PING are exempt from the staleness cutoff. */
-        val ttlExempt: Boolean get() = this == OPEN || this == CLOSE || this == PING
+        val ttlExempt: Boolean get() = isLifecycle
+
+        /**
+         * A human just did something, as opposed to the session announcing or
+         * maintaining itself.
+         *
+         * Defined as the complement of [isLifecycle] rather than by listing action
+         * types, so a relay that keys off it stays agnostic: adding a new action to
+         * the vocabulary must not require editing anything between the source and the
+         * receiver.
+         */
+        val isUserAction: Boolean get() = !isLifecycle
 
         companion object {
             private val BY_CODE = entries.associateBy { it.code }

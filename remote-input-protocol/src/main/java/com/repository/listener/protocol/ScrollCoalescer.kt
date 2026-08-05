@@ -25,7 +25,8 @@ import kotlin.math.sign
  *  4. steps reaching the cap flushes immediately and starts a new window.
  *  5. A direction change flushes the pending event, then applies rule 1.
  *  6. SELECT/BACK/OPEN/CLOSE/PING flush any pending SCROLL first, then emit.
- *     They are never coalesced.
+ *     They are never coalesced -- a semantic action has already waited out its
+ *     own recognition window on the source and must go out immediately.
  *
  * Deliberately Android-free and single-threaded: it is confined to the link
  * service's worker thread, and time is passed in rather than read, so the whole

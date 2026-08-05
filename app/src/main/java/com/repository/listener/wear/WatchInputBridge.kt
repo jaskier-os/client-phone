@@ -180,14 +180,14 @@ class WatchInputBridge(
      * relay down every 10 s forever and make desktop audio permanently unusable. OPEN
      * and CLOSE are excluded for the same reason: a session opens by itself whenever
      * the watch app comes to the foreground.
+     *
+     * The distinction it draws is user-action versus session-lifecycle, NOT which
+     * action. This relay is agnostic to what any action MEANS -- it never asks whether
+     * a frame is a select or a back -- so a new action in the vocabulary needs no edit
+     * here. That is why the test is [EventType.isUserAction] and not a list.
      */
     private fun maybeStopAudioRelayFor(event: RemoteInputEvent) {
-        when (event.type) {
-            RemoteInputProtocol.EventType.SCROLL,
-            RemoteInputProtocol.EventType.SELECT,
-            RemoteInputProtocol.EventType.BACK -> Unit
-            else -> return
-        }
+        if (!event.type.isUserAction) return
         if (!com.repository.listener.service.ListenerService.audioRelayActive) return
         // Own the idempotence HERE rather than leaning on the relay flag clearing in
         // time. Teardown is asynchronous -- it closes a peer connection and unwinds ICE
@@ -211,9 +211,10 @@ class WatchInputBridge(
         maybeStopAudioRelayFor(event)
 
         // Reorder guard, keyed on (sid, seq). MessageClient is reliable but NOT
-        // order-guaranteed, so a SELECT can overtake the SCROLL that preceded it.
+        // order-guaranteed, so a later frame can overtake the one that preceded it.
         // Forwarding the newer one first would make the glasses drop the older as a
-        // duplicate, losing it permanently.
+        // duplicate, losing it permanently. The guard reads only (sid, seq) -- it never
+        // needs to know what the frames it is ordering mean.
         //
         // OPEN is exempt. It is what establishes the session on the glasses, and the
         // glasses adopt no session implicitly. If a SCROLL overtook its OPEN, a

@@ -286,6 +286,18 @@ class WatchLinkService : Service() {
     @androidx.annotation.VisibleForTesting
     internal fun startForTest() = startWorker()
 
+    /**
+     * The session teardown [onDestroy] performs, without the Android service lifecycle.
+     *
+     * Separate from [stopForTest], which only kills the worker: what a test needs to exercise is the
+     * FLUSH -- the pending detents and the half-recognised tap that must still be emitted -- and
+     * that lives in `closeSession`, not in the looper shutdown.
+     */
+    @androidx.annotation.VisibleForTesting
+    internal fun closeSessionForTest() {
+        handler.post { closeSession() }
+    }
+
     @androidx.annotation.VisibleForTesting
     internal fun stopForTest() {
         handler.removeCallbacksAndMessages(null)
@@ -352,6 +364,11 @@ class WatchLinkService : Service() {
     // ---- Session ----
 
     private fun openSession() {
+        // A tap half-recognised under the OLD session must not resolve into the new
+        // one: it would be sent with a fresh sid and a stamp from before the session
+        // existed, which the receiver ages against the wrong baseline.
+        handler.removeCallbacks(singleTapRunnable)
+        pendingTapMs = null
         sid = mintSid()
         synchronized(sendLock) { seq = 0 }
         sessionOpenSent = false
@@ -438,21 +455,89 @@ class WatchLinkService : Service() {
     }
 
     /**
-     * One raw physical tap. Emitted immediately and never merged with scroll: the
-     * glasses own double-tap disambiguation against a 400 ms threshold, and
-     * delaying a tap here would corrupt that arithmetic.
+     * One physical tap on the watch face.
+     *
+     * The watch RECOGNISES the gesture and emits the SEMANTIC ACTION it means: one
+     * tap is [EventType.SELECT], two taps inside [DOUBLE_TAP_WINDOW_MS] are a single
+     * [EventType.BACK]. Nothing downstream re-derives gestures -- see the note on
+     * `RemoteInputProtocol.EventType`.
+     *
+     * Recognising here rather than on the glasses is the whole point: distinguishing
+     * single from double REQUIRES waiting out the window before acting, and that wait
+     * is free on the device the finger is touching. Stacked on top of ~450 ms of
+     * transport it was not: a single tap took most of a second, and the code that
+     * skipped the wait emitted a select AND a back for one double tap.
      */
-    fun onTap() {
-        val tapMs = SystemClock.elapsedRealtime()
+    fun onTap() = onTapAt(SystemClock.elapsedRealtime())
+
+    /**
+     * [onTap] with the tap instant passed in rather than read.
+     *
+     * The same seam [ScrollCoalescer] uses, and for the same reason: the recogniser's whole job is
+     * arithmetic on the gap between two taps, and a test that produced that gap with `Thread.sleep`
+     * would be measuring the watch's scheduler, not the rule. It does -- on this hardware a
+     * `sleep(150)` from the instrumentation thread was observed landing 552 ms later, which the
+     * recogniser then correctly classified as two singles and the test wrongly called a failure.
+     * Everything downstream of the timestamp (worker thread, coalescer, sequence, encoder, send)
+     * is still the real thing.
+     */
+    @androidx.annotation.VisibleForTesting
+    internal fun onTapAt(tapMs: Long) {
         handler.post {
             // Jitter instrumentation. `queue` is the delay between the physical tap
-            // and this reaching the worker. It is the component that could corrupt
-            // the glasses' 400 ms double-tap arithmetic, because the receiver
-            // disambiguates on the tap-time stamp carried in the frame.
+            // and this reaching the worker, i.e. how much of the recognition window
+            // is spent before the recogniser even sees the tap.
             val onWorker = SystemClock.elapsedRealtime()
             Log.i(TAG, "TAP tap=$tapMs worker=$onWorker queue=${onWorker - tapMs}")
-            coalescer.onDiscreteEvent(EventType.SELECT, tapMs)
+            onTapRecognised(tapMs)
         }
+    }
+
+    /**
+     * The pending FIRST tap of a possible double, or null when no window is open.
+     *
+     * Worker-thread confined, like every other piece of session state.
+     */
+    private var pendingTapMs: Long? = null
+
+    /** Fires when a pending tap's window closes with no second tap: it was a single. */
+    private val singleTapRunnable = Runnable {
+        val tapMs = pendingTapMs ?: return@Runnable
+        pendingTapMs = null
+        Log.i(TAG, "GESTURE single -> SELECT tap=$tapMs")
+        coalescer.onDiscreteEvent(EventType.SELECT, tapMs)
+    }
+
+    /**
+     * Worker-thread tap recogniser. See [onTap].
+     *
+     * A third rapid tap cannot produce anything absurd: the second tap CLOSES the
+     * window (cancelling the timer and clearing [pendingTapMs]) before emitting BACK,
+     * so a third tap opens a brand new window and is judged on its own. Three fast
+     * taps are therefore BACK then SELECT, never a second BACK from a re-used first
+     * tap and never two overlapping windows.
+     */
+    private fun onTapRecognised(tapMs: Long) {
+        val first = pendingTapMs
+        if (first != null && tapMs - first < RemoteInputProtocol.DOUBLE_TAP_WINDOW_MS) {
+            handler.removeCallbacks(singleTapRunnable)
+            pendingTapMs = null
+            Log.i(TAG, "GESTURE double -> BACK first=$first second=$tapMs gap=${tapMs - first}")
+            // Stamped with the SECOND tap: that is the moment the user completed the
+            // gesture, and it is what the receiver's TTL must be measured against.
+            // Stamping the first would charge the whole recognition window to age and
+            // land every BACK a window closer to being dropped as stale.
+            coalescer.onDiscreteEvent(EventType.BACK, tapMs)
+            return
+        }
+        // A tap while another window is open but OUTSIDE it: the pending one is a
+        // single and must be emitted now, in order, before this one opens its window.
+        if (first != null) {
+            handler.removeCallbacks(singleTapRunnable)
+            singleTapRunnable.run()
+        }
+        pendingTapMs = tapMs
+        handler.postDelayed(singleTapRunnable, RemoteInputProtocol.DOUBLE_TAP_WINDOW_MS)
     }
 
     private val drainRunnable = Runnable {
@@ -479,6 +564,18 @@ class WatchLinkService : Service() {
             coalescer.onDetents(chunk, now)
         }
         coalescer.flush(now)
+        // A tap still inside its recognition window is a SINGLE: no second tap is
+        // coming, because the session is ending. Dropping it would silently discard
+        // an action the user actually performed -- the same conservation rule the
+        // coalescer's own flush exists to satisfy.
+        resolvePendingTapAsSingle()
+    }
+
+    /** Emits a still-pending first tap as SELECT now, if there is one. */
+    private fun resolvePendingTapAsSingle() {
+        if (pendingTapMs == null) return
+        handler.removeCallbacks(singleTapRunnable)
+        singleTapRunnable.run()
     }
 
     // ---- Sending ----
@@ -568,9 +665,10 @@ class WatchLinkService : Service() {
         messageClient.sendMessage(node, path, payload)
             .addOnSuccessListener {
                 // Measurement path. `stamp` is the age of the event when it was
-                // handed to the radio: the jitter that shifts the glasses'
-                // double-tap arithmetic. `ack` is the round trip to GMS accepting
-                // the message, which bounds the Data Layer hop and therefore TTL.
+                // handed to the radio -- for a recognised action that legitimately
+                // includes the recognition window it waited out. `ack` is the round
+                // trip to GMS accepting the message, which bounds the Data Layer hop
+                // and therefore the TTL the glasses enforce.
                 val ackMs = SystemClock.elapsedRealtime()
                 Log.i(
                     TAG,
