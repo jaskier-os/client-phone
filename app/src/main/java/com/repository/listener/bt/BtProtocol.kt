@@ -229,4 +229,20 @@ object BtProtocol {
     // Phone -> glasses chunked: ["LIST", agMac, hashHex, jsonChunk, isFinal("0"/"1")].
     // jsonArray of {"n": "+E164normalized", "d": "Display Name"}.
     const val CH_CONTACTS = "listener_contacts"
+
+    // Remote input events from a registered input source (the Wear watch bezel
+    // today, another gadget later). Carried on the DEDICATED input RFCOMM socket
+    // (InputRfcommClient / INPUT_UUID), never the shared message socket, where
+    // bulk frames head-of-line-block input for seconds.
+    // Args: [v, src, sid, seq, type, steps, wms, tag] -- all decimal ASCII
+    // except src, type and tag.
+    //   type:  "SCROLL"|"SELECT"|"BACK"|"OPEN"|"CLOSE"|"PING"
+    //   steps: signed detent count; positive = forward/down; "0" for non-SCROLL
+    //   wms:   watch elapsedRealtime low 32 bits at the moment of the input
+    //   tag:   16 hex chars, HMAC-SHA256 truncated to 8 bytes, computed ON THE
+    //          WATCH over "v|src|sid|seq|type|steps|wms"
+    // Receivers MUST check args.size >= 8, parse with toIntOrNull()/toUIntOrNull()
+    // and wrap the whole parse in try/catch: onMessage runs on a Binder thread and
+    // an uncaught throw kills the service.
+    const val CH_REMOTE_INPUT = "listener_remote_input"
 }

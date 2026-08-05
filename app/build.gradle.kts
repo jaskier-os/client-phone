@@ -113,6 +113,13 @@ dependencies {
     // Navigation module
     implementation(project(":navigation"))
 
+    // Frozen remote-input wire contract, shared with :wear.
+    implementation(project(":remote-input-protocol"))
+
+    // Wear Data Layer, for remote input from the watch. Its aar-metadata declares
+    // minCompileSdk=1, so this does not force :app off compileSdk 34.
+    implementation("com.google.android.gms:play-services-wearable:20.0.1")
+
     // Silero VAD + openWakeWord via ONNX Runtime
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 

@@ -62,6 +62,10 @@ class PhoneBtHost(private val context: Context) {
      */
     private val mapRfcommClient = MapRfcommClient(context)
 
+    /** Dedicated socket for remote input (watch bezel). Kept off the shared
+     *  control socket so bulk frames cannot head-of-line-block input. */
+    val inputRfcommClient = InputRfcommClient(context)
+
     /**
      * G3: persistent BLE wake link to glasses BleWakeService. Used to wake the
      * other side when we have outbound data and RFCOMM is torn down, and to
@@ -97,6 +101,7 @@ class PhoneBtHost(private val context: Context) {
             log("Bond completed for ${device.address} -- kicking immediate RFCOMM reconnect")
             rfcommClient.requestImmediateReconnect("bond_complete")
             mapRfcommClient.requestImmediateReconnect("bond_complete")
+            inputRfcommClient.requestImmediateReconnect("bond_complete")
         }
     }
 
@@ -576,6 +581,7 @@ class PhoneBtHost(private val context: Context) {
                         // unit with NO MAC re-lookup -- the exact device BLE saw is the one we bond.
                         rfcommClient.setTargetDevice(device)
                         mapRfcommClient.setTargetDevice(device)
+                        inputRfcommClient.setTargetDevice(device)
                         mainHandler.postDelayed({
                             if (!rfcommConnected) {
                                 rfcommClient.requestImmediateReconnect("repo_ble_bonded")
@@ -664,6 +670,7 @@ class PhoneBtHost(private val context: Context) {
             maybeColdStartGlassesListener("bonded")
             rfcommClient.requestImmediateReconnect("bonded")
             mapRfcommClient.requestImmediateReconnect("bonded")
+            inputRfcommClient.requestImmediateReconnect("bonded")
             ensureBleWakeStarted()
             scheduleRetry()
         } else {
@@ -828,6 +835,7 @@ class PhoneBtHost(private val context: Context) {
                 // It connects to the same bonded glasses on MAP_UUID; if it is
                 // already up this is a no-op.
                 mapRfcommClient.requestImmediateReconnect("control_connected")
+                inputRfcommClient.requestImmediateReconnect("control_connected")
                 // Reachability: RFCOMM up is hard proof of life.
                 reachability.onRfcommConnected()
                 // Mirror the freshly-connected device identity, then force a state re-broadcast.
@@ -884,6 +892,8 @@ class PhoneBtHost(private val context: Context) {
         rfcommClient.start()
         mapRfcommClient.onLog = { msg -> log("MapRFCOMM: $msg") }
         mapRfcommClient.start()
+        inputRfcommClient.onLog = { msg -> log("InputRFCOMM: $msg") }
+        inputRfcommClient.start()
         ensureBondReceiverRegistered()
         ensureBleWakeStarted()
     }
@@ -919,6 +929,7 @@ class PhoneBtHost(private val context: Context) {
             log("BleWake: rx code=0x${"%02X".format(code.toInt() and 0xFF)} -> requesting RFCOMM reconnect")
             rfcommClient.requestImmediateReconnect("ble:0x${"%02X".format(code.toInt() and 0xFF)}")
             mapRfcommClient.requestImmediateReconnect("ble:0x${"%02X".format(code.toInt() and 0xFF)}")
+            inputRfcommClient.requestImmediateReconnect("ble:0x${"%02X".format(code.toInt() and 0xFF)}")
         }
         bleWake.setOnConnectionStateCallback { up ->
             log("BleWake: link state=${if (up) "UP" else "DOWN"}")
@@ -1678,6 +1689,7 @@ class PhoneBtHost(private val context: Context) {
         }
         rfcommClient.requestImmediateReconnect("wake:$reason")
         mapRfcommClient.requestImmediateReconnect("wake:$reason")
+        inputRfcommClient.requestImmediateReconnect("wake:$reason")
     }
 
     fun sendSettings(settingsJson: String) {
@@ -2426,6 +2438,7 @@ class PhoneBtHost(private val context: Context) {
         // Tear down both RFCOMM links so neither connect thread is leaked.
         rfcommClient.stop()
         mapRfcommClient.stop()
+        inputRfcommClient.stop()
         bluetoothHelper.release()
     }
 }

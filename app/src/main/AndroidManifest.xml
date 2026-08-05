@@ -89,6 +89,24 @@
             android:exported="false"
             android:theme="@style/Theme.Listener" />
 
+        <!--
+          Receives remote input from the watch over the Wear Data Layer. Exported
+          because Google Play services must bind it; the connected-node check in
+          the service is hygiene only. The real authentication is the
+          watch-computed HMAC verified on the glasses.
+        -->
+        <service
+            android:name=".wear.WatchMessageListenerService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.google.android.gms.wearable.MESSAGE_RECEIVED" />
+                <data
+                    android:scheme="wear"
+                    android:host="*"
+                    android:pathPrefix="/remote-input/v1/" />
+            </intent-filter>
+        </service>
+
         <service
             android:name=".service.ListenerService"
             android:exported="false"

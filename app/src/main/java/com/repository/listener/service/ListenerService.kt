@@ -2862,6 +2862,34 @@ class ListenerService : LifecycleService(),
     }
 
 
+    /** Remote input bridge (watch -> dedicated glasses input socket). */
+    private var watchInputBridge: com.repository.listener.wear.WatchInputBridge? = null
+
+    /**
+     * Pushes a status bitfield back to the watch.
+     *
+     * Advisory only and deliberately unauthenticated: this side holds no HMAC key
+     * by design, so it cannot sign. The watch treats status as advisory and never
+     * lets it assert health over a locally observed failure.
+     */
+    private fun sendWatchStatus(bits: ByteArray) {
+        try {
+            val nodeClient = com.google.android.gms.wearable.Wearable.getNodeClient(this)
+            nodeClient.connectedNodes.addOnSuccessListener { nodes ->
+                val messageClient = com.google.android.gms.wearable.Wearable.getMessageClient(this)
+                for (node in nodes) {
+                    messageClient.sendMessage(
+                        node.id,
+                        com.repository.listener.protocol.RemoteInputProtocol.PATH_STATUS,
+                        bits,
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "watch status push failed: ${e.message}")
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         LogCollector.i(TAG, "Service creating (photo-auto-attach v2)")
@@ -2993,6 +3021,18 @@ class ListenerService : LifecycleService(),
         phoneBtHost = PhoneBtHost(this)
         phoneBtHostInstance = phoneBtHost
         phoneBtHost.listener = this
+
+        // Remote input from the watch. The bridge forwards watch-signed frames
+        // verbatim onto the dedicated input socket; it holds no HMAC key, because
+        // the watch signs and the glasses verify. Published statically so the
+        // exported WearableListenerService can reach it -- GMS binds that service
+        // into this process on demand, and it cannot start a foreground service
+        // from the background to revive us.
+        watchInputBridge = com.repository.listener.wear.WatchInputBridge(
+            inputClient = phoneBtHost.inputRfcommClient,
+            statusSender = { bits -> sendWatchStatus(bits) },
+        )
+        com.repository.listener.wear.WatchMessageListenerService.bridge = watchInputBridge
         phoneBtHost.onGlassesCommandResult = { requestId, result ->
             onGlassesCommandResult(requestId, result)
         }
@@ -11199,6 +11239,11 @@ class ListenerService : LifecycleService(),
 
     override fun onDestroy() {
         LogCollector.i(TAG, "Service destroying")
+        // Clear the static bridge reference first: GMS can bind the listener
+        // service at any moment and must not hand frames to a dead bridge.
+        com.repository.listener.wear.WatchMessageListenerService.bridge = null
+        watchInputBridge?.shutdown()
+        watchInputBridge = null
         // Set FIRST: callbacks posted from the OkHttp/WebRTC threads may already be
         // queued on the main looper and would otherwise rebuild a PeerConnectionFactory
         // or re-arm relay state on a dead service (leaked peer + audio device).

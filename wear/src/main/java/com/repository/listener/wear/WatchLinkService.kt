@@ -270,7 +270,15 @@ class WatchLinkService : Service() {
      */
     fun onTap() {
         val tapMs = SystemClock.elapsedRealtime()
-        handler.post { coalescer.onDiscreteEvent(EventType.SELECT, tapMs) }
+        handler.post {
+            // Jitter instrumentation. `queue` is the delay between the physical tap
+            // and this reaching the worker. It is the component that could corrupt
+            // the glasses' 400 ms double-tap arithmetic, because the receiver
+            // disambiguates on the tap-time stamp carried in the frame.
+            val onWorker = SystemClock.elapsedRealtime()
+            Log.i(TAG, "TAP tap=$tapMs worker=$onWorker queue=${onWorker - tapMs}")
+            coalescer.onDiscreteEvent(EventType.SELECT, tapMs)
+        }
     }
 
     private val drainRunnable = Runnable {
@@ -341,7 +349,20 @@ class WatchLinkService : Service() {
         } else {
             RemoteInputProtocol.PATH_EVENT
         }
+        val handoffMs = SystemClock.elapsedRealtime()
         messageClient.sendMessage(node, path, payload)
+            .addOnSuccessListener {
+                // Measurement path. `stamp` is the age of the event when it was
+                // handed to the radio: the jitter that shifts the glasses'
+                // double-tap arithmetic. `ack` is the round trip to GMS accepting
+                // the message, which bounds the Data Layer hop and therefore TTL.
+                val ackMs = SystemClock.elapsedRealtime()
+                Log.i(
+                    TAG,
+                    "SENT type=$type stamp=${handoffMs - timeMs} " +
+                        "ack=${ackMs - handoffMs} total=${ackMs - timeMs}",
+                )
+            }
             .addOnFailureListener { e ->
                 Log.w(TAG, "send failed ($type): ${e.message}")
                 // Input events are never retried: a retried SCROLL arrives stale
