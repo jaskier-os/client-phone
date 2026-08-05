@@ -233,8 +233,15 @@ private fun RemoteScreen(
  */
 private fun rawAxisScroll(view: View, verticalScrollPixels: Float): Float {
     val factor = android.view.ViewConfiguration.get(view.context).scaledVerticalScrollFactor
-    if (factor <= 0f) return -verticalScrollPixels
-    return -verticalScrollPixels / factor.toFloat()
+    val raw = if (factor <= 0f) -verticalScrollPixels else -verticalScrollPixels / factor.toFloat()
+    // Calibration trace. Confirms on real hardware that one detent yields ~1.0
+    // raw units, which is what ROTARY_DETENT_UNITS assumes. Read with:
+    //   adb -s <watch> logcat -s RotaryCal
+    android.util.Log.i(
+        "RotaryCal",
+        "pixels=$verticalScrollPixels factor=$factor raw=$raw t=${SystemClock.elapsedRealtime()}",
+    )
+    return raw
 }
 
 /**
