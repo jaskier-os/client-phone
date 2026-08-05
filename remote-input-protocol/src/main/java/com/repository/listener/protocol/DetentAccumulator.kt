@@ -77,17 +77,22 @@ class DetentAccumulator(
 
         accumulated += delta
 
-        // A direction reversal invalidates the opposite-signed remainder, and the
-        // carried surplus of the old direction can no longer be delivered as-is.
-        if (carriedSurplus != 0 && accumulated.sign != 0f &&
-            carriedSurplus.sign.toFloat() != accumulated.sign
-        ) {
-            carriedSurplus = 0
-        }
-
         val whole = (accumulated / threshold).toInt()
         if (whole != 0) {
             accumulated -= whole * threshold
+
+            // A reversal is only real once a COMPLETED detent goes the other way.
+            // Deciding this on the sub-detent remainder instead would let a single
+            // noise sample -- a finger tremor that never completes a detent --
+            // discard an entire carried backlog of genuine user motion.
+            if (carriedSurplus != 0 && whole.sign != carriedSurplus.sign) {
+                // Hand the old direction's undelivered backlog to the caller before
+                // reversing, so it is DELIVERED rather than discarded. Conservation
+                // holds: every detent the user produced still reaches the sink.
+                val backlog = carriedSurplus
+                carriedSurplus = whole
+                return backlog
+            }
             carriedSurplus += whole
         }
 
@@ -120,12 +125,21 @@ class DetentAccumulator(
         return direction * allowed
     }
 
-    /** Emits all carried surplus ignoring the rate limit. For teardown only. */
-    fun flushAll(): Int {
-        val out = carriedSurplus
-        carriedSurplus = 0
-        accumulated = 0f
-        return out
+    /**
+     * Emits carried surplus ignoring the rate limit, in chunks no larger than
+     * [maxStepsPerEvent] so every result stays inside the int8 wire range. Call
+     * repeatedly until it returns 0. For teardown, where the remaining backlog
+     * must land before the session ends rather than be stranded.
+     */
+    fun flushChunk(): Int {
+        if (carriedSurplus == 0) {
+            accumulated = 0f
+            return 0
+        }
+        val direction = carriedSurplus.sign
+        val chunk = minOf(abs(carriedSurplus), maxStepsPerEvent)
+        carriedSurplus -= direction * chunk
+        return direction * chunk
     }
 
     fun reset() {

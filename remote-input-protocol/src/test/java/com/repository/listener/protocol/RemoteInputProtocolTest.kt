@@ -276,6 +276,55 @@ class RemoteInputProtocolTest {
         RemoteInputProtocol.StatusFlags.decode(ByteArray(2))
     }
 
+    /**
+     * The status path is unauthenticated by design, so a forged frame must only
+     * ever be able to make the watch more pessimistic -- never to assert health
+     * over a locally observed failure, and never to resume sending.
+     */
+    @Test
+    fun status_forgedHealthCannotOverrideALocalFailure() {
+        val flags = RemoteInputProtocol.StatusFlags
+        // The watch locally believes the link is down and a send was dropped.
+        val current = flags.LAST_SEND_DROPPED
+        // A forged frame claims everything is healthy.
+        val forged = flags.GLASSES_LINK_UP or flags.PHONE_SERVICE_ALIVE or
+            flags.GLASSES_SINK_ATTACHED
+        val merged = flags.applyAdvisory(current, forged, trusted = false)
+        assertFalse(flags.isSet(merged, flags.GLASSES_LINK_UP))
+        assertFalse(flags.isSet(merged, flags.PHONE_SERVICE_ALIVE))
+        assertTrue("a locally observed failure must survive", flags.isSet(merged, flags.LAST_SEND_DROPPED))
+    }
+
+    @Test
+    fun status_forgedProblemsAreStillHonoured() {
+        val flags = RemoteInputProtocol.StatusFlags
+        val current = flags.GLASSES_LINK_UP or flags.PHONE_SERVICE_ALIVE
+        val merged = flags.applyAdvisory(current, flags.WAKING_GLASSES, trusted = false)
+        assertTrue(flags.isSet(merged, flags.WAKING_GLASSES))
+    }
+
+    @Test
+    fun status_trustedTransitionRestoresHealth() {
+        val flags = RemoteInputProtocol.StatusFlags
+        val healthy = flags.GLASSES_LINK_UP or flags.PHONE_SERVICE_ALIVE or
+            flags.GLASSES_SINK_ATTACHED
+        val merged = flags.applyAdvisory(flags.LAST_SEND_DROPPED, healthy, trusted = true)
+        assertEquals("a genuine local reconnect may clear failure state", healthy, merged)
+    }
+
+    /**
+     * The glasses are an independent implementation. If they render the tag with
+     * "%02X" we must still accept it, or the feature is 100 % broken with no
+     * useful error. Emit lowercase, accept either case.
+     */
+    @Test
+    fun tag_acceptsUppercaseHexFromAnotherImplementation() {
+        val e = event()
+        val lower = RemoteInputProtocol.computeTagHex(key, e)
+        assertEquals("we always EMIT lowercase", lower, lower.lowercase())
+        assertTrue(RemoteInputProtocol.verifyTagHex(key, e, lower.uppercase()))
+    }
+
     // ---- Sequence arithmetic ----
 
     /** A plain `<=` deadlocks the source forever at uint32 wraparound. */

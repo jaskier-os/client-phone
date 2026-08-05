@@ -101,6 +101,7 @@ object RemoteInputProtocol {
      * OPEN/CLOSE/PING are TTL-exempt. Set by [TtlCalibration]; see the measurement
      * recorded in the plan.
      */
+    @Volatile
     var ttlMs: Long = TtlCalibration.DEFAULT_TTL_MS
         private set
 
@@ -395,11 +396,15 @@ object RemoteInputProtocol {
     // ---- Status backchannel (phone -> watch), 1 byte ----
 
     /**
-     * Advisory only. This frame is NOT authenticated: the tag key lives on the
-     * watch and the glasses, deliberately not on the phone, so the phone cannot
-     * sign anything. A forged status frame must therefore never be able to make
-     * the watch send MORE or believe a failure is resolved -- it may only disable
-     * sending or report a problem. [StatusFlags.mergeAdvisory] enforces that.
+     * Advisory only, and deliberately NOT authenticated: the tag key lives on the
+     * watch and the glasses, not on the phone, so the phone cannot sign anything.
+     *
+     * The consequence is a real and accepted limitation, stated plainly rather
+     * than papered over: any app able to deliver on this path can forge a status
+     * frame. The containment is that status is advisory input to the watch's
+     * DISPLAY state only. It must never be allowed to make the watch send more,
+     * nor to clear a failure the watch observed locally -- see
+     * [applyAdvisory], which is where that rule is enforced.
      */
     object StatusFlags {
         const val GLASSES_LINK_UP = 1 shl 0
@@ -432,6 +437,31 @@ object RemoteInputProtocol {
         }
 
         fun isSet(bits: Int, flag: Int): Boolean = (bits and flag) != 0
+
+        /**
+         * Folds an unauthenticated status frame into the watch's view of the link.
+         *
+         * A forged frame may only ever make the watch MORE pessimistic. Bits that
+         * report a problem (dropped, waking) are OR-ed in, so a forger can raise
+         * them but the watch's own observations can never be erased. Bits that
+         * report health (link up, service alive, sink attached) are AND-ed with
+         * what the watch already believes, so a forger cannot assert READY over a
+         * locally observed failure or resume sending that the watch has stopped.
+         *
+         * @param current the watch's current bits.
+         * @param received the bits from the frame just received.
+         * @param trusted true only when the watch itself cleared its local
+         *        failure state (a genuine reconnect), which is the sole path
+         *        allowed to turn health bits back on.
+         */
+        fun applyAdvisory(current: Int, received: Int, trusted: Boolean): Int {
+            if (trusted) return received
+            val healthMask = GLASSES_LINK_UP or PHONE_SERVICE_ALIVE or GLASSES_SINK_ATTACHED
+            val problemMask = LAST_SEND_DROPPED or WAKING_GLASSES
+            val health = current and received and healthMask
+            val problems = (current or received) and problemMask
+            return health or problems
+        }
     }
 
     // ---- Hex helpers ----
@@ -448,7 +478,14 @@ object RemoteInputProtocol {
         return String(out)
     }
 
-    /** Strict lowercase-hex parse of an exact byte count. Null on anything else. */
+    /**
+     * Strict hex parse of an exact byte count. Null on anything else.
+     *
+     * Encoding accepts BOTH cases even though [toHex] always emits lowercase: an
+     * independent implementation using "%02X" would otherwise produce tags this
+     * side silently rejected, which presents as the feature being 100 % broken
+     * with no useful error. Emit lowercase, accept either.
+     */
     fun parseHexOrNull(hex: String, expectedBytes: Int): ByteArray? {
         if (hex.length != expectedBytes * 2) return null
         val out = ByteArray(expectedBytes)
@@ -463,6 +500,7 @@ object RemoteInputProtocol {
     private fun hexDigit(c: Char): Int? = when (c) {
         in '0'..'9' -> c - '0'
         in 'a'..'f' -> c - 'a' + 10
+        in 'A'..'F' -> c - 'A' + 10
         else -> null
     }
 

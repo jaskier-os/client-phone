@@ -99,22 +99,59 @@ class DetentAccumulatorTest {
         )
     }
 
-    /** A reversal must not deliver the old direction's backlog as new motion. */
+    /**
+     * A reversal must DELIVER the old direction's backlog, not discard it. The
+     * user really did produce those detents; dropping them is exactly the silent
+     * loss this whole pipeline exists to prevent.
+     */
     @Test
-    fun directionReversalDiscardsOppositeDirectionBacklog() {
+    fun directionReversalDeliversOldBacklogThenReverses() {
         val a = acc()
         assertEquals(4, a.onDelta(10.0f, 0L))
+        assertEquals(6, a.pendingSurplus)
+        val backlog = a.onDelta(-3.0f, 10L)
+        assertEquals("the forward backlog must be delivered forward", 6, backlog)
+        assertEquals("only the new reverse motion remains", -3, a.pendingSurplus)
+    }
+
+    /**
+     * A sub-detent tremor that never completes a detent must not be mistaken for
+     * a reversal. Before the fix this discarded the entire carried backlog.
+     */
+    @Test
+    fun subDetentJitterDoesNotDiscardCarriedBacklog() {
+        val a = acc()
+        // 10 forward detents enter the pipeline.
+        var delivered = abs(a.onDelta(10.0f, 0L))
         assertTrue(a.pendingSurplus > 0)
-        val reversed = a.onDelta(-3.0f, 10L)
-        assertTrue("reversal must emit backwards, got $reversed", reversed <= 0)
-        assertTrue("no forward backlog may survive a reversal", a.pendingSurplus <= 0)
+
+        // A tremor below threshold in the opposite direction: no completed detent,
+        // so it must not be treated as a reversal. Anything it emits is still the
+        // forward backlog being drained, never a discard.
+        delivered += abs(a.onDelta(-0.4f, 10L))
+
+        // Drain the rest and assert nothing was lost anywhere.
+        var now = 20L
+        repeat(400) {
+            delivered += abs(a.drain(now))
+            now += 25L
+        }
+        assertEquals("a sub-detent tremor must not discard real detents", 10, delivered)
+        assertEquals(0, a.pendingSurplus)
     }
 
     @Test
-    fun flushAllEmitsCarriedSurplusForTeardown() {
+    fun flushChunkDrainsSurplusWithinTheWireRange() {
         val a = acc()
         a.onDelta(10.0f, 0L)
-        assertEquals(6, a.flushAll())
+        var drained = 0
+        while (true) {
+            val chunk = a.flushChunk()
+            if (chunk == 0) break
+            assertTrue("chunk must fit the int8 wire range", abs(chunk) <= 4)
+            drained += abs(chunk)
+        }
+        assertEquals(6, drained)
         assertEquals(0, a.pendingSurplus)
     }
 

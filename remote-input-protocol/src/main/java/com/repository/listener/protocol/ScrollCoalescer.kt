@@ -145,7 +145,21 @@ class ScrollCoalescer(
         windowOpenedAtMs = Long.MIN_VALUE
     }
 
-    fun reset() {
+    /**
+     * Clears all state. Emits any pending detents first: this is the only stage
+     * that could otherwise strand up to [maxSteps]-1 detents forever, which would
+     * break the conservation invariant on a session restart.
+     */
+    fun reset(nowMs: Long) {
+        flush(nowMs)
+        pendingSteps = 0
+        windowOpenedAtMs = Long.MIN_VALUE
+        pendingTimeMs = 0
+    }
+
+    /** Clears state WITHOUT emitting. Only for teardown, where the transport is
+     *  already gone and an emission would have nowhere to go. */
+    fun discard() {
         pendingSteps = 0
         windowOpenedAtMs = Long.MIN_VALUE
         pendingTimeMs = 0

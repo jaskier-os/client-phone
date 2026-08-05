@@ -235,12 +235,26 @@ class ScrollCoalescerTest {
         )
     }
 
+    /** reset must not strand pending detents -- it is the only stage that could
+     *  otherwise lose up to cap-1 detents forever on a session restart. */
     @Test
-    fun resetClearsPendingWindow() {
+    fun resetFlushesPendingDetentsInsteadOfStrandingThem() {
         val c = coalescer()
         c.onDetents(1, 0L)
         c.onDetents(5, 10L)
-        c.reset()
+        val beforeReset = scrollTotal()
+        c.reset(20L)
+        assertEquals("reset must emit what was pending", 6, scrollTotal())
+        assertTrue(scrollTotal() > beforeReset)
+        assertNull(c.nextTimeoutAtMs())
+    }
+
+    @Test
+    fun discardDropsPendingWindowForTeardown() {
+        val c = coalescer()
+        c.onDetents(1, 0L)
+        c.onDetents(5, 10L)
+        c.discard()
         emitted.clear()
         c.onTimeout(1000L)
         assertTrue(emitted.isEmpty())
