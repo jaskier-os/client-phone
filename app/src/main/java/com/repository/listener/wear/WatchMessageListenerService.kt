@@ -85,10 +85,16 @@ class WatchMessageListenerService : WearableListenerService() {
                     "wms=${decoded.event.wmsUnsigned} rx=${SystemClock.elapsedRealtime()}",
             )
 
-            when (decoded.event.type) {
-                EventType.PING -> target.onPing(decoded.event.seq)
-                else -> target.onEvent(decoded.event, tagHex)
-            }
+            // A PING is BOTH a round-trip probe for the watch and the keepalive that
+            // holds the session open on the glasses -- so it is answered here AND
+            // forwarded, not one or the other. Answering only (which is what this
+            // did) left the glasses' session with no traffic at all during idle, and
+            // they expire a silent session after SESSION_EXPIRY_MS and then reject a
+            // PING for the sid they just dropped. The status reply is issued first
+            // and unconditionally: the watch's link display and its RTT measurement
+            // must not depend on the glasses link being up.
+            if (decoded.event.type == EventType.PING) target.onPing(decoded.event.seq)
+            target.onEvent(decoded.event, tagHex)
         } catch (e: RemoteInputProtocol.MalformedFrameException) {
             Log.w(TAG, "malformed frame: ${e.message}")
         } catch (e: Exception) {

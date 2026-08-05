@@ -92,6 +92,36 @@ class WatchLinkService : Service() {
     private val capabilityClient: CapabilityClient by lazy { Wearable.getCapabilityClient(this) }
 
     /**
+     * Transport seam for tests. Null in production, where [dispatchEvent] talks to
+     * [messageClient] directly.
+     *
+     * This exists because the defect it guards against was an INTERACTION, not a
+     * component: `openSession` called the asynchronous node resolution and then sent
+     * OPEN immediately, and `sendEvent` silently discarded it because the node was
+     * still null. Every unit-testable piece was individually correct. A test can
+     * only catch that by driving this service's real session lifecycle and looking
+     * at what was actually handed to the radio, which needs somewhere to look.
+     *
+     * Deliberately a frame recorder rather than a mock MessageClient: it captures
+     * the path and the encoded payload, so a test asserts on the bytes the phone
+     * would receive rather than on an interaction with a mock.
+     */
+    @androidx.annotation.VisibleForTesting
+    @Volatile
+    internal var testFrameSink: ((path: String, payload: ByteArray) -> Unit)? = null
+
+    /**
+     * Node-resolution seam for tests. When set, it replaces the capability lookup
+     * and is invoked with the callback that must receive the resolved node id (or
+     * null). Keeping the SHAPE of the real resolver -- asynchronous, callback
+     * delivered off the worker -- is the point: a synchronous stub would remove the
+     * exact race the defect lived in.
+     */
+    @androidx.annotation.VisibleForTesting
+    @Volatile
+    internal var testNodeResolver: ((onResolved: (String?) -> Unit) -> Unit)? = null
+
+    /**
      * The one sequence counter for this session.
      *
      * A plain Int guarded by [sendLock]: every caller runs on the worker thread,
@@ -111,6 +141,30 @@ class WatchLinkService : Service() {
 
     @Volatile
     private var phoneNodeId: String? = null
+
+    /**
+     * Whether an OPEN for the current [sid] has actually been handed to the radio.
+     *
+     * Distinct from "openSession() ran". Node resolution is asynchronous, so on a
+     * fresh process [phoneNodeId] is null at the moment openSession() wants to send
+     * and the frame is silently discarded. The glasses NEVER adopt a session
+     * implicitly -- every action for a sid they hold no OPEN for is rejected -- so a
+     * session whose OPEN was dropped is permanently dead. This flag is what makes
+     * establishment retryable instead of fire-and-forget.
+     *
+     * Worker-thread confined. Every write goes through [handler] even from GMS
+     * callbacks, which run on the main thread.
+     */
+    private var sessionOpenSent = false
+
+    /**
+     * elapsedRealtime of the last frame handed to the radio for this session.
+     *
+     * Used only to detect that the glasses have almost certainly expired the session
+     * on their side, so it can be re-announced. Worker-thread confined, like
+     * [sessionOpenSent].
+     */
+    private var lastFrameSentMs = 0L
 
     @Volatile
     private var everSawPhoneNode = false
@@ -151,7 +205,20 @@ class WatchLinkService : Service() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        startWorker()
+        startForegroundSafely()
+        handler.post(statusTick)
+    }
 
+    /**
+     * Everything [onCreate] does except the Android service ceremony.
+     *
+     * Split out so a test can exercise the real session lifecycle -- real worker
+     * thread, real accumulator, real coalescer, real send path -- without needing
+     * foreground-service permissions, which have nothing to do with the logic that
+     * was broken.
+     */
+    private fun startWorker() {
         worker = HandlerThread("watch-link").apply { start() }
         handler = Handler(worker.looper)
 
@@ -161,9 +228,24 @@ class WatchLinkService : Service() {
             sendEvent(type, steps, timeMs)
         })
 
-        startForegroundSafely()
         handler.post { openSession() }
-        handler.post(statusTick)
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun startForTest() = startWorker()
+
+    @androidx.annotation.VisibleForTesting
+    internal fun stopForTest() {
+        handler.removeCallbacksAndMessages(null)
+        worker.quitSafely()
+    }
+
+    /** Forces a node re-resolution, bypassing the retry throttle. */
+    @androidx.annotation.VisibleForTesting
+    internal fun resolveForTest() {
+        lastResolveMs = 0L
+        resolveInFlight = false
+        handler.post { resolvePhoneNode() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -220,12 +302,36 @@ class WatchLinkService : Service() {
     private fun openSession() {
         sid = mintSid()
         synchronized(sendLock) { seq = 0 }
+        sessionOpenSent = false
+        lastFrameSentMs = 0L
         // Seed the status clock so the first seconds of a session read as SETUP or
         // UNPAIRED rather than as "Phone unreachable" before any frame can arrive.
         lastStatusMs = SystemClock.elapsedRealtime()
         resolvePhoneNode()
-        sendEvent(EventType.OPEN, 0, SystemClock.elapsedRealtime())
-        Log.i(TAG, "session open sid=${sid.toUInt()}")
+        // No send here. The node is not resolved yet on a fresh process, so a send
+        // now is discarded. [ensureSessionOpenLocked] emits the OPEN the moment
+        // there is somewhere to send it, ahead of the first real event.
+        Log.i(TAG, "session open sid=${sid.toUInt()} (OPEN pending node resolution)")
+    }
+
+    /**
+     * Emits OPEN if this session has not announced itself yet. Worker thread only.
+     *
+     * Called from [sendEvent] rather than only from the resolution callback so that
+     * OPEN is guaranteed to take a LOWER seq than the event that triggered it and to
+     * be handed to the radio first. Ordering matters more than it looks: the phone's
+     * relay drops anything at or behind what it already forwarded, so an ACTION that
+     * overtakes its OPEN does not merely arrive early -- it makes the phone discard
+     * the OPEN outright, and every subsequent action is then rejected for an unknown
+     * sid until the session expires.
+     */
+    private fun ensureSessionOpenLocked(node: String) {
+        if (sessionOpenSent) return
+        // Set BEFORE dispatching: dispatchEvent re-enters nothing, but leaving the
+        // flag false until after the send would let every event in a burst prepend
+        // its own OPEN and flood the phone's bounded relay queue.
+        sessionOpenSent = true
+        dispatchEvent(node, EventType.OPEN, 0, SystemClock.elapsedRealtime())
     }
 
     private fun closeSession() {
@@ -330,6 +436,29 @@ class WatchLinkService : Service() {
             resolvePhoneNode()
             return
         }
+        // The glasses drop a session that has been silent for SESSION_EXPIRY_MS, and
+        // they REJECT a PING for a sid they no longer hold -- a PING cannot
+        // resurrect anything. The idle PING backoff (30 s) is deliberately longer
+        // than that expiry (20 s), so an idle session is always already gone by the
+        // time the next keepalive goes out. Rather than shortening the backoff and
+        // paying for it on both batteries, notice the gap and re-announce: the
+        // glasses' resume path accepts an OPEN for the session already in progress
+        // and preserves its sequence high-water mark.
+        val now = SystemClock.elapsedRealtime()
+        if (sessionOpenSent &&
+            lastFrameSentMs != 0L &&
+            now - lastFrameSentMs >= RemoteInputProtocol.SESSION_EXPIRY_MS
+        ) {
+            Log.i(TAG, "re-opening sid=${sid.toUInt()} after ${now - lastFrameSentMs}ms silence")
+            sessionOpenSent = false
+        }
+        // Every session must announce itself before it can act. OPEN itself is
+        // exempt, or this would recurse.
+        if (type != EventType.OPEN) ensureSessionOpenLocked(node)
+        dispatchEvent(node, type, steps, timeMs)
+    }
+
+    private fun dispatchEvent(node: String, type: EventType, steps: Int, timeMs: Long) {
         if (hmacKey.isEmpty()) {
             Log.e(TAG, "no HMAC key configured; refusing to send unauthenticated input")
             return
@@ -360,6 +489,7 @@ class WatchLinkService : Service() {
             RemoteInputProtocol.PATH_EVENT
         }
         val handoffMs = SystemClock.elapsedRealtime()
+        lastFrameSentMs = handoffMs
         if (type == EventType.PING) {
             // Stamp only once the frame is genuinely on its way. Stamping before
             // the early returns above would arm the timer for a PING that was
@@ -367,6 +497,12 @@ class WatchLinkService : Service() {
             // huge round trip.
             lastPingSentMs = handoffMs
             lastPingSeq = sentSeq
+        }
+        val sink = testFrameSink
+        if (sink != null) {
+            sink(path, payload)
+            Log.i(TAG, "SENT type=$type sid=${sid.toUInt()} seq=${sentSeq.toUInt()} (test sink)")
+            return
         }
         messageClient.sendMessage(node, path, payload)
             .addOnSuccessListener {
@@ -387,6 +523,12 @@ class WatchLinkService : Service() {
                 // Input events are never retried: a retried SCROLL arrives stale
                 // and a retried SELECT could confirm something the user did not.
                 phoneNodeId = null
+                // The session is no longer established as far as we can tell -- and
+                // if the frame that failed WAS the OPEN, nothing else would ever
+                // re-send it. Marshalled onto the worker: this listener runs on the
+                // main thread, and a plain write here could clobber a concurrent
+                // worker-side write.
+                handler.post { sessionOpenSent = false }
             }
     }
 
@@ -408,6 +550,12 @@ class WatchLinkService : Service() {
         lastResolveMs = now
         resolveInFlight = true
 
+        val stub = testNodeResolver
+        if (stub != null) {
+            stub { nodeId -> onNodeResolved(nodeId) }
+            return
+        }
+
         com.google.android.gms.wearable.Wearable.getNodeClient(this).connectedNodes
             .addOnSuccessListener { nodes ->
                 Log.i(TAG, "connectedNodes=${nodes.size} " +
@@ -423,16 +571,44 @@ class WatchLinkService : Service() {
                     "capability nodes=${info.nodes.size} " +
                         info.nodes.joinToString { "${it.displayName}/${it.id}/nearby=${it.isNearby}" },
                 )
-                phoneNodeId = node?.id
-                if (node != null) everSawPhoneNode = true
-                resolveInFlight = false
-                handler.post { recomputeState() }
+                onNodeResolved(node?.id)
             }
             .addOnFailureListener { e ->
                 Log.w(TAG, "capability lookup failed: ${e.message}")
-                phoneNodeId = null
-                resolveInFlight = false
+                onNodeResolved(null)
             }
+    }
+
+    /**
+     * Single completion path for node resolution, however it was performed.
+     *
+     * This is where blocker A is actually closed: resolution is asynchronous, so the
+     * OPEN cannot be sent by [openSession] -- it has to be sent here, the first
+     * moment there is a node to send it to. Nothing else re-sent it, so before this
+     * existed every session was announced to nobody and the glasses rejected every
+     * action for a sid they had never seen an OPEN for.
+     *
+     * Callers run on the MAIN thread (GMS task listeners do). Session state is
+     * worker-confined, so every mutation is marshalled through [handler].
+     */
+    private fun onNodeResolved(nodeId: String?) {
+        phoneNodeId = nodeId
+        if (nodeId != null) everSawPhoneNode = true
+        resolveInFlight = false
+        handler.post {
+            val resolved = phoneNodeId
+            if (resolved != null) {
+                ensureSessionOpenLocked(resolved)
+            } else {
+                // Node lost. The next resolution must re-announce the session, or the
+                // glasses keep rejecting every action for a sid they never saw an
+                // OPEN for. Re-announcing is safe: the glasses treat an OPEN for the
+                // session already in progress as liveness and PRESERVE their own
+                // sequence high-water mark, so it can never rewind them.
+                sessionOpenSent = false
+            }
+            recomputeState()
+        }
     }
 
     /** Applies a status frame received from the phone. */

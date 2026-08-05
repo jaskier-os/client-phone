@@ -24,13 +24,23 @@ import java.util.concurrent.atomic.AtomicLong
  * outage would evict other features' queued frames.
  *
  * Differences from [GlassesRfcommClient]:
- *   - No inbound read loop (input is one-way).
  *   - send() DROPS when disconnected instead of queuing. Input is only meaningful
  *     while it is fresh; a queue would deliver a stale burst on reconnect and
  *     could never evict anything, because there is nothing to evict.
+ *
+ * The inbound direction carries ONLY the glasses' input back-channel
+ * (`CH_REMOTE_INPUT_SINK`, `CH_REMOTE_INPUT_STATUS`). It is parsed here, on this
+ * socket, because this is the socket the glasses publish it on -- the shared
+ * message socket has a parser but never receives these frames, so routing them
+ * there would mean the watch is told "glasses screen not active" forever even
+ * while scrolling works. Parsing it here rather than moving the publisher also
+ * keeps the signal on the same transport whose connect/disconnect edges trigger
+ * the glasses' re-announce, so the state and the link that carries it cannot
+ * disagree.
  */
 @SuppressLint("MissingPermission")
-class InputRfcommClient(private val context: Context) {
+class InputRfcommClient(private val context: Context) :
+    com.repository.listener.wear.WatchInputBridge.InputTransport {
 
     companion object {
         const val INPUT_UUID = "d4e5f6a7-b8c9-0123-def0-345678901234"
@@ -41,6 +51,12 @@ class InputRfcommClient(private val context: Context) {
          * BLE wake/page storm at the event rate.
          */
         private const val SELF_HEAL_THROTTLE_MS = 3000L
+
+        /**
+         * Inbound accumulation ceiling. The back-channel's largest legitimate frame
+         * is a few dozen bytes; this is generous slack, not a real size.
+         */
+        private const val MAX_INBOUND_BUFFER_BYTES = 4 * 1024
     }
 
     private val reconnectSignal = Semaphore(0)
@@ -50,7 +66,7 @@ class InputRfcommClient(private val context: Context) {
 
     /** Connect state. AtomicBoolean so exactly one racer wins the teardown. */
     private val connected = AtomicBoolean(false)
-    val isConnected: Boolean get() = connected.get()
+    override val isConnected: Boolean get() = connected.get()
 
     private val lastSelfHealMs = AtomicLong(0L)
 
@@ -62,7 +78,26 @@ class InputRfcommClient(private val context: Context) {
     private val writeLock = Any()
 
     /** Raised on a connect/disconnect edge so the bridge can push status. */
-    var onLinkStateChanged: ((Boolean) -> Unit)? = null
+    override var onLinkStateChanged: ((Boolean) -> Unit)? = null
+
+    /**
+     * Glasses -> phone sink state from `CH_REMOTE_INPUT_SINK`: whether a UI sink is
+     * attached and would actually act on an event.
+     *
+     * The single source of this fact on the phone. The shared control socket
+     * deliberately does NOT also handle this channel: two sources for one bit can
+     * disagree, and a status display that lies is worse than none.
+     */
+    var onSinkState: ((Boolean) -> Unit)? = null
+
+    /**
+     * Glasses -> phone router status from `CH_REMOTE_INPUT_STATUS`:
+     * (sessionOpen, sinkAttached, droppedTotal).
+     *
+     * Richer than [onSinkState] but reports the same `sinkAttached` bit, so the
+     * consumer must fold them into one value rather than tracking two.
+     */
+    var onRouterStatus: ((Boolean, Boolean, Long) -> Unit)? = null
 
     fun requestImmediateReconnect(reason: String) {
         log("input requestImmediateReconnect: $reason")
@@ -106,7 +141,7 @@ class InputRfcommClient(private val context: Context) {
      * surface it, rather than retrying: a retried scroll arrives stale and a
      * retried select could confirm something the user did not choose.
      */
-    fun send(channel: String, vararg args: String): Boolean {
+    override fun send(channel: String, vararg args: String): Boolean {
         if (!connected.get()) {
             maybeSelfHeal()
             return false
@@ -198,16 +233,91 @@ class InputRfcommClient(private val context: Context) {
         }
     }
 
-    /** Blocks until the socket dies. One-way link, so nothing is parsed. */
+    /**
+     * Reads the back-channel until the socket dies.
+     *
+     * Frames use the same length-prefixed format [buildFrame] writes, because the
+     * glasses' MessageRelay speaks one format in both directions.
+     */
     private fun waitUntilClosed(s: BluetoothSocket) {
         try {
             val input = s.inputStream
-            val scratch = ByteArray(64)
+            val chunk = ByteArray(1024)
+            val acc = java.io.ByteArrayOutputStream()
             while (shouldRun && connected.get()) {
-                if (input.read(scratch) < 0) break
+                val n = input.read(chunk)
+                if (n < 0) break
+                if (n == 0) continue
+                // Bounded independently of anything the peer claims: the largest
+                // legitimate inbound frame here is a few dozen bytes, and an
+                // unbounded accumulator is a peer-controlled allocation.
+                if (acc.size() + n > MAX_INBOUND_BUFFER_BYTES) {
+                    log("input rx buffer overflow; resetting")
+                    acc.reset()
+                }
+                acc.write(chunk, 0, n)
+                val consumed = drainFrames(acc.toByteArray())
+                if (consumed > 0) {
+                    val rest = acc.toByteArray()
+                    acc.reset()
+                    if (consumed < rest.size) acc.write(rest, consumed, rest.size - consumed)
+                }
             }
         } catch (e: Exception) {
             log("input socket closed: ${e.message}")
+        }
+    }
+
+    /** Parses whole frames out of [buf]; returns how many bytes were consumed. */
+    private fun drainFrames(buf: ByteArray): Int {
+        var offset = 0
+        while (buf.size - offset >= 4) {
+            val len = ByteBuffer.wrap(buf, offset, 4).int
+            if (len < 0 || len > MAX_INBOUND_BUFFER_BYTES) {
+                log("input rx invalid frame length=$len; dropping buffer")
+                return buf.size
+            }
+            if (buf.size - offset - 4 < len) break
+            try {
+                parseFrame(buf, offset + 4, len)
+            } catch (e: Exception) {
+                log("input rx frame parse failed: ${e.message}")
+            }
+            offset += 4 + len
+        }
+        return offset
+    }
+
+    private fun parseFrame(buf: ByteArray, start: Int, length: Int) {
+        var p = start
+        val end = start + length
+        val chanLen = buf[p].toInt() and 0xFF; p++
+        require(p + chanLen <= end) { "channel bytes overflow" }
+        val channel = String(buf, p, chanLen, Charsets.UTF_8); p += chanLen
+        val argCount = buf[p].toInt() and 0xFF; p++
+        val args = ArrayList<String>(argCount)
+        for (i in 0 until argCount) {
+            require(p + 4 <= end) { "arg length overflow" }
+            val argLen = ByteBuffer.wrap(buf, p, 4).int; p += 4
+            require(argLen >= 0 && p + argLen <= end) { "arg bytes overflow: len=$argLen" }
+            args.add(String(buf, p, argLen, Charsets.UTF_8)); p += argLen
+        }
+        when (channel) {
+            BtProtocol.CH_REMOTE_INPUT_SINK -> {
+                val attached = args.getOrNull(0) == "1"
+                log("input rx sink attached=$attached")
+                onSinkState?.invoke(attached)
+            }
+            BtProtocol.CH_REMOTE_INPUT_STATUS -> {
+                val sessionOpen = args.getOrNull(0) == "1"
+                val sinkAttached = args.getOrNull(1) == "1"
+                val dropped = args.getOrNull(2)?.toLongOrNull() ?: 0L
+                log("input rx status sessionOpen=$sessionOpen sink=$sinkAttached dropped=$dropped")
+                onRouterStatus?.invoke(sessionOpen, sinkAttached, dropped)
+            }
+            // Anything else on this socket is not ours. Ignored rather than logged
+            // per frame: a peer controls the rate and the log is on flash.
+            else -> Unit
         }
     }
 

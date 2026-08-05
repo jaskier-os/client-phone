@@ -3033,8 +3033,15 @@ class ListenerService : LifecycleService(),
             statusSender = { bits -> sendWatchStatus(bits) },
         )
         com.repository.listener.wear.WatchMessageListenerService.bridge = watchInputBridge
-        phoneBtHost.onRemoteInputSinkState = { attached ->
+        // The glasses' sink state arrives on the DEDICATED input socket, because that
+        // is the socket they publish it on. Both channels report the same
+        // `sinkAttached` bit and both feed the one setter, so the watch can never be
+        // shown two contradictory answers.
+        phoneBtHost.inputRfcommClient.onSinkState = { attached ->
             watchInputBridge?.setGlassesSinkAttached(attached)
+        }
+        phoneBtHost.inputRfcommClient.onRouterStatus = { _, sinkAttached, _ ->
+            watchInputBridge?.setGlassesSinkAttached(sinkAttached)
         }
         phoneBtHost.onGlassesCommandResult = { requestId, result ->
             onGlassesCommandResult(requestId, result)

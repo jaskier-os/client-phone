@@ -66,8 +66,10 @@ class PhoneBtHost(private val context: Context) {
      *  control socket so bulk frames cannot head-of-line-block input. */
     val inputRfcommClient = InputRfcommClient(context)
 
-    /** Glasses reported whether their remote-input sink is attached. */
-    var onRemoteInputSinkState: ((Boolean) -> Unit)? = null
+    // The remote-input sink state is NOT handled here. The glasses publish it on the
+    // dedicated input socket, so it is parsed by InputRfcommClient -- see
+    // InputRfcommClient.onSinkState. A second handler on this shared socket would be
+    // a competing source for the same bit that can never actually fire.
 
     /**
      * G3: persistent BLE wake link to glasses BleWakeService. Used to wake the
@@ -1034,8 +1036,6 @@ class PhoneBtHost(private val context: Context) {
                     when (cmd) {
                         BtProtocol.CH_STATUS -> handleStatusFromGlasses(args)
                         BtProtocol.CH_STATE_SNAPSHOT -> handleStateSnapshotFromGlasses(args)
-                        BtProtocol.CH_REMOTE_INPUT_SINK ->
-                            onRemoteInputSinkState?.invoke(args.at(0).getString() == "1")
                         BtProtocol.CH_COMMAND -> handleCommandFromGlasses(args)
                         BtProtocol.CH_HEALTH_PONG -> {
                             log("Health pong received")

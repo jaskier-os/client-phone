@@ -251,5 +251,16 @@ object BtProtocol {
     // watch's GLASSES_BUSY state, so the user is told "glasses screen not
     // active" instead of seeing a connected status while events are discarded.
     // Args: ["1" attached, "0" detached].
+    //
+    // Received on the DEDICATED input socket (InputRfcommClient), which is the socket
+    // the glasses publish it on -- NOT on the shared control socket.
     const val CH_REMOTE_INPUT_SINK = "listener_remote_input_sink"
+
+    // Glasses -> phone, same dedicated input socket: the router's own account of why
+    // input may be going nowhere.
+    // Args: [sessionOpen, sinkAttached, droppedTotal] -- "1"/"0" for the flags,
+    // decimal for the counter. `sinkAttached` reports the SAME bit as
+    // CH_REMOTE_INPUT_SINK, so consumers must fold the two into one value rather
+    // than tracking two that can disagree.
+    const val CH_REMOTE_INPUT_STATUS = "listener_remote_input_status"
 }

@@ -28,9 +28,23 @@ import com.repository.listener.protocol.RemoteInputProtocol.StatusFlags
  * immediately, so a slow RFCOMM write can never block a GMS Binder thread.
  */
 class WatchInputBridge(
-    private val inputClient: InputRfcommClient,
+    private val inputClient: InputTransport,
     private val statusSender: (ByteArray) -> Unit,
 ) {
+
+    /**
+     * The slice of [InputRfcommClient] this bridge uses.
+     *
+     * Extracted so the bridge's session and ordering rules can be exercised against
+     * a recording double on the JVM. The previous tests all built their own routers
+     * and fake sources, so they ran green while every real session was being dropped
+     * here -- the guard itself was never the thing under test.
+     */
+    interface InputTransport {
+        val isConnected: Boolean
+        fun send(channel: String, vararg args: String): Boolean
+        var onLinkStateChanged: ((Boolean) -> Unit)?
+    }
 
     companion object {
         private const val TAG = "WatchInputBridge"
@@ -51,8 +65,22 @@ class WatchInputBridge(
     private val worker = HandlerThread("watch-input-bridge").apply { start() }
     private val handler = Handler(worker.looper)
 
-    /** Last sequence number actually forwarded, for the reorder guard. */
+    /**
+     * Reorder guard state: the last (sid, seq) actually forwarded.
+     *
+     * The sid is part of the key, not decoration. `seq` restarts at 1 for every new
+     * session while this bridge outlives all of them -- it is constructed once by
+     * ListenerService -- so a guard on `seq` alone judges every new session's first
+     * frames against the PREVIOUS session's high-water mark and drops the entire
+     * session. That is a liveness bug, not a security one: the phone holds no HMAC
+     * key and forwards unverified, so the authoritative replay defence is the
+     * glasses' persisted monotonic-sid store. This guard exists only to stop a
+     * later frame from overtaking an earlier one WITHIN a session.
+     *
+     * Worker-thread confined: written only in [forward], which runs on [handler].
+     */
     private var lastForwarded = 0
+    private var lastForwardedSid = 0
     private var haveForwarded = false
 
     /** Depth of the worker queue, so a blocked write cannot grow it unboundedly. */
@@ -100,14 +128,35 @@ class WatchInputBridge(
     }
 
     private fun forward(event: RemoteInputEvent, tagHex: String) {
-        // Reorder guard. MessageClient is reliable but NOT order-guaranteed, so a
-        // SELECT can overtake the SCROLL that preceded it. Forwarding the newer
-        // one first would make the glasses drop the older as a duplicate, losing
-        // it permanently. Anything at or behind what we already forwarded is a
-        // duplicate or a late arrival and must not rewind the stream.
-        if (haveForwarded && RemoteInputProtocol.seqDifference(event.seq, lastForwarded) <= 0) {
-            Log.d(TAG, "dropping stale seq=${event.seqUnsigned} last=${lastForwarded.toUInt()}")
-            return
+        // Reorder guard, keyed on (sid, seq). MessageClient is reliable but NOT
+        // order-guaranteed, so a SELECT can overtake the SCROLL that preceded it.
+        // Forwarding the newer one first would make the glasses drop the older as a
+        // duplicate, losing it permanently.
+        //
+        // OPEN is exempt. It is what establishes the session on the glasses, and the
+        // glasses adopt no session implicitly. If a SCROLL overtook its OPEN, a
+        // seq-only guard would forward the SCROLL, raise the water mark past the
+        // OPEN, and then discard the OPEN -- after which every action of that
+        // session is rejected for an unknown sid, permanently. A duplicate OPEN
+        // costs nothing: the glasses treat an OPEN for the session already in
+        // progress as liveness and preserve their own sequence floor.
+        if (haveForwarded && event.type != RemoteInputProtocol.EventType.OPEN) {
+            // Wrap-safe on both axes: sid and seq are uint32 in an Int, and a plain
+            // comparison locks the source out forever past 2^31.
+            val sidDiff = RemoteInputProtocol.seqDifference(event.sid, lastForwardedSid)
+            if (sidDiff < 0) {
+                Log.d(TAG, "dropping old session sid=${event.sidUnsigned} last=${lastForwardedSid.toUInt()}")
+                return
+            }
+            // sidDiff > 0 is a NEW session: its seq legitimately restarts, so the
+            // previous session's water mark says nothing about it and is discarded.
+            // Only within one session (sidDiff == 0) does seq ordering mean anything.
+            if (sidDiff == 0 &&
+                RemoteInputProtocol.seqDifference(event.seq, lastForwarded) <= 0
+            ) {
+                Log.d(TAG, "dropping stale seq=${event.seqUnsigned} last=${lastForwarded.toUInt()}")
+                return
+            }
         }
 
         if (!inputClient.isConnected) {
@@ -131,7 +180,18 @@ class WatchInputBridge(
             return
         }
 
-        lastForwarded = event.seq
+        // Never let an out-of-order OPEN rewind the water mark of a session already
+        // in flight; it is exempt from the guard, not licensed to reset it.
+        if (!haveForwarded ||
+            RemoteInputProtocol.seqDifference(event.sid, lastForwardedSid) > 0
+        ) {
+            lastForwardedSid = event.sid
+            lastForwarded = event.seq
+        } else if (event.sid == lastForwardedSid &&
+            RemoteInputProtocol.seqDifference(event.seq, lastForwarded) > 0
+        ) {
+            lastForwarded = event.seq
+        }
         haveForwarded = true
         lastSendDropped = false
         // Log the successful forward too. Only logging failures makes a healthy
