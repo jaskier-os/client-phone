@@ -47,12 +47,21 @@ object ComplicationCopy {
     fun shortText(state: LinkState): String = when (state) {
         LinkState.SETUP -> "Pair"
         LinkState.UNPAIRED -> "No app"
-        LinkState.PHONE_STOPPED -> "Stopped"
+        LinkState.PHONE_STOPPED -> "No svc"
         LinkState.BT_OFF -> "BT off"
         LinkState.WAKING -> "Waking"
         LinkState.PHONE_ONLY -> "No AR"
-        LinkState.GLASSES_BUSY -> "AR idle"
-        LinkState.DEGRADED -> "Drops"
+        LinkState.GLASSES_BUSY -> "AR busy"
+        LinkState.DEGRADED -> "Losing"
+        // Each refusal keeps its own word even at a seven-glyph budget. Collapsing
+        // them to a shared "Refused" was tried and is wrong: the complication is
+        // the surface the user reads WITHOUT opening the app, so it is the one
+        // place the reason matters most, and three states rendering identically
+        // is the same indistinguishability the refusal signal exists to remove.
+        LinkState.REFUSED_HERE -> "Blocked"
+        LinkState.REFUSED_FOLDED -> "Folded"
+        LinkState.REFUSED_LOCKED -> "In use"
+        LinkState.REFUSED -> "Refused"
         LinkState.READY -> "Ready"
         LinkState.UNREACHABLE -> "No link"
     }
@@ -61,19 +70,28 @@ object ComplicationCopy {
      * The fuller phrasing for a LONG_TEXT slot. Never longer than
      * [LONG_TEXT_MAX], never empty.
      *
-     * [LinkState.label] is authored for the full-screen activity and overruns a
-     * complication slot, so the long copy is a separate, shorter authoring of the
-     * same meaning rather than a truncation of it.
+     * [LinkState.title] is the on-screen glance line and some titles still overrun
+     * a complication slot, so the long copy is a separate authoring of the same
+     * meaning rather than a truncation of it. It must never CONTRADICT the title:
+     * the complication and the app describing one state as two different things
+     * is worse than either wording alone.
      */
     fun longText(state: LinkState): String = when (state) {
-        LinkState.SETUP -> "Open the phone app"
-        LinkState.UNPAIRED -> "Phone app not found"
-        LinkState.PHONE_STOPPED -> "Phone app stopped"
+        LinkState.SETUP -> "Not paired yet"
+        LinkState.UNPAIRED -> "No phone app"
+        LinkState.PHONE_STOPPED -> "Phone service down"
         LinkState.BT_OFF -> "Bluetooth is off"
         LinkState.WAKING -> "Waking glasses"
         LinkState.PHONE_ONLY -> "Glasses offline"
-        LinkState.GLASSES_BUSY -> "Glasses not active"
-        LinkState.DEGRADED -> "Dropping input"
+        LinkState.GLASSES_BUSY -> "Glasses busy"
+        LinkState.DEGRADED -> "Losing input"
+        LinkState.REFUSED_HERE -> "Not allowed here"
+        LinkState.REFUSED_FOLDED -> "Glasses folded"
+        // Not "Glasses busy": GLASSES_BUSY already owns that phrasing and the two
+        // are different problems -- that one is a display that is not listening,
+        // this one is a display doing something the user must finish.
+        LinkState.REFUSED_LOCKED -> "Glasses in use"
+        LinkState.REFUSED -> "Input declined"
         LinkState.READY -> "Glasses connected"
         LinkState.UNREACHABLE -> "Phone unreachable"
     }
@@ -83,7 +101,7 @@ object ComplicationCopy {
      * a full sentence: it has no layout budget.
      */
     fun contentDescription(state: LinkState): String =
-        "Glasses Remote: ${state.label}"
+        "Glasses Remote: ${state.title}. ${state.hint}"
 
     /**
      * Link health as a 0..[HEALTH_MAX] rank for a RANGED_VALUE slot.
@@ -106,6 +124,14 @@ object ComplicationCopy {
         LinkState.WAKING,
         LinkState.GLASSES_BUSY,
         LinkState.DEGRADED,
+        // Rank 2, not 3. The whole chain IS up for a refusal, so by pure link
+        // health these would sit alongside READY -- but the arc is read as "can I
+        // use this right now", and a full arc while every tap is being declined
+        // is exactly the false reassurance the refusal signal exists to end.
+        LinkState.REFUSED_HERE,
+        LinkState.REFUSED_FOLDED,
+        LinkState.REFUSED_LOCKED,
+        LinkState.REFUSED,
         -> 2f
 
         LinkState.READY -> 3f

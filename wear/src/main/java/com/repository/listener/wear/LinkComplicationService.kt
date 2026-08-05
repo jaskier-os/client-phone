@@ -45,10 +45,34 @@ class LinkComplicationService : SuspendingComplicationDataSourceService() {
          */
         private const val MIN_PUSH_INTERVAL_MS = 30_000L
 
+        /**
+         * The floor applied when the link LOSES capability.
+         *
+         * The two directions are not symmetric in how much harm staleness does.
+         * The complication is the only always-visible surface this app owns, so a
+         * stale "Ready" is an active lie -- the user reads it, taps, and nothing
+         * happens -- while a stale "Glasses offline" merely under-promises and
+         * costs them a glance at the app. Holding a degradation back for the full
+         * 30 s is therefore the one case worth spending budget to avoid, and it
+         * is also the rarer event: capability is lost once per outage, not
+         * continuously.
+         *
+         * Still non-zero, so a flapping link cannot turn this into an unlimited
+         * push rate and get the data source throttled.
+         */
+        private const val DEGRADE_PUSH_INTERVAL_MS = 5_000L
+
         private val pushHandler = Handler(Looper.getMainLooper())
 
         @Volatile
         private var lastPushMs = 0L
+
+        /**
+         * Health rank at the last push, so the direction of a change is known.
+         * -1 means nothing has been pushed yet.
+         */
+        @Volatile
+        private var lastPushedRank = -1f
 
         @Volatile
         private var pushScheduled = false
@@ -68,24 +92,38 @@ class LinkComplicationService : SuspendingComplicationDataSourceService() {
             val now = SystemClock.elapsedRealtime()
             val since = now - lastPushMs
 
-            if (since >= MIN_PUSH_INTERVAL_MS) {
+            // A loss of capability gets the short floor; everything else gets the
+            // full budget-preserving one. See DEGRADE_PUSH_INTERVAL_MS.
+            val rank = WatchLinkService.current()?.let { ComplicationCopy.healthRank(it.state) }
+            val degrading = rank != null && lastPushedRank >= 0f && rank < lastPushedRank
+            val interval = if (degrading) DEGRADE_PUSH_INTERVAL_MS else MIN_PUSH_INTERVAL_MS
+
+            if (since >= interval) {
                 lastPushMs = now
+                if (rank != null) lastPushedRank = rank
                 push(app)
                 return
             }
 
             // A push is already queued; it will pick up whatever the state is when
-            // it fires, so there is nothing to add.
-            if (pushScheduled) return
+            // it fires, so there is nothing to add -- UNLESS this change is a
+            // degradation and the queued push is sitting on the long interval, in
+            // which case it would hold a misleading "healthy" reading for up to
+            // 30 s. Re-arm it on the short floor instead.
+            if (pushScheduled && !degrading) return
 
+            if (pushScheduled) pushHandler.removeCallbacksAndMessages(null)
             pushScheduled = true
             pushHandler.postDelayed(
                 {
                     pushScheduled = false
                     lastPushMs = SystemClock.elapsedRealtime()
+                    WatchLinkService.current()?.let {
+                        lastPushedRank = ComplicationCopy.healthRank(it.state)
+                    }
                     push(app)
                 },
-                MIN_PUSH_INTERVAL_MS - since,
+                (interval - since).coerceAtLeast(0L),
             )
         }
 
