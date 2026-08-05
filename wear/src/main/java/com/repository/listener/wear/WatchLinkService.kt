@@ -309,7 +309,7 @@ class WatchLinkService : Service() {
         lastStatusMs = SystemClock.elapsedRealtime()
         resolvePhoneNode()
         // No send here. The node is not resolved yet on a fresh process, so a send
-        // now is discarded. [ensureSessionOpenLocked] emits the OPEN the moment
+        // now is discarded. [ensureSessionOpen] emits the OPEN the moment
         // there is somewhere to send it, ahead of the first real event.
         Log.i(TAG, "session open sid=${sid.toUInt()} (OPEN pending node resolution)")
     }
@@ -325,13 +325,17 @@ class WatchLinkService : Service() {
      * the OPEN outright, and every subsequent action is then rejected for an unknown
      * sid until the session expires.
      */
-    private fun ensureSessionOpenLocked(node: String) {
+    private fun ensureSessionOpen(node: String) {
         if (sessionOpenSent) return
-        // Set BEFORE dispatching: dispatchEvent re-enters nothing, but leaving the
-        // flag false until after the send would let every event in a burst prepend
-        // its own OPEN and flood the phone's bounded relay queue.
-        sessionOpenSent = true
-        dispatchEvent(node, EventType.OPEN, 0, SystemClock.elapsedRealtime())
+        // Latched only on a dispatch that actually happened. Setting it up front
+        // would bound an OPEN storm, but it would also mean a dispatch refused for
+        // a local reason -- an absent HMAC key, an unencodable event -- left the
+        // session marked announced forever with nothing on the wire, which is the
+        // same permanently dead session this whole fix exists to prevent. The storm
+        // is bounded instead by the fact that this runs on the single worker thread:
+        // the OPEN is dispatched before the caller's own frame, so the flag is
+        // already true for every later event in the burst.
+        sessionOpenSent = dispatchEvent(node, EventType.OPEN, 0, SystemClock.elapsedRealtime())
     }
 
     private fun closeSession() {
@@ -454,14 +458,15 @@ class WatchLinkService : Service() {
         }
         // Every session must announce itself before it can act. OPEN itself is
         // exempt, or this would recurse.
-        if (type != EventType.OPEN) ensureSessionOpenLocked(node)
+        if (type != EventType.OPEN) ensureSessionOpen(node)
         dispatchEvent(node, type, steps, timeMs)
     }
 
-    private fun dispatchEvent(node: String, type: EventType, steps: Int, timeMs: Long) {
+    /** @return true if the frame was genuinely handed onward. */
+    private fun dispatchEvent(node: String, type: EventType, steps: Int, timeMs: Long): Boolean {
         if (hmacKey.isEmpty()) {
             Log.e(TAG, "no HMAC key configured; refusing to send unauthenticated input")
-            return
+            return false
         }
 
         val payload: ByteArray
@@ -479,7 +484,7 @@ class WatchLinkService : Service() {
                 RemoteInputProtocol.encodeEvent(hmacKey, event)
             } catch (e: IllegalArgumentException) {
                 Log.e(TAG, "refusing to encode malformed event: ${e.message}")
-                return
+                return false
             }
         }
 
@@ -502,7 +507,7 @@ class WatchLinkService : Service() {
         if (sink != null) {
             sink(path, payload)
             Log.i(TAG, "SENT type=$type sid=${sid.toUInt()} seq=${sentSeq.toUInt()} (test sink)")
-            return
+            return true
         }
         messageClient.sendMessage(node, path, payload)
             .addOnSuccessListener {
@@ -530,6 +535,7 @@ class WatchLinkService : Service() {
                 // worker-side write.
                 handler.post { sessionOpenSent = false }
             }
+        return true
     }
 
     // ---- Node resolution & status ----
@@ -598,7 +604,7 @@ class WatchLinkService : Service() {
         handler.post {
             val resolved = phoneNodeId
             if (resolved != null) {
-                ensureSessionOpenLocked(resolved)
+                ensureSessionOpen(resolved)
             } else {
                 // Node lost. The next resolution must re-announce the session, or the
                 // glasses keep rejecting every action for a sid they never saw an

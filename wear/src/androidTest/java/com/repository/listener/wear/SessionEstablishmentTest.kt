@@ -59,11 +59,34 @@ class SessionEstablishmentTest {
      * permissions to satisfy. The session logic under test lives entirely on the
      * worker thread, which [startForTest] brings up exactly as `onCreate` does.
      */
+    /**
+     * A [WatchLinkService] with a real base Context attached.
+     *
+     * Constructing the class alone is not enough: `mintSid` reads SharedPreferences
+     * and `recomputeState` touches the complication, both of which go through
+     * ContextWrapper and would NPE on the worker thread -- killing the process
+     * rather than failing a test. `attachBaseContext` is the documented way to give
+     * a Service its Context without the service lifecycle, which is exactly the
+     * split wanted here: real session logic, no foreground-service ceremony.
+     */
+    private fun newBareService(): WatchLinkService {
+        val service = WatchLinkService()
+        val method = android.content.ContextWrapper::class.java
+            .getDeclaredMethod("attachBaseContext", android.content.Context::class.java)
+        method.isAccessible = true
+        method.invoke(
+            service,
+            androidx.test.platform.app.InstrumentationRegistry
+                .getInstrumentation().targetContext,
+        )
+        return service
+    }
+
     private fun newService(
         resolveTo: String?,
         resolveDelayMs: Long = 40L,
     ): WatchLinkService {
-        val service = WatchLinkService()
+        val service = newBareService()
         service.testFrameSink = { path, payload -> sent += SentFrame(path, payload) }
         // Asynchronous BY CONSTRUCTION, and delivered on another thread, because
         // that is the shape the defect lived in. A synchronous stub here would make
@@ -102,9 +125,16 @@ class SessionEstablishmentTest {
     fun openIsSentOnceTheNodeResolvesEvenThoughItWasUnknownAtSessionStart() {
         val service = newService(resolveTo = "phone-node-1")
         try {
-            // The user scrolls immediately, while resolution is still in flight --
-            // the exact ordering that produced the shipped failure.
-            service.onRotaryDelta(1.0f, SystemClock.elapsedRealtime())
+            // A real bezel turn: detents keep coming while node resolution is still
+            // in flight. That overlap is the exact ordering that produced the
+            // shipped failure. Detents produced strictly BEFORE the node exists are
+            // legitimately lost -- input is never queued, because a queued scroll
+            // lands stale -- so what must be proven is that the session establishes
+            // and the detents that follow are carried, not that the earliest one is.
+            repeat(20) {
+                service.onRotaryDelta(1.0f, SystemClock.elapsedRealtime())
+                Thread.sleep(25)
+            }
 
             assertTrue(
                 "no OPEN was ever transmitted; sent=$sent",
@@ -144,7 +174,7 @@ class SessionEstablishmentTest {
      */
     @Test
     fun sessionIsReannouncedAfterNodeLoss() {
-        val service = WatchLinkService()
+        val service = newBareService()
         service.testFrameSink = { path, payload -> sent += SentFrame(path, payload) }
         // AtomicReference, not a captured var: the resolver runs on its own thread
         // and the test mutates this from the test thread.

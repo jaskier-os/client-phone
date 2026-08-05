@@ -51,12 +51,6 @@ class InputRfcommClient(private val context: Context) :
          * BLE wake/page storm at the event rate.
          */
         private const val SELF_HEAL_THROTTLE_MS = 3000L
-
-        /**
-         * Inbound accumulation ceiling. The back-channel's largest legitimate frame
-         * is a few dozen bytes; this is generous slack, not a real size.
-         */
-        private const val MAX_INBOUND_BUFFER_BYTES = 4 * 1024
     }
 
     private val reconnectSignal = Semaphore(0)
@@ -240,84 +234,49 @@ class InputRfcommClient(private val context: Context) :
      * glasses' MessageRelay speaks one format in both directions.
      */
     private fun waitUntilClosed(s: BluetoothSocket) {
+        val parser = InputBackChannelParser(log = { log(it) }) { channel, args ->
+            dispatchBackChannel(channel, args)
+        }
         try {
             val input = s.inputStream
             val chunk = ByteArray(1024)
-            val acc = java.io.ByteArrayOutputStream()
             while (shouldRun && connected.get()) {
                 val n = input.read(chunk)
                 if (n < 0) break
-                if (n == 0) continue
-                // Bounded independently of anything the peer claims: the largest
-                // legitimate inbound frame here is a few dozen bytes, and an
-                // unbounded accumulator is a peer-controlled allocation.
-                if (acc.size() + n > MAX_INBOUND_BUFFER_BYTES) {
-                    log("input rx buffer overflow; resetting")
-                    acc.reset()
-                }
-                acc.write(chunk, 0, n)
-                val consumed = drainFrames(acc.toByteArray())
-                if (consumed > 0) {
-                    val rest = acc.toByteArray()
-                    acc.reset()
-                    if (consumed < rest.size) acc.write(rest, consumed, rest.size - consumed)
-                }
+                parser.onBytes(chunk, n)
             }
         } catch (e: Exception) {
             log("input socket closed: ${e.message}")
         }
     }
 
-    /** Parses whole frames out of [buf]; returns how many bytes were consumed. */
-    private fun drainFrames(buf: ByteArray): Int {
-        var offset = 0
-        while (buf.size - offset >= 4) {
-            val len = ByteBuffer.wrap(buf, offset, 4).int
-            if (len < 0 || len > MAX_INBOUND_BUFFER_BYTES) {
-                log("input rx invalid frame length=$len; dropping buffer")
-                return buf.size
+    /**
+     * Applies one decoded back-channel frame.
+     *
+     * Callbacks are invoked inside the socket read loop, so a throw here would kill
+     * the loop and silently end the back channel. Guarded.
+     */
+    private fun dispatchBackChannel(channel: String, args: List<String>) {
+        try {
+            when (channel) {
+                BtProtocol.CH_REMOTE_INPUT_SINK -> {
+                    val attached = args.getOrNull(0) == "1"
+                    log("input rx sink attached=$attached")
+                    onSinkState?.invoke(attached)
+                }
+                BtProtocol.CH_REMOTE_INPUT_STATUS -> {
+                    val sessionOpen = args.getOrNull(0) == "1"
+                    val sinkAttached = args.getOrNull(1) == "1"
+                    val dropped = args.getOrNull(2)?.toLongOrNull() ?: 0L
+                    log("input rx status sessionOpen=$sessionOpen sink=$sinkAttached dropped=$dropped")
+                    onRouterStatus?.invoke(sessionOpen, sinkAttached, dropped)
+                }
+                // Anything else on this socket is not ours. Ignored rather than
+                // logged per frame: a peer controls the rate and the log is on flash.
+                else -> Unit
             }
-            if (buf.size - offset - 4 < len) break
-            try {
-                parseFrame(buf, offset + 4, len)
-            } catch (e: Exception) {
-                log("input rx frame parse failed: ${e.message}")
-            }
-            offset += 4 + len
-        }
-        return offset
-    }
-
-    private fun parseFrame(buf: ByteArray, start: Int, length: Int) {
-        var p = start
-        val end = start + length
-        val chanLen = buf[p].toInt() and 0xFF; p++
-        require(p + chanLen <= end) { "channel bytes overflow" }
-        val channel = String(buf, p, chanLen, Charsets.UTF_8); p += chanLen
-        val argCount = buf[p].toInt() and 0xFF; p++
-        val args = ArrayList<String>(argCount)
-        for (i in 0 until argCount) {
-            require(p + 4 <= end) { "arg length overflow" }
-            val argLen = ByteBuffer.wrap(buf, p, 4).int; p += 4
-            require(argLen >= 0 && p + argLen <= end) { "arg bytes overflow: len=$argLen" }
-            args.add(String(buf, p, argLen, Charsets.UTF_8)); p += argLen
-        }
-        when (channel) {
-            BtProtocol.CH_REMOTE_INPUT_SINK -> {
-                val attached = args.getOrNull(0) == "1"
-                log("input rx sink attached=$attached")
-                onSinkState?.invoke(attached)
-            }
-            BtProtocol.CH_REMOTE_INPUT_STATUS -> {
-                val sessionOpen = args.getOrNull(0) == "1"
-                val sinkAttached = args.getOrNull(1) == "1"
-                val dropped = args.getOrNull(2)?.toLongOrNull() ?: 0L
-                log("input rx status sessionOpen=$sessionOpen sink=$sinkAttached dropped=$dropped")
-                onRouterStatus?.invoke(sessionOpen, sinkAttached, dropped)
-            }
-            // Anything else on this socket is not ours. Ignored rather than logged
-            // per frame: a peer controls the rate and the log is on flash.
-            else -> Unit
+        } catch (e: Exception) {
+            log("input rx dispatch failed: ${e.message}")
         }
     }
 

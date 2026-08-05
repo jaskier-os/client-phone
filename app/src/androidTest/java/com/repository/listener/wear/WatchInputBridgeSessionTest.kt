@@ -4,6 +4,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.repository.listener.bt.BtProtocol
 import com.repository.listener.protocol.RemoteInputProtocol
 import com.repository.listener.protocol.RemoteInputProtocol.EventType
+import com.google.android.gms.wearable.MessageEvent
 import com.repository.listener.protocol.RemoteInputProtocol.RemoteInputEvent
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -232,21 +233,54 @@ class WatchInputBridgeSessionTest {
      * they just dropped, so a keepalive the phone swallows keeps nothing alive. The
      * shipped code answered the watch and returned, which made every session die
      * 20 s after it opened even once its OPEN was delivered.
+     *
+     * Driven through the REAL [WatchMessageListenerService.onMessageReceived],
+     * because that is the file that decides this. Feeding PING straight into
+     * `bridge.onEvent` would assert nothing: it would stay green with the old
+     * `when { PING -> onPing; else -> onEvent }` restored, i.e. the regression test
+     * would not test the regression.
      */
     @Test
-    fun pingIsForwardedToTheGlassesAndNotOnlyAnswered() {
+    fun pingIsBothAnsweredAndForwardedByTheListenerService() {
         bridge = newBridge()
+        WatchMessageListenerService.bridge = bridge
+        try {
+            val listener = WatchMessageListenerService()
 
-        feed(sid = 70, seq = 1, type = EventType.OPEN)
-        feed(sid = 70, seq = 2, type = EventType.PING)
-        drain()
+            val open = RemoteInputEvent(sid = 70, seq = 1, type = EventType.OPEN, steps = 0, wms = 1)
+            listener.onMessageReceived(
+                messageEvent(RemoteInputProtocol.PATH_OPEN, RemoteInputProtocol.encodeEvent(key, open)),
+            )
+            val ping = RemoteInputEvent(sid = 70, seq = 2, type = EventType.PING, steps = 0, wms = 2)
+            synchronized(statuses) { statuses.clear() }
+            listener.onMessageReceived(
+                messageEvent(RemoteInputProtocol.PATH_EVENT, RemoteInputProtocol.encodeEvent(key, ping)),
+            )
+            drain()
 
-        assertTrue(
-            "PING must be relayed so the glasses' session does not expire; got " +
-                transport.forwarded(),
-            transport.forwarded().contains(Triple("70", "2", "PING")),
-        )
+            assertTrue(
+                "PING must be relayed so the glasses' session does not expire; got " +
+                    transport.forwarded(),
+                transport.forwarded().contains(Triple("70", "2", "PING")),
+            )
+            assertTrue(
+                "the watch must still get its correlated status reply, or its RTT " +
+                    "measurement and link display break",
+                synchronized(statuses) { statuses.any { it.size > 1 } },
+            )
+        } finally {
+            WatchMessageListenerService.bridge = null
+        }
     }
+
+    /** A minimal real [MessageEvent]; GMS ships it as an interface. */
+    private fun messageEvent(path: String, payload: ByteArray): MessageEvent =
+        object : MessageEvent {
+            override fun getRequestId(): Int = 1
+            override fun getPath(): String = path
+            override fun getData(): ByteArray = payload
+            override fun getSourceNodeId(): String = "test-node"
+        }
 
     /**
      * The forwarded args must be the watch's own, byte for byte.
