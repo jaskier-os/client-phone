@@ -86,7 +86,7 @@ class WatchMessageListenerService : WearableListenerService() {
             )
 
             when (decoded.event.type) {
-                EventType.PING -> target.onPing()
+                EventType.PING -> target.onPing(decoded.event.seq)
                 else -> target.onEvent(decoded.event, tagHex)
             }
         } catch (e: RemoteInputProtocol.MalformedFrameException) {

@@ -60,11 +60,22 @@ class RemoteInputGoldenVectorsTest {
      */
     private fun goldenLines(): List<String> {
         if (!GOLDEN_FILE.exists()) {
+            if (!regenerateRequested()) {
+                throw AssertionError(
+                    "golden-vectors-v1.ndjson is missing. It is the cross-repo drift " +
+                        "guard and must be checked in. Silently regenerating it would " +
+                        "let the suite pass green with no cross-repo assurance at all. " +
+                        "Re-create deliberately with -Dgolden.regenerate=true.",
+                )
+            }
             GOLDEN_FILE.parentFile.mkdirs()
             GOLDEN_FILE.writeText(generate())
         }
         return GOLDEN_FILE.readLines()
     }
+
+    private fun regenerateRequested(): Boolean =
+        System.getProperty("golden.regenerate") == "true"
 
     // ---- Vector definitions ----
 
@@ -223,6 +234,12 @@ class RemoteInputGoldenVectorsTest {
     fun goldenVectorsAreStable() {
         val generated = generate()
         if (!GOLDEN_FILE.exists()) {
+            if (!regenerateRequested()) {
+                throw AssertionError(
+                    "golden-vectors-v1.ndjson is missing; refusing to regenerate " +
+                        "silently. Pass -Dgolden.regenerate=true to re-create it.",
+                )
+            }
             GOLDEN_FILE.parentFile.mkdirs()
             GOLDEN_FILE.writeText(generated)
             println("Generated golden vectors at ${GOLDEN_FILE.absolutePath}")
@@ -303,12 +320,21 @@ class RemoteInputGoldenVectorsTest {
     /** The cap magnitudes a stale receiver would wrongly accept must be present. */
     @Test
     fun rejectVectorsCoverTheSupersededCapValues() {
-        val text = goldenLines().joinToString("\n")
-        for (stale in listOf("abs(steps)=9", "abs(steps)=16")) {
+        // Couple to the structured rule + the actual encoded steps byte, not the
+        // human-readable reason string, so rewording a message cannot silently
+        // drop the coverage this asserts.
+        val stepsOutOfRange = goldenLines()
+            .filter { it.contains(""""rule":"steps_out_of_range"""") }
+            .mapNotNull { field(it, "payloadHex") }
+            .mapNotNull { hex -> RemoteInputProtocol.parseHexOrNull(hex, hex.length / 2) }
+            .map { it[1].toInt() }
+            .toSet()
+        for (stale in listOf(9, 16, -9, -16)) {
             assertTrue(
-                "the file must carry a reject vector for $stale, or a receiver " +
-                    "still using the superseded cap of 16 would pass the whole set",
-                text.contains(stale),
+                "the file must carry a steps_out_of_range vector with steps=$stale, " +
+                    "or a receiver still using the superseded cap of 16 would pass " +
+                    "the entire set",
+                stale in stepsOutOfRange,
             )
         }
     }

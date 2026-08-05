@@ -109,7 +109,9 @@ class BoundaryValueTest {
 
     @Test
     fun statusFrameRejectsEmptyAndOversized() {
-        for (n in listOf(0, 2, 8)) {
+        // 5 bytes is the legal correlated form (1 bitfield + 4 reply seq); only an
+        // empty payload is structurally invalid.
+        for (n in listOf(0)) {
             try {
                 RemoteInputProtocol.StatusFlags.decode(ByteArray(n))
                 throw AssertionError("expected rejection for a $n-byte status frame")

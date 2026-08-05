@@ -147,17 +147,20 @@ class WatchInputBridge(
         pushStatus(force = true)
     }
 
-    /** Replies to a watch PING with the current status. */
-    fun onPing() {
-        pushStatus(force = true)
+    /**
+     * Replies to a watch PING, echoing its seq so the watch can distinguish a
+     * genuine reply from an unsolicited push and time only the former.
+     */
+    fun onPing(pingSeq: Int) {
+        pushStatus(force = true, replyToSeq = pingSeq)
     }
 
-    private fun pushStatus(force: Boolean) {
+    private fun pushStatus(force: Boolean, replyToSeq: Int? = null) {
         // Always evaluate on the worker: pushStatus is also called from the RFCOMM
         // connect thread via the link-state callback, which would otherwise race
         // lastStatusPushMs and the flag reads.
         if (Thread.currentThread() != worker) {
-            handler.post { pushStatus(force) }
+            handler.post { pushStatus(force, replyToSeq) }
             return
         }
         val now = SystemClock.elapsedRealtime()
@@ -173,8 +176,13 @@ class WatchInputBridge(
             glassesSinkAttached = glassesSinkAttached,
             wakingGlasses = wakingGlasses,
         )
+        val frame = if (replyToSeq != null) {
+            StatusFlags.encodeWithReplyTo(bits, replyToSeq)
+        } else {
+            bits
+        }
         try {
-            statusSender(bits)
+            statusSender(frame)
         } catch (e: Exception) {
             Log.w(TAG, "status push failed: ${e.message}")
         }

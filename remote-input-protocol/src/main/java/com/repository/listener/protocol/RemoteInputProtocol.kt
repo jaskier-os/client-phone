@@ -478,10 +478,36 @@ object RemoteInputProtocol {
         }
 
         fun decode(payload: ByteArray?): Int {
-            if (payload == null || payload.size != 1) {
-                throw MalformedFrameException("status payload must be exactly 1 byte")
+            if (payload == null || payload.isEmpty()) {
+                throw MalformedFrameException("status payload must not be empty")
             }
             return payload[0].toInt() and 0xFF
+        }
+
+        /**
+         * Optional 4-byte correlation suffix: the `seq` of the PING this status is
+         * replying to, or absent for an unsolicited push.
+         *
+         * Without this the watch cannot tell a PING reply from a spontaneous status
+         * push (link-state change, dropped send, waking glasses), and timing an
+         * unsolicited frame against the last PING produces a fabricated round trip
+         * of up to a whole ping interval -- landing in exactly the upper tail that
+         * sets the staleness cutoff.
+         */
+        const val REPLY_SUFFIX_BYTES = 4
+
+        fun encodeWithReplyTo(bits: ByteArray, replyToSeq: Int): ByteArray =
+            java.nio.ByteBuffer.allocate(1 + REPLY_SUFFIX_BYTES)
+                .order(java.nio.ByteOrder.BIG_ENDIAN)
+                .put(bits[0])
+                .putInt(replyToSeq)
+                .array()
+
+        /** The correlated PING seq, or null when this is an unsolicited push. */
+        fun replyToSeq(payload: ByteArray?): Int? {
+            if (payload == null || payload.size < 1 + REPLY_SUFFIX_BYTES) return null
+            return java.nio.ByteBuffer.wrap(payload, 1, REPLY_SUFFIX_BYTES)
+                .order(java.nio.ByteOrder.BIG_ENDIAN).int
         }
 
         fun isSet(bits: Int, flag: Int): Boolean = (bits and flag) != 0

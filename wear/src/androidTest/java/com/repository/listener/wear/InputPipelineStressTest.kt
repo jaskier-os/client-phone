@@ -43,6 +43,13 @@ class InputPipelineStressTest {
         return sorted[idx - 1]
     }
 
+    /**
+     * NOTE ON WHAT THIS MEASURES. The harness posts to a HandlerThread it creates
+     * itself, so the queueing figure is a FLOOR for the real WatchLinkService
+     * worker, which additionally runs the ping timer, HMAC computation and
+     * sendMessage on the same looper. Treat it as a lower bound, not the
+     * operating value.
+     */
     private fun report(label: String, samples: List<Long>) {
         val sorted = samples.sorted()
         android.util.Log.i(
@@ -112,34 +119,13 @@ class InputPipelineStressTest {
         )
     }
 
-    /**
-     * Two taps separated by a known interval must preserve that interval in their
-     * stamps. This is the property the glasses' double-tap detection depends on.
-     */
-    @Test
-    fun tapIntervalIsPreservedInTheStamps() {
-        val emitted = mutableListOf<Long>()
-        val coalescer = ScrollCoalescer(sink = { type, _, timeMs ->
-            if (type == EventType.SELECT) emitted += timeMs
-        })
-
-        val errors = mutableListOf<Long>()
-        repeat(40) {
-            emitted.clear()
-            val first = SystemClock.elapsedRealtime()
-            coalescer.onDiscreteEvent(EventType.SELECT, first)
-            Thread.sleep(150)
-            val second = SystemClock.elapsedRealtime()
-            coalescer.onDiscreteEvent(EventType.SELECT, second)
-
-            assertEquals("both taps must survive", 2, emitted.size)
-            val actualInterval = emitted[1] - emitted[0]
-            val trueInterval = second - first
-            errors += abs(actualInterval - trueInterval)
-        }
-        report("tap_interval_error_ms", errors)
-        assertEquals("stamps must reproduce the true interval exactly", 0L, errors.max())
-    }
+    // NOTE: a previous test here asserted that the inter-tap interval survived in
+    // the emitted stamps, and reported 0 ms error at every percentile. It was a
+    // tautology: ScrollCoalescer.onDiscreteEvent passes the caller's stamp
+    // straight through, so it compared a value with itself and would have shown
+    // 0 ms with the entire pipeline broken. Removed rather than left as false
+    // assurance. The property it claimed to cover belongs in an end-to-end test
+    // that reads the stamp back off the wire on the receiving side.
 
     /**
      * Flood: prove no detent is lost, ordering holds, and nothing wedges.
@@ -152,15 +138,9 @@ class InputPipelineStressTest {
 
         var delivered = 0
         var lastSign = 0
-        var inversions = 0
         val coalescer = ScrollCoalescer(sink = { type, steps, _ ->
             if (type == EventType.SCROLL) {
                 delivered += abs(steps)
-                if (lastSign != 0 && steps != 0 && Integer.signum(steps) != lastSign) {
-                    // Direction changes are legitimate; count them only to prove
-                    // the stream is not scrambled beyond the injected reversals.
-                    inversions++
-                }
                 lastSign = Integer.signum(steps)
             }
         })

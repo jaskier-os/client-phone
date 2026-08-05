@@ -272,8 +272,32 @@ class RemoteInputProtocolTest {
     }
 
     @Test(expected = MalformedFrameException::class)
-    fun status_rejectsWrongLength() {
-        RemoteInputProtocol.StatusFlags.decode(ByteArray(2))
+    fun status_rejectsEmptyPayload() {
+        RemoteInputProtocol.StatusFlags.decode(ByteArray(0))
+    }
+
+    /**
+     * A status frame may carry an optional 4-byte correlation suffix naming the
+     * PING it replies to. Without it the watch cannot distinguish a reply from an
+     * unsolicited push, and timing an unsolicited frame against the last PING
+     * fabricates a round trip in exactly the tail that sets the staleness cutoff.
+     */
+    @Test
+    fun status_carriesOptionalReplyCorrelation() {
+        val flags = RemoteInputProtocol.StatusFlags
+        val bits = flags.encode(
+            glassesLinkUp = true, phoneServiceAlive = true, lastSendDropped = false,
+            glassesSinkAttached = true, wakingGlasses = false,
+        )
+        // Unsolicited push: no correlation.
+        assertNull(flags.replyToSeq(bits))
+        // Reply: correlation present and exact, including above 2^31.
+        for (seq in listOf(1, 4242, Int.MAX_VALUE, -1)) {
+            val correlated = flags.encodeWithReplyTo(bits, seq)
+            assertEquals(seq, flags.replyToSeq(correlated))
+            // The bitfield must still decode identically with the suffix present.
+            assertEquals(flags.decode(bits), flags.decode(correlated))
+        }
     }
 
     /**

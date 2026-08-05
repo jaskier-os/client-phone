@@ -135,6 +135,10 @@ class WatchLinkService : Service() {
     @Volatile
     private var lastPingSentMs = 0L
 
+    /** seq of the outstanding PING, so only its reply is timed. */
+    @Volatile
+    private var lastPingSeq = 0
+
     @Volatile
     var state: LinkState = LinkState.SETUP
         private set
@@ -332,10 +336,12 @@ class WatchLinkService : Service() {
         }
 
         val payload: ByteArray
+        val sentSeq: Int
         synchronized(sendLock) {
+            sentSeq = ++seq
             val event = RemoteInputEvent(
                 sid = sid,
-                seq = ++seq,
+                seq = sentSeq,
                 type = type,
                 steps = steps,
                 wms = timeMs.toInt(),
@@ -354,6 +360,14 @@ class WatchLinkService : Service() {
             RemoteInputProtocol.PATH_EVENT
         }
         val handoffMs = SystemClock.elapsedRealtime()
+        if (type == EventType.PING) {
+            // Stamp only once the frame is genuinely on its way. Stamping before
+            // the early returns above would arm the timer for a PING that was
+            // never sent, and the next unsolicited status would be recorded as a
+            // huge round trip.
+            lastPingSentMs = handoffMs
+            lastPingSeq = sentSeq
+        }
         messageClient.sendMessage(node, path, payload)
             .addOnSuccessListener {
                 // Measurement path. `stamp` is the age of the event when it was
@@ -363,8 +377,9 @@ class WatchLinkService : Service() {
                 val ackMs = SystemClock.elapsedRealtime()
                 Log.i(
                     TAG,
-                    "SENT type=$type stamp=${handoffMs - timeMs} " +
-                        "ack=${ackMs - handoffMs} total=${ackMs - timeMs}",
+                    "SENT type=$type sid=${sid.toUInt()} seq=${sentSeq.toUInt()} " +
+                        "stamp=${handoffMs - timeMs} ack=${ackMs - handoffMs} " +
+                        "total=${ackMs - timeMs}",
                 )
             }
             .addOnFailureListener { e ->
@@ -421,19 +436,26 @@ class WatchLinkService : Service() {
     }
 
     /** Applies a status frame received from the phone. */
-    fun onStatus(bits: Int) {
+    fun onStatus(bits: Int, replyToSeq: Int?) {
         // Round-trip measurement, taken on a SINGLE clock.
         //
-        // The watch and the phone both report elapsedRealtime, but from different
-        // boots, so subtracting one from the other measures the clock offset, not
-        // latency. The phone replies to every PING with a status frame, so
-        // (status arrival - PING send) is a true round trip on the watch's own
-        // clock and needs no clock synchronisation at all.
+        // Both devices report elapsedRealtime but from different boots, so
+        // subtracting one from the other measures the clock offset rather than
+        // latency. Timing the phone's reply against the PING that caused it needs
+        // no clock synchronisation at all.
+        //
+        // ONLY correlated replies are timed. The phone also pushes status
+        // spontaneously (link-state change, dropped send, waking glasses), and
+        // attributing one of those to the last PING fabricates a round trip of up
+        // to a whole ping interval -- which would land in exactly the upper tail
+        // that sets the staleness cutoff.
         val pingAt = lastPingSentMs
-        if (pingAt != 0L) {
+        if (pingAt != 0L && replyToSeq != null && replyToSeq == lastPingSeq) {
             val rtt = SystemClock.elapsedRealtime() - pingAt
             lastPingSentMs = 0L
-            Log.i(TAG, "RTT ms=$rtt")
+            Log.i(TAG, "RTT ms=$rtt seq=${replyToSeq.toUInt()}")
+        } else if (replyToSeq == null) {
+            Log.i(TAG, "status push (unsolicited, not timed)")
         }
         handler.post {
             // The status path is unauthenticated, so a frame may only ever make
@@ -450,7 +472,6 @@ class WatchLinkService : Service() {
     private val statusTick = object : Runnable {
         override fun run() {
             if (phoneNodeId == null) resolvePhoneNode()
-            lastPingSentMs = SystemClock.elapsedRealtime()
             sendEvent(EventType.PING, 0, SystemClock.elapsedRealtime())
             recomputeState()
             handler.postDelayed(this, pingIntervalMs())
