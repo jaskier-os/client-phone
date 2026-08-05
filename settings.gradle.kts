@@ -23,3 +23,6 @@ include(":navigation")
 // has no Android variants, so the `environment` flavor dimension declared by :app
 // cannot propagate into it and no consumer needs missingDimensionStrategy.
 include(":remote-input-protocol")
+// Wear OS app. Shares :app's applicationId and signing certificate, which the Wear
+// Data Layer requires for message delivery between the watch and phone nodes.
+include(":wear")
