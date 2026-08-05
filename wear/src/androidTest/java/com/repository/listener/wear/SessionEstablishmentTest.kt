@@ -216,6 +216,77 @@ class SessionEstablishmentTest {
     }
 
     /**
+     * The keepalive must not back off before a detent has ever been seen.
+     *
+     * `lastDetentMs` starts at 0 and only a real detent writes it, so `now - 0` is
+     * the device uptime -- days on this hardware. That made the idle backoff engage
+     * on every FRESH session, producing a 30 s keepalive gap against the glasses'
+     * 20 s expiry from the very first session: the user saw
+     * "Phone app stopped - open it" on a healthy link while the watch logged a
+     * ~29 s silence and reopened, forever.
+     */
+    @Test
+    fun keepaliveDoesNotBackOffBeforeTheFirstDetent() {
+        val uptime = 886_000_000L // a realistic multi-day elapsedRealtime
+        assertEquals(
+            "a session with no detent yet must use the ACTIVE cadence; treating " +
+                "'never' as 'idle for the whole uptime' is what broke this",
+            RemoteInputProtocol.PING_INTERVAL_MS,
+            WatchLinkService.pingIntervalFor(lastDetentMs = 0L, nowMs = uptime),
+        )
+        // A genuinely idle session may still back off.
+        assertEquals(
+            RemoteInputProtocol.PING_IDLE_BACKOFF_MS,
+            WatchLinkService.pingIntervalFor(
+                lastDetentMs = uptime - RemoteInputProtocol.IDLE_BEFORE_PING_BACKOFF_MS - 1,
+                nowMs = uptime,
+            ),
+        )
+        // ...but no cadence it can return may be slower than the expiry it prevents.
+        assertTrue(
+            "every cadence this can return must beat the glasses session expiry",
+            listOf(
+                WatchLinkService.pingIntervalFor(0L, uptime),
+                WatchLinkService.pingIntervalFor(uptime - 1, uptime),
+                WatchLinkService.pingIntervalFor(1L, uptime),
+            ).all { it < RemoteInputProtocol.SESSION_EXPIRY_MS },
+        )
+    }
+
+    /**
+     * The watch must be able to reach a healthy display from its own initial state.
+     *
+     * The status fold AND-s health bits, so a health-bits-clear starting value is
+     * absorbing: no number of healthy frames could ever turn PHONE_SERVICE_ALIVE
+     * back on, and the watch showed "Phone app stopped" permanently on a link that
+     * was working.
+     */
+    @Test
+    fun theStatusFoldStartsFromAStateHealthCanBeReachedFrom() {
+        val service = newService(resolveTo = "phone-node-1")
+        try {
+            val healthy = RemoteInputProtocol.StatusFlags.decode(
+                RemoteInputProtocol.StatusFlags.encode(
+                    glassesLinkUp = true, phoneServiceAlive = true, lastSendDropped = false,
+                    glassesSinkAttached = true, wakingGlasses = false,
+                )
+            )
+            repeat(3) { service.onStatus(healthy, null) }
+            assertTrue(
+                "the fold never became healthy; bits=${service.statusBitsForTest()}",
+                awaitCondition {
+                    RemoteInputProtocol.StatusFlags.isSet(
+                        service.statusBitsForTest(),
+                        RemoteInputProtocol.StatusFlags.PHONE_SERVICE_ALIVE,
+                    )
+                },
+            )
+        } finally {
+            service.stopForTest()
+        }
+    }
+
+    /**
      * A burst must not prepend one OPEN per event. The phone's relay queue is
      * bounded at 8 and drops the newest beyond that, so an OPEN storm would evict
      * the very input it was trying to enable.

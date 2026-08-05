@@ -102,11 +102,44 @@ object RemoteInputProtocol {
     const val REORDER_DEADLINE_MS = 40L
 
     const val PING_INTERVAL_MS = 10_000L
-    const val PING_IDLE_BACKOFF_MS = 30_000L
+
+    /**
+     * Keepalive cadence once the session has genuinely been idle.
+     *
+     * MUST stay below [SESSION_EXPIRY_MS], with margin for the transport. This was
+     * 30 s against a 20 s expiry, which guaranteed the failure it exists to prevent:
+     * every idle session died on the glasses ~10 s before its own keepalive was due,
+     * and the watch then observed a ~29 s silence and reopened, forever. The
+     * measured round trip reaches ~1 s, so 12 s leaves 8 s of margin.
+     *
+     * This is the SECOND instance of this bug class here -- the watch's
+     * STATUS_TIMEOUT_MS was previously below this same backoff. The invariant is
+     * therefore executable rather than a comment; see [assertTimingCoherent].
+     */
+    const val PING_IDLE_BACKOFF_MS = 12_000L
+
     const val IDLE_BEFORE_PING_BACKOFF_MS = 60_000L
 
     /** Glasses expire a session after this long with no event and no PING. */
     const val SESSION_EXPIRY_MS = 20_000L
+
+    /**
+     * Fails loudly if a keepalive cadence is set above a timeout it must beat.
+     *
+     * A comment asking the next editor to remember this has already failed twice, so
+     * the invariant is checked by the test suite instead of trusted.
+     */
+    fun assertTimingCoherent() {
+        require(PING_IDLE_BACKOFF_MS < SESSION_EXPIRY_MS) {
+            "PING_IDLE_BACKOFF_MS ($PING_IDLE_BACKOFF_MS) must be below " +
+                "SESSION_EXPIRY_MS ($SESSION_EXPIRY_MS): a keepalive slower than the " +
+                "expiry it prevents guarantees the session dies every idle cycle"
+        }
+        require(PING_INTERVAL_MS < SESSION_EXPIRY_MS) {
+            "PING_INTERVAL_MS ($PING_INTERVAL_MS) must be below " +
+                "SESSION_EXPIRY_MS ($SESSION_EXPIRY_MS)"
+        }
+    }
 
     /**
      * Staleness cutoff, derived from the real measured Data Layer round trip

@@ -73,6 +73,40 @@ class WatchLinkService : Service() {
         /** Node resolution retry cadence while unpaired. */
         private const val NODE_RETRY_MS = 5_000L
 
+        /**
+         * The starting value for [statusBits]: health bits set, problem bits clear.
+         *
+         * See the field for why a zero seed is wrong. Written as the health mask
+         * rather than a literal so adding a health flag cannot silently reintroduce
+         * the absorbing-zero bug for that one bit.
+         */
+        private val HEALTH_SEED =
+            RemoteInputProtocol.StatusFlags.GLASSES_LINK_UP or
+                RemoteInputProtocol.StatusFlags.PHONE_SERVICE_ALIVE or
+                RemoteInputProtocol.StatusFlags.GLASSES_SINK_ATTACHED
+
+        /**
+         * Keepalive cadence for a given last-detent stamp. Pure, so the rule can be
+         * tested without a running service or a real clock.
+         *
+         * [lastDetentMs] is 0 until the first real detent, and `now - 0` is the whole
+         * device uptime -- days here. Comparing that against the idle threshold made
+         * the backoff engage IMMEDIATELY on every fresh session instead of after a
+         * minute of genuine idleness, which is what produced a 30 s keepalive gap
+         * against the glasses' 20 s expiry from the very first session.
+         */
+        @JvmStatic
+        @androidx.annotation.VisibleForTesting
+        fun pingIntervalFor(lastDetentMs: Long, nowMs: Long): Long {
+            if (lastDetentMs == 0L) return RemoteInputProtocol.PING_INTERVAL_MS
+            val idleFor = nowMs - lastDetentMs
+            return if (idleFor > RemoteInputProtocol.IDLE_BEFORE_PING_BACKOFF_MS) {
+                RemoteInputProtocol.PING_IDLE_BACKOFF_MS
+            } else {
+                RemoteInputProtocol.PING_INTERVAL_MS
+            }
+        }
+
         @Volatile
         private var instance: WatchLinkService? = null
 
@@ -176,8 +210,26 @@ class WatchLinkService : Service() {
     @Volatile
     private var lastResolveMs = 0L
 
+    /**
+     * The watch's view of the link, folded from the phone's advisory status frames.
+     *
+     * Seeded with the health bits SET, not cleared. [StatusFlags.applyAdvisory]
+     * AND-folds health bits so an unauthenticated frame can never assert health the
+     * watch has not otherwise observed -- which means a zero seed is an absorbing
+     * state: `0 AND anything == 0`, so every health bit stays off forever no matter
+     * how many perfectly healthy frames arrive, and the watch shows
+     * "Phone app stopped - open it" permanently while the phone is demonstrably
+     * running. The seed is the watch's own prior, and the honest prior before any
+     * evidence is "no failure observed"; the very first frame then intersects it
+     * down to whatever the phone actually reports.
+     *
+     * Health is only ever RE-asserted here, at the start of a session. It is never
+     * restored mid-session, so a failure the watch folded in still cannot be
+     * cleared by a forged frame -- the containment that AND-folding exists for is
+     * intact.
+     */
     @Volatile
-    private var statusBits = 0
+    private var statusBits = HEALTH_SEED
 
     @Volatile
     private var lastStatusMs = 0L
@@ -304,6 +356,10 @@ class WatchLinkService : Service() {
         synchronized(sendLock) { seq = 0 }
         sessionOpenSent = false
         lastFrameSentMs = 0L
+        // Re-seed the fold for the new session. Carrying a previous session's
+        // latched problem bits across an explicit reopen would report a failure the
+        // new link has not exhibited.
+        statusBits = HEALTH_SEED
         // Seed the status clock so the first seconds of a session read as SETUP or
         // UNPAIRED rather than as "Phone unreachable" before any frame can arrive.
         lastStatusMs = SystemClock.elapsedRealtime()
@@ -660,15 +716,20 @@ class WatchLinkService : Service() {
         }
     }
 
-    /** Backs off once the session has been idle, to save both batteries. */
-    private fun pingIntervalMs(): Long {
-        val idleFor = SystemClock.elapsedRealtime() - lastDetentMs
-        return if (idleFor > RemoteInputProtocol.IDLE_BEFORE_PING_BACKOFF_MS) {
-            RemoteInputProtocol.PING_IDLE_BACKOFF_MS
-        } else {
-            RemoteInputProtocol.PING_INTERVAL_MS
-        }
-    }
+    /**
+     * Backs off once the session has been idle, to save both batteries.
+     *
+     * `lastDetentMs` starts at 0 and is written only by a real detent, so before the
+     * FIRST detent of a process `idleFor` is the whole device uptime -- days on this
+     * hardware. The backoff therefore engages IMMEDIATELY on a fresh session rather
+     * than after a minute of genuine idleness, which is the opposite of intent.
+     * Treating "no detent yet" as "not idle yet" is what makes the constant mean
+     * what its name says.
+     */
+    private fun pingIntervalMs(): Long = pingIntervalFor(lastDetentMs, SystemClock.elapsedRealtime())
+
+    @androidx.annotation.VisibleForTesting
+    internal fun statusBitsForTest(): Int = statusBits
 
     private fun recomputeState() {
         val fresh = lastStatusMs != 0L &&
