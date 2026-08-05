@@ -14,7 +14,6 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
-import com.google.android.gms.tasks.Tasks
 import com.google.android.gms.wearable.CapabilityClient
 import com.google.android.gms.wearable.MessageClient
 import com.google.android.gms.wearable.Wearable
@@ -24,8 +23,6 @@ import com.repository.listener.protocol.RemoteInputProtocol.EventType
 import com.repository.listener.protocol.RemoteInputProtocol.RemoteInputEvent
 import com.repository.listener.protocol.ScrollCoalescer
 import com.repository.listener.protocol.SessionIdentity
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Owns the phone link AND the input session.
@@ -63,14 +60,18 @@ class WatchLinkService : Service() {
         /** Release keepScreenOn after this long with no detent. */
         const val SCREEN_IDLE_RELEASE_MS = 30_000L
 
-        /** No status frame for this long -> UNREACHABLE. */
-        const val STATUS_TIMEOUT_MS = 25_000L
+        /**
+         * No status frame for this long -> UNREACHABLE.
+         *
+         * MUST exceed the backed-off PING interval. PING drops to 30 s once the
+         * session has been idle for a minute, so a 25 s timeout would flap into
+         * UNREACHABLE -- disabling input -- on every idle period even though the
+         * link is perfectly healthy.
+         */
+        const val STATUS_TIMEOUT_MS = 75_000L
 
         /** Node resolution retry cadence while unpaired. */
         private const val NODE_RETRY_MS = 5_000L
-
-        /** How long to wait on a blocking GMS task before giving up. */
-        private const val TASK_TIMEOUT_MS = 5_000L
 
         @Volatile
         private var instance: WatchLinkService? = null
@@ -90,10 +91,15 @@ class WatchLinkService : Service() {
     private val messageClient: MessageClient by lazy { Wearable.getMessageClient(this) }
     private val capabilityClient: CapabilityClient by lazy { Wearable.getCapabilityClient(this) }
 
-    /** The one sequence counter for this session. Minting and sending are paired
-     *  under [sendLock] so a seq cannot be assigned in one order and written in
-     *  another. */
-    private val seq = AtomicInteger(0)
+    /**
+     * The one sequence counter for this session.
+     *
+     * A plain Int guarded by [sendLock]: every caller runs on the worker thread,
+     * and the lock spans mint-and-dispatch so numbering order cannot diverge from
+     * the order frames are handed to the radio. An atomic on top of the lock would
+     * imply a second concurrency story that does not exist.
+     */
+    private var seq = 0
     private val sendLock = Any()
 
     private var sid: Int = 0
@@ -108,6 +114,13 @@ class WatchLinkService : Service() {
 
     @Volatile
     private var everSawPhoneNode = false
+
+    /** One outstanding capability lookup at a time; see [resolvePhoneNode]. */
+    @Volatile
+    private var resolveInFlight = false
+
+    @Volatile
+    private var lastResolveMs = 0L
 
     @Volatile
     private var statusBits = 0
@@ -124,9 +137,6 @@ class WatchLinkService : Service() {
 
     @Volatile
     private var listener: StateListener? = null
-
-    /** Session baseline: the watch clock value carried by the OPEN frame. */
-    private var openWms = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -186,9 +196,14 @@ class WatchLinkService : Service() {
             }
         } catch (e: Exception) {
             // The connectedDevice type requires a qualifying permission at the
-            // moment of this call. Log loudly rather than dying silently -- an
-            // unstarted foreground service means the session dies on screen-off.
-            Log.e(TAG, "startForeground failed; session will not survive screen-off", e)
+            // moment of this call. If promotion fails we MUST stop: the service
+            // was started with startForegroundService, and failing to promote
+            // inside the platform's window raises
+            // ForegroundServiceDidNotStartInTimeException, which is NOT catchable
+            // and kills the process. Stopping cleanly turns a crash into a
+            // degraded-but-diagnosable state.
+            Log.e(TAG, "startForeground failed; stopping service", e)
+            stopSelf()
         }
     }
 
@@ -196,8 +211,10 @@ class WatchLinkService : Service() {
 
     private fun openSession() {
         sid = mintSid()
-        seq.set(0)
-        openWms = SystemClock.elapsedRealtime().toInt()
+        synchronized(sendLock) { seq = 0 }
+        // Seed the status clock so the first seconds of a session read as SETUP or
+        // UNPAIRED rather than as "Phone unreachable" before any frame can arrive.
+        lastStatusMs = SystemClock.elapsedRealtime()
         resolvePhoneNode()
         sendEvent(EventType.OPEN, 0, SystemClock.elapsedRealtime())
         Log.i(TAG, "session open sid=${sid.toUInt()}")
@@ -232,9 +249,16 @@ class WatchLinkService : Service() {
      */
     fun onRotaryDelta(delta: Float, eventTimeMs: Long) {
         handler.post {
-            lastDetentMs = SystemClock.elapsedRealtime()
-            val steps = accumulator.onDelta(delta, eventTimeMs)
-            if (steps != 0) coalescer.onDetents(steps, SystemClock.elapsedRealtime())
+            // ONE clock throughout. The accumulator's idle reset and the rate
+            // limiter's window both compare timestamps, and mixing uptimeMillis
+            // (which stops in deep sleep) with elapsedRealtime (which does not)
+            // makes those deltas go negative after any doze, wedging the limiter
+            // window so detents stop draining. The caller's event time is used
+            // only for ordering within a gesture, so stamping here is safe.
+            val now = SystemClock.elapsedRealtime()
+            lastDetentMs = now
+            val steps = accumulator.onDelta(delta, now)
+            if (steps != 0) coalescer.onDetents(steps, now)
             scheduleDrain()
         }
     }
@@ -247,11 +271,6 @@ class WatchLinkService : Service() {
     fun onTap() {
         val tapMs = SystemClock.elapsedRealtime()
         handler.post { coalescer.onDiscreteEvent(EventType.SELECT, tapMs) }
-    }
-
-    fun onBack() {
-        val ms = SystemClock.elapsedRealtime()
-        handler.post { coalescer.onDiscreteEvent(EventType.BACK, ms) }
     }
 
     private val drainRunnable = Runnable {
@@ -304,7 +323,7 @@ class WatchLinkService : Service() {
         synchronized(sendLock) {
             val event = RemoteInputEvent(
                 sid = sid,
-                seq = seq.incrementAndGet(),
+                seq = ++seq,
                 type = type,
                 steps = steps,
                 wms = timeMs.toInt(),
@@ -333,19 +352,35 @@ class WatchLinkService : Service() {
 
     // ---- Node resolution & status ----
 
+    /**
+     * Resolves the phone node ASYNCHRONOUSLY.
+     *
+     * This must never block the worker thread. A blocking await here would charge
+     * its full timeout to EVERY event whenever the phone is unreachable, queueing
+     * every posted rotary delta behind it and starving the drain runnable -- the
+     * user's scrolling would simply stop. A single in-flight flag plus a retry
+     * throttle keeps this to one outstanding lookup regardless of event rate.
+     */
     private fun resolvePhoneNode() {
-        try {
-            val info = Tasks.await(
-                capabilityClient.getCapability(CAP_PHONE_INPUT_SINK, CapabilityClient.FILTER_REACHABLE),
-                TASK_TIMEOUT_MS, TimeUnit.MILLISECONDS,
-            )
-            val node = info.nodes.firstOrNull { it.isNearby } ?: info.nodes.firstOrNull()
-            phoneNodeId = node?.id
-            if (node != null) everSawPhoneNode = true
-        } catch (e: Exception) {
-            Log.w(TAG, "capability lookup failed: ${e.message}")
-            phoneNodeId = null
-        }
+        val now = SystemClock.elapsedRealtime()
+        if (resolveInFlight) return
+        if (now - lastResolveMs < NODE_RETRY_MS) return
+        lastResolveMs = now
+        resolveInFlight = true
+
+        capabilityClient.getCapability(CAP_PHONE_INPUT_SINK, CapabilityClient.FILTER_REACHABLE)
+            .addOnSuccessListener { info ->
+                val node = info.nodes.firstOrNull { it.isNearby } ?: info.nodes.firstOrNull()
+                phoneNodeId = node?.id
+                if (node != null) everSawPhoneNode = true
+                resolveInFlight = false
+                handler.post { recomputeState() }
+            }
+            .addOnFailureListener { e ->
+                Log.w(TAG, "capability lookup failed: ${e.message}")
+                phoneNodeId = null
+                resolveInFlight = false
+            }
     }
 
     /** Applies a status frame received from the phone. */

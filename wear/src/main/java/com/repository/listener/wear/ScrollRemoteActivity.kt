@@ -2,28 +2,32 @@ package com.repository.listener.wear
 
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.view.HapticFeedbackConstants
 import android.view.View
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.rotary.onRotaryScrollEvent
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.style.TextAlign
@@ -42,7 +46,19 @@ import androidx.wear.compose.material3.Text
  */
 class ScrollRemoteActivity : ComponentActivity() {
 
+    private companion object {
+        const val ATTACH_RETRY_MS = 150L
+        const val ATTACH_MAX_ATTEMPTS = 40
+
+        /** Cadence for re-evaluating whether the screen should stay awake. */
+        const val SCREEN_TICK_MS = 5_000L
+    }
+
+    private val attachHandler = Handler(Looper.getMainLooper())
     private var linkService: WatchLinkService? = null
+
+    private val linkState: MutableState<LinkState> = mutableStateOf(LinkState.SETUP)
+    private val detentCount: MutableState<Int> = mutableStateOf(0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,10 +68,16 @@ class ScrollRemoteActivity : ComponentActivity() {
         setContent {
             MaterialTheme {
                 RemoteScreen(
-                    onRotaryDelta = { delta, eventTime ->
-                        WatchLinkService.current()?.onRotaryDelta(delta, eventTime)
+                    state = linkState,
+                    detents = detentCount,
+                    onRotaryDelta = { delta ->
+                        WatchLinkService.current()?.onRotaryDelta(delta, SystemClock.elapsedRealtime())
+                        noteInteraction()
                     },
-                    onTap = { WatchLinkService.current()?.onTap() },
+                    onTap = {
+                        WatchLinkService.current()?.onTap()
+                        noteInteraction()
+                    },
                 )
             }
         }
@@ -63,52 +85,102 @@ class ScrollRemoteActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        linkService = WatchLinkService.current()
+        attachWhenReady()
+        attachHandler.post(screenTick)
     }
 
     override fun onStop() {
         super.onStop()
         // Detach only. Wrist-down must NOT close the session, or the sid churns
         // and the accumulator's carried remainder is lost mid-scroll.
+        //
+        // Clearing the listener also stops the service -- a process-lifetime
+        // singleton -- from retaining this activity through the callback.
         linkService?.setStateListener(null)
         linkService = null
+        attachHandler.removeCallbacksAndMessages(null)
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    /**
+     * startForegroundService is asynchronous, so on a cold start the service does
+     * not exist yet when onStart runs. Retry briefly rather than silently leaving
+     * the UI frozen on its initial state forever.
+     */
+    private fun attachWhenReady(attempt: Int = 0) {
+        val service = WatchLinkService.current()
+        if (service != null) {
+            linkService = service
+            service.setStateListener { next ->
+                runOnUiThread { linkState.value = next }
+            }
+            return
+        }
+        if (attempt < ATTACH_MAX_ATTEMPTS) {
+            attachHandler.postDelayed({ attachWhenReady(attempt + 1) }, ATTACH_RETRY_MS)
+        }
+    }
+
+    private fun noteInteraction() {
+        detentCount.value = detentCount.value + 1
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    /**
+     * Releases the screen once the session has been idle, per the battery budget.
+     * keepScreenOn on this AMOLED costs far more than the link itself, so it is
+     * held only while the user is actually scrolling.
+     */
+    private val screenTick = object : Runnable {
+        override fun run() {
+            val keep = linkService?.screenShouldStayOn() ?: false
+            if (keep) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+            attachHandler.postDelayed(this, SCREEN_TICK_MS)
+        }
     }
 }
 
 @Composable
 private fun RemoteScreen(
-    onRotaryDelta: (Float, Long) -> Unit,
+    state: MutableState<LinkState>,
+    detents: MutableState<Int>,
+    onRotaryDelta: (Float) -> Unit,
     onTap: () -> Unit,
 ) {
     val focusRequester = remember { FocusRequester() }
     val view = LocalView.current
-    var state by remember { mutableStateOf(LinkState.SETUP) }
-    var detents by remember { mutableStateOf(0) }
 
     // onRotaryScrollEvent delivers nothing unless the composable is focusable AND
     // actually holds focus, so request it once on first composition.
-    LaunchedEffect(Unit) {
-        focusRequester.requestFocus()
-        WatchLinkService.current()?.setStateListener { next -> state = next }
-    }
+    LaunchedEffect(Unit) { focusRequester.requestFocus() }
+
+    val current = state.value
 
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
-            // EXACTLY ONE dispatch path is hooked. Rotary events are delivered to
-            // all four of Activity.dispatchGenericMotionEvent,
-            // Activity.onGenericMotionEvent, View.OnGenericMotionListener and
-            // View.onGenericMotionEvent -- hooking more than one counts every
-            // detent multiple times.
+            // EXACTLY ONE dispatch path is hooked. Rotary events reach all four of
+            // Activity.dispatchGenericMotionEvent, Activity.onGenericMotionEvent,
+            // View.OnGenericMotionListener and View.onGenericMotionEvent --
+            // hooking more than one counts every detent multiple times.
             .onRotaryScrollEvent { event ->
-                onRotaryDelta(event.verticalScrollPixels, SystemClock.uptimeMillis())
-                detents++
+                onRotaryDelta(rawAxisScroll(view, event.verticalScrollPixels))
                 performDetentHaptic(view)
                 true
             }
             .focusRequester(focusRequester)
-            .focusable(),
+            .focusable()
+            // One raw physical tap. No double-tap detection here on purpose: the
+            // glasses own that disambiguation against a 400 ms threshold, and a
+            // second detector would consume the pair and mask their logic.
+            .pointerInput(Unit) {
+                detectTapGestures(onTap = { onTap() })
+            },
         contentAlignment = Alignment.Center,
     ) {
         Column(
@@ -116,13 +188,13 @@ private fun RemoteScreen(
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             Text(
-                text = state.label,
+                text = current.label,
                 textAlign = TextAlign.Center,
                 fontSize = 15.sp,
-                color = if (state.inputEnabled) Color(0xFF4FC3F7) else Color(0xFFFFB74D),
+                color = if (current.inputEnabled) Color(0xFF4FC3F7) else Color(0xFFFFB74D),
             )
             Text(
-                text = if (state.inputEnabled) "Turn the bezel to scroll" else "",
+                text = if (current.inputEnabled) "Turn the bezel to scroll" else "",
                 textAlign = TextAlign.Center,
                 fontSize = 12.sp,
                 color = Color(0xFF9E9E9E),
@@ -131,7 +203,7 @@ private fun RemoteScreen(
             // Detent counter: the cheapest possible proof, visible on the watch,
             // that bezel events are actually reaching this app.
             Text(
-                text = if (detents > 0) "detents $detents" else "",
+                text = if (detents.value > 0) "detents ${detents.value}" else "",
                 textAlign = TextAlign.Center,
                 fontSize = 11.sp,
                 color = Color(0xFF616161),
@@ -139,6 +211,30 @@ private fun RemoteScreen(
             )
         }
     }
+}
+
+/**
+ * Recovers the RAW `AXIS_SCROLL` value from Compose's rotary event.
+ *
+ * Compose does not hand through the raw axis. `RotaryScrollEvent` is built as
+ * `-getAxisValue(AXIS_SCROLL) * ViewConfiguration.scaledVerticalScrollFactor`, so
+ * the value is (a) negated and (b) multiplied by a device-dependent pixel factor
+ * that is roughly a list-item height -- on this watch (340 dpi) around two orders
+ * of magnitude. Feeding that straight into an accumulator calibrated at 1.0 units
+ * per detent would turn one detent into hundreds of steps: a single flick would
+ * scroll the glasses for many seconds, and in the wrong direction.
+ *
+ * Dividing the factor back out restores the normalized -1..+1 per detent that the
+ * hardware actually reports (verified via `dumpsys input`: SCROLL min=-1 max=+1),
+ * and re-negating restores the sign convention where positive means forward/down.
+ *
+ * The factor is queried per event rather than cached because it is
+ * configuration-dependent and this is a single cheap field read.
+ */
+private fun rawAxisScroll(view: View, verticalScrollPixels: Float): Float {
+    val factor = android.view.ViewConfiguration.get(view.context).scaledVerticalScrollFactor
+    if (factor <= 0f) return -verticalScrollPixels
+    return -verticalScrollPixels / factor.toFloat()
 }
 
 /**
