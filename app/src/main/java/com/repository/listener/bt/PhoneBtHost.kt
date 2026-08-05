@@ -48,6 +48,15 @@ class PhoneBtHost(private val context: Context) {
         private const val RETRY_INTERVAL_RELAY_ACTIVE_MS = 30_000L
         /** Bonded-but-RFCOMM-down cycles before we presume the listener is dead and cold-start it. */
         private const val COLD_START_AFTER_FAILURES = 2
+
+        /**
+         * Coalescing window for the "glasses are back" edges.
+         *
+         * A single glasses boot produces link-UP, HELLO and often a notify within
+         * about a second, and each would otherwise page three sockets. Short enough
+         * that a genuine second boot still reconnects promptly.
+         */
+        private const val RELAY_RECONNECT_THROTTLE_MS = 2_000L
         private const val MAX_CAPS_CHARS = 10_000  // Safe limit: worst-case 3 bytes/char in JNI modified UTF-8
     }
 
@@ -77,6 +86,9 @@ class PhoneBtHost(private val context: Context) {
      * receive WAKE_WORD/BUTTON_PRESS/etc notifications from the glasses.
      */
     val bleWake = BleWakeNotifyClient(context)
+
+    /** Coalesces the several "glasses are back" edges of a single boot. */
+    private val lastRelayReconnectMs = java.util.concurrent.atomic.AtomicLong(0L)
     private val batteryLogger = BatteryEventLogger(context)
     @Volatile private var bleWakeStarted = false
 
@@ -905,6 +917,38 @@ class PhoneBtHost(private val context: Context) {
     }
 
     /**
+     * Ask every RFCOMM relay to reconnect, from a signal that the glasses are back.
+     *
+     * One helper rather than three call sites repeated per event, because the whole
+     * class of bug this closes is a signal that reconnects SOME sockets and not
+     * others: the input socket was added later than the control and map sockets and
+     * was simply missing from paths that predated it. A single place to add a
+     * transport makes that omission impossible rather than merely unlikely.
+     *
+     * Throttled: several of these edges (link-UP, HELLO, and often a notify) fire
+     * within a second of the same boot, and each relay's connect attempt pages the
+     * radio. The relays are individually idempotent, but paging three sockets three
+     * times over is exactly the storm the self-heal throttle exists to avoid.
+     */
+    private fun reconnectRelays(reason: String) {
+        // Pair mode owns bonding and connection; a reconnect here would race the
+        // identify path onto whatever the cached MAC resolves to. Same rule the
+        // notify callback already applies.
+        if (pairModeActive) {
+            log("BleWake: reconnect ($reason) deferred -- pair mode active")
+            return
+        }
+        val now = android.os.SystemClock.uptimeMillis()
+        val last = lastRelayReconnectMs.get()
+        if (now - last < RELAY_RECONNECT_THROTTLE_MS) return
+        if (!lastRelayReconnectMs.compareAndSet(last, now)) return
+        log("Reconnecting RFCOMM relays ($reason)")
+        rfcommClient.requestImmediateReconnect(reason)
+        mapRfcommClient.requestImmediateReconnect(reason)
+        inputRfcommClient.requestImmediateReconnect(reason)
+    }
+
+    /**
      * G3: bring up the persistent BLE wake link to the bonded glasses device.
      * Inbound notifications trigger an immediate RFCOMM reconnect so we never
      * miss data because we were idling.
@@ -933,13 +977,22 @@ class PhoneBtHost(private val context: Context) {
                 return@setOnNotifyCallback
             }
             log("BleWake: rx code=0x${"%02X".format(code.toInt() and 0xFF)} -> requesting RFCOMM reconnect")
-            rfcommClient.requestImmediateReconnect("ble:0x${"%02X".format(code.toInt() and 0xFF)}")
-            mapRfcommClient.requestImmediateReconnect("ble:0x${"%02X".format(code.toInt() and 0xFF)}")
-            inputRfcommClient.requestImmediateReconnect("ble:0x${"%02X".format(code.toInt() and 0xFF)}")
+            reconnectRelays("ble:0x${"%02X".format(code.toInt() and 0xFF)}")
         }
         bleWake.setOnConnectionStateCallback { up ->
             log("BleWake: link state=${if (up) "UP" else "DOWN"}")
             if (up) {
+                // The BLE link coming UP is the ONE reliable signal that the glasses
+                // just booted, and while the desktop audio relay holds the radio it
+                // is the ONLY one: the periodic self-heal deliberately skips its
+                // blind RFCOMM page in that state and defers to "BLE wake armed".
+                // Arming a wake that never reconnects anything leaves every RFCOMM
+                // socket down indefinitely -- the watch then shows "Waking glasses"
+                // forever, because the wake it is waiting on has already happened
+                // and was not acted on. Reconnect here, on the edge, rather than
+                // waiting for an inbound notify that a freshly booted device has no
+                // reason to send.
+                reconnectRelays("ble_link_up")
                 // The BLE wake link is the steady-state idle channel (RFCOMM is demand-opened
                 // and closed during idle). When BLE (re)connects -- e.g. after a glasses reboot
                 // -- probe liveness so a stale Unreachable (left by a ping that timed out while
@@ -960,6 +1013,11 @@ class PhoneBtHost(private val context: Context) {
         bleWake.setOnHelloCallback {
             log("BleWake: rx HELLO")
             reachability.onBleHello()
+            // HELLO is the glasses announcing themselves after a (re)boot, so it is
+            // the same "they are back" edge as link-UP and must reconnect for the
+            // same reason. It arrives on the notify characteristic but NOT through
+            // setOnNotifyCallback, so the reconnect there does not cover it.
+            reconnectRelays("ble_hello")
         }
         bleWake.start(dev)
     }

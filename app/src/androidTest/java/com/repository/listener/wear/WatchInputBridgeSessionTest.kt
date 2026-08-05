@@ -273,6 +273,76 @@ class WatchInputBridgeSessionTest {
         }
     }
 
+    /**
+     * "Waking glasses" must expire rather than latch forever.
+     *
+     * The wake claim previously cleared ONLY on a link-up edge, so when the wake
+     * never completed -- which is exactly what happened when the phone armed a BLE
+     * wake whose link-up edge reconnected no RFCOMM socket -- the watch displayed
+     * "Waking glasses..." indefinitely, with no progress and no explanation. That
+     * is the same shape as a status bit with no path out of it.
+     *
+     * Runs against the REAL timeout so it cannot pass on a build whose constant was
+     * changed to something meaningless.
+     */
+    @Test
+    fun aWakeThatNeverCompletesIsReportedAsOfflineRatherThanWakingForever() {
+        bridge = newBridge()
+        transport.isConnected = false
+
+        feed(sid = 100, seq = 1, type = EventType.SCROLL, steps = 1)
+        drain()
+        assertTrue(
+            "the first event on a down link must claim a wake",
+            statusHas(RemoteInputProtocol.StatusFlags.WAKING_GLASSES),
+        )
+
+        // Hold the claim past its deadline. The PING path is what re-evaluates it,
+        // because a PING arrives every 10 s whether or not the user is still trying
+        // -- which is precisely when a lying status matters most.
+        Thread.sleep(WatchInputBridge.WAKE_CLAIM_TIMEOUT_MS + 1_500L)
+        synchronized(statuses) { statuses.clear() }
+        bridge.onPing(7)
+        drain()
+
+        assertTrue(
+            "an expired wake claim must stop being reported as waking; the watch " +
+                "would otherwise show 'Waking glasses' forever",
+            !statusHas(RemoteInputProtocol.StatusFlags.WAKING_GLASSES),
+        )
+    }
+
+    /** A wake that DOES complete must clear at once, not wait out the timeout. */
+    @Test
+    fun aCompletedWakeClearsOnTheLinkUpEdge() {
+        bridge = newBridge()
+        transport.isConnected = false
+        feed(sid = 101, seq = 1, type = EventType.SCROLL, steps = 1)
+        drain()
+        assertTrue(
+            "precondition: a wake must be claimed",
+            statusHas(RemoteInputProtocol.StatusFlags.WAKING_GLASSES),
+        )
+
+        synchronized(statuses) { statuses.clear() }
+        transport.isConnected = true
+        transport.onLinkStateChanged?.invoke(true)
+        drain()
+
+        assertTrue(
+            "a completed wake must clear immediately",
+            !statusHas(RemoteInputProtocol.StatusFlags.WAKING_GLASSES),
+        )
+    }
+
+    /** True if the most recent status frame carries [flag]. */
+    private fun statusHas(flag: Int): Boolean {
+        val last = synchronized(statuses) { statuses.lastOrNull() } ?: return false
+        return RemoteInputProtocol.StatusFlags.isSet(
+            RemoteInputProtocol.StatusFlags.decode(last), flag,
+        )
+    }
+
     /** A minimal real [MessageEvent]; GMS ships it as an interface. */
     private fun messageEvent(path: String, payload: ByteArray): MessageEvent =
         object : MessageEvent {

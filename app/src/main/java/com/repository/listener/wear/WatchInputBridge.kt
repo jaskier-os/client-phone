@@ -60,6 +60,17 @@ class WatchInputBridge(
          * than dropping now, which is the same reason input is never queued.
          */
         private const val MAX_PENDING_EVENTS = 8
+
+        /**
+         * How long "Waking glasses..." may be claimed before it is treated as failed.
+         *
+         * A wake is a BLE notify plus an RFCOMM page; on a healthy link that is a
+         * couple of seconds, and the periodic self-heal retries every 5 s (30 s while
+         * the desktop audio relay holds the radio). 45 s therefore spans several full
+         * retry cycles, so this cannot fire on a wake that is merely slow -- only on
+         * one that is not happening.
+         */
+        const val WAKE_CLAIM_TIMEOUT_MS = 45_000L
     }
 
     private val worker = HandlerThread("watch-input-bridge").apply { start() }
@@ -89,12 +100,16 @@ class WatchInputBridge(
     @Volatile private var glassesSinkAttached = false
     @Volatile private var lastSendDropped = false
     @Volatile private var wakingGlasses = false
+
+    /** elapsedRealtime when the current wake claim started; 0 when not waking. */
+    @Volatile private var wakeStartedMs = 0L
     @Volatile private var lastStatusPushMs = 0L
 
     init {
         inputClient.onLinkStateChanged = { up ->
             if (up) {
                 wakingGlasses = false
+                wakeStartedMs = 0L
                 lastSendDropped = false
             }
             pushStatus(force = true)
@@ -162,9 +177,23 @@ class WatchInputBridge(
         if (!inputClient.isConnected) {
             // Never enqueue. A queued input frame is delivered stale and would sit
             // in a shared bounded queue evicting other features' traffic.
+            //
+            // "Waking" is a CLAIM WITH A DEADLINE, not a latch. It previously cleared
+            // only on a link-up edge, so if the wake never completed the watch showed
+            // "Waking glasses..." forever -- indistinguishable from progress, and the
+            // same shape as a status bit that could never clear. Past the deadline the
+            // wake has demonstrably failed, and the honest report is that the glasses
+            // are offline, which is what the watch already has copy for.
+            val now = SystemClock.elapsedRealtime()
             if (!wakingGlasses) {
                 wakingGlasses = true
+                wakeStartedMs = now
+                Log.i(TAG, "link down; claiming wake for up to ${WAKE_CLAIM_TIMEOUT_MS}ms")
                 pushStatus(force = true)
+            } else {
+                val wasWaking = wakingGlasses
+                expireStaleWakeClaim()
+                if (wasWaking && !wakingGlasses) pushStatus(force = true)
             }
             Log.d(TAG, "link down; dropping ${event.type}")
             return
@@ -210,9 +239,33 @@ class WatchInputBridge(
     /**
      * Replies to a watch PING, echoing its seq so the watch can distinguish a
      * genuine reply from an unsolicited push and time only the former.
+     *
+     * The PING is also what re-evaluates a stale wake claim: it arrives every 10 s
+     * regardless of user input, so a wake that never completes is reported as a
+     * failure within one timeout even if the user has stopped touching the bezel.
+     * Relying on the next input event instead would mean the lie persists exactly
+     * when the user gives up and stops generating events.
      */
     fun onPing(pingSeq: Int) {
+        expireStaleWakeClaim()
         pushStatus(force = true, replyToSeq = pingSeq)
+    }
+
+    /**
+     * Drops a wake claim that has outlived [WAKE_CLAIM_TIMEOUT_MS].
+     *
+     * Separate from the send path so it runs on time-based signals too, not only
+     * when the user happens to produce input.
+     */
+    private fun expireStaleWakeClaim() {
+        if (!wakingGlasses) return
+        if (inputClient.isConnected) return
+        val started = wakeStartedMs
+        if (started == 0L) return
+        if (SystemClock.elapsedRealtime() - started <= WAKE_CLAIM_TIMEOUT_MS) return
+        wakingGlasses = false
+        wakeStartedMs = 0L
+        Log.w(TAG, "wake did not complete in ${WAKE_CLAIM_TIMEOUT_MS}ms; reporting glasses offline")
     }
 
     private fun pushStatus(force: Boolean, replyToSeq: Int? = null) {
