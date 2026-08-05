@@ -1,6 +1,7 @@
 package com.repository.listener.protocol
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.abs
@@ -109,9 +110,45 @@ class DetentAccumulatorTest {
         val a = acc()
         assertEquals(4, a.onDelta(10.0f, 0L))
         assertEquals(6, a.pendingSurplus)
-        val backlog = a.onDelta(-3.0f, 10L)
-        assertEquals("the forward backlog must be delivered forward", 6, backlog)
-        assertEquals("only the new reverse motion remains", -3, a.pendingSurplus)
+
+        // The backlog must leave through the SAME clamped path as any other
+        // emission -- returning it raw would overflow the int8 wire field.
+        val emitted = a.onDelta(-3.0f, 10L)
+        assertTrue("the forward backlog must be delivered forward", emitted > 0)
+        assertTrue("emissions must stay within the clamp, got $emitted", emitted <= 4)
+
+        var forward = 4 + emitted
+        var backward = 0
+        var now = 20L
+        repeat(400) {
+            val step = a.drain(now)
+            if (step > 0) forward += step else backward += -step
+            now += 25L
+        }
+        assertEquals("all 10 forward detents must be delivered", 10, forward)
+        assertEquals("all 3 reverse detents must be delivered", 3, backward)
+        assertFalse(a.hasUndeliveredDetents)
+    }
+
+    /**
+     * The two directions must never be netted against each other. Summing them
+     * would cancel real user motion instead of delivering it.
+     */
+    @Test
+    fun reversalIsNeverSummedAgainstTheOldDirection() {
+        val a = acc()
+        a.onDelta(10.0f, 0L)
+        a.onDelta(-10.0f, 10L)
+        var forward = 0
+        var backward = 0
+        var now = 20L
+        repeat(400) {
+            val step = a.drain(now)
+            if (step > 0) forward += step else backward += -step
+            now += 25L
+        }
+        assertTrue("forward motion must not be cancelled", forward > 0)
+        assertTrue("reverse motion must not be cancelled", backward > 0)
     }
 
     /**

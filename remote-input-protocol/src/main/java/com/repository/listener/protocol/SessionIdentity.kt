@@ -40,10 +40,12 @@ object SessionIdentity {
      *
      * Wrap behaviour is defined rather than left implicit: `sid` is a uint32 and
      * one increment per app session start makes wrap unreachable in practice, but
-     * if it ever happened the counter would return to [FIRST_SID] rather than to 0
-     * (reserved) or to a negative Int. A receiver seeing that regression rejects
-     * it as a replay, which is the safe failure: the user restarts the session and
-     * the next mint moves forward again.
+     * if it ever happened the counter returns to [FIRST_SID] rather than to 0
+     * (reserved) or to a negative Int. The receiver compares with a WRAP-SAFE
+     * signed difference, so it reads the wrapped value as NEWER and accepts the
+     * session -- the source is not locked out. A plain `<=` would refuse every
+     * subsequent session forever, which is precisely why the comparison is
+     * wrap-safe.
      */
     fun mintNextSid(previousSid: Int): Int {
         val next = previousSid + 1

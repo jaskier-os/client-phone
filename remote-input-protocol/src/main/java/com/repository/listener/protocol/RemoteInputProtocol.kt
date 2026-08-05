@@ -147,9 +147,41 @@ object RemoteInputProtocol {
 
     // ---- Event vocabulary ----
 
+    /**
+     * Event types.
+     *
+     * TAP SEMANTICS (decided 2026-08-05, binding). [SELECT] is ONE RAW PHYSICAL
+     * TAP. The watch performs NO double-tap detection: no GestureDetector
+     * onDoubleTap, no local timer, and it never synthesizes [BACK] from a tap pair.
+     *
+     * The glasses already own tap disambiguation and it is tuned against the
+     * physical touchpad (`MainActivity.DOUBLE_TAP_THRESHOLD_MS = 400`). Running a
+     * second detector on the watch would fight it: the watch's would consume the
+     * pair and mask the glasses' logic, and the two thresholds would drift apart.
+     * Keeping disambiguation in exactly one place makes the watch feel identical to
+     * the touchpad the user has already tuned by feel, and any future input device
+     * inherits correct tap semantics for free.
+     *
+     * Consequences for the producer, which are correctness requirements rather
+     * than polish:
+     *  - Emit one SELECT per physical tap, as promptly as possible.
+     *  - NEVER put a tap through the scroll coalescing window. Coalescing exists
+     *    for detent bursts; delaying a tap corrupts the glasses' 400 ms arithmetic.
+     *  - Taps and scroll steps are never merged with each other.
+     *  - Populate [RemoteInputEvent.wms] at the MOMENT OF THE TAP, not at enqueue
+     *    or send time. The receiver may disambiguate on `wms` rather than arrival
+     *    time, so a late stamp turns a deliberate "go back" into "select twice".
+     */
     enum class EventType(val code: Int) {
         SCROLL(1),
+
+        /** One raw physical tap. See the note above: no local double-tap logic. */
         SELECT(2),
+
+        /**
+         * An explicit back action. Reserved for a real back affordance; it is NOT
+         * synthesized from a double tap by the producer.
+         */
         BACK(3),
         OPEN(4),
         CLOSE(5),
@@ -210,7 +242,10 @@ object RemoteInputProtocol {
         if (event.src.contains(CANONICAL_SEPARATOR)) return "src contains separator"
         if (event.type.carriesSteps) {
             if (event.steps == 0) return "SCROLL with zero steps"
-            if (Math.abs(event.steps) > MAX_STEPS_PER_EVENT) {
+            // Range check, NOT Math.abs: abs(Int.MIN_VALUE) is itself negative, so
+            // an abs-based check would pass Int.MIN_VALUE through to encode, where
+            // it truncates to 0x00 and emits a SCROLL the peer rejects.
+            if (event.steps !in -MAX_STEPS_PER_EVENT..MAX_STEPS_PER_EVENT) {
                 return "steps magnitude ${event.steps} exceeds $MAX_STEPS_PER_EVENT"
             }
         } else if (event.steps != 0) {

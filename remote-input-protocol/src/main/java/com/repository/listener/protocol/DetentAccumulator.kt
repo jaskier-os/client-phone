@@ -50,14 +50,28 @@ class DetentAccumulator(
     /** Steps the rate limiter could not pass yet. Carried, never dropped. */
     private var carriedSurplus: Int = 0
 
+    /**
+     * Detents in the NEW direction, held while the old direction's backlog drains.
+     * Kept separate so the two directions can never be summed against each other,
+     * which would cancel real user motion instead of delivering it.
+     */
+    private var pendingReversal: Int = 0
+
     private var lastEventTimeMs: Long = Long.MIN_VALUE
 
     /** Rate-limiter window start and the count already spent inside it. */
     private var windowStartMs: Long = Long.MIN_VALUE
     private var stepsInWindow: Int = 0
 
-    /** Steps still owed to the caller because the limiter deferred them. */
+    /**
+     * Steps still owed to the caller because the limiter deferred them, in the
+     * currently draining direction. Excludes any held reversal; use
+     * [hasUndeliveredDetents] to ask whether anything at all is still owed.
+     */
     val pendingSurplus: Int get() = carriedSurplus
+
+    /** True while any detent in either direction has not yet been delivered. */
+    val hasUndeliveredDetents: Boolean get() = carriedSurplus != 0 || pendingReversal != 0
 
     /**
      * Feeds one raw input delta.
@@ -86,14 +100,18 @@ class DetentAccumulator(
             // noise sample -- a finger tremor that never completes a detent --
             // discard an entire carried backlog of genuine user motion.
             if (carriedSurplus != 0 && whole.sign != carriedSurplus.sign) {
-                // Hand the old direction's undelivered backlog to the caller before
-                // reversing, so it is DELIVERED rather than discarded. Conservation
-                // holds: every detent the user produced still reaches the sink.
-                val backlog = carriedSurplus
-                carriedSurplus = whole
-                return backlog
+                // Deliver the old direction's undelivered backlog BEFORE reversing,
+                // so it is delivered rather than discarded, and hold the new
+                // direction's detents until that backlog has drained.
+                //
+                // The backlog leaves through the normal clamped drain path below.
+                // Returning it raw would exceed maxStepsPerEvent and overflow the
+                // int8 wire field -- the clamp invariant belongs here, not in
+                // whichever caller happens to chunk afterwards.
+                pendingReversal += whole
+            } else {
+                carriedSurplus += whole
             }
-            carriedSurplus += whole
         }
 
         return drain(eventTimeMs)
@@ -105,6 +123,13 @@ class DetentAccumulator(
      * after the user's finger stops, and on detach so nothing is stranded.
      */
     fun drain(nowMs: Long): Int {
+        // Once the old direction has fully drained, the held reversal becomes the
+        // live direction. Promoting here (rather than at reversal time) is what
+        // keeps every emission single-directional and within the clamp.
+        if (carriedSurplus == 0 && pendingReversal != 0) {
+            carriedSurplus = pendingReversal
+            pendingReversal = 0
+        }
         if (carriedSurplus == 0) return 0
 
         if (windowStartMs == Long.MIN_VALUE || nowMs - windowStartMs >= MS_PER_SECOND) {
@@ -132,6 +157,10 @@ class DetentAccumulator(
      * must land before the session ends rather than be stranded.
      */
     fun flushChunk(): Int {
+        if (carriedSurplus == 0 && pendingReversal != 0) {
+            carriedSurplus = pendingReversal
+            pendingReversal = 0
+        }
         if (carriedSurplus == 0) {
             accumulated = 0f
             return 0
@@ -145,6 +174,7 @@ class DetentAccumulator(
     fun reset() {
         accumulated = 0f
         carriedSurplus = 0
+        pendingReversal = 0
         lastEventTimeMs = Long.MIN_VALUE
         windowStartMs = Long.MIN_VALUE
         stepsInWindow = 0

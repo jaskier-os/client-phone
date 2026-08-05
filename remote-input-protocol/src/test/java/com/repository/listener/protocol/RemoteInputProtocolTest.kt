@@ -109,7 +109,7 @@ class RemoteInputProtocolTest {
     @Test(expected = MalformedFrameException::class)
     fun encodingA_rejectsStepsAboveCap() {
         val bytes = RemoteInputProtocol.encodeEvent(key, event())
-        bytes[1] = 17
+        bytes[1] = 9
         RemoteInputProtocol.decodeEvent(bytes)
     }
 

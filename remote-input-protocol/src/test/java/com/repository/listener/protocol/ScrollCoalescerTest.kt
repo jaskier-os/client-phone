@@ -122,6 +122,61 @@ class ScrollCoalescerTest {
         assertEquals("SELECT never carries steps", 0, emitted[2].steps)
     }
 
+    /**
+     * Tap semantics. The glasses own double-tap disambiguation with a 400 ms
+     * threshold, so the watch must deliver every physical tap as its own SELECT,
+     * in order, with no merging and no local suppression. Swallowing or merging a
+     * tap pair here would silently turn the user's "go back" into "select twice".
+     */
+    @Test
+    fun everyTapProducesExactlyOneSelectEvent() {
+        val c = coalescer()
+        val taps = 7
+        var now = 0L
+        repeat(taps) {
+            c.onDiscreteEvent(EventType.SELECT, now)
+            now += 120L
+        }
+        assertEquals(
+            "N physical taps must produce exactly N SELECT events",
+            taps, emitted.count { it.type == EventType.SELECT },
+        )
+    }
+
+    /**
+     * Two taps inside the glasses' 400 ms window must BOTH arrive as separate
+     * events, with their original stamps: the receiver may disambiguate on `wms`
+     * rather than arrival time.
+     */
+    @Test
+    fun rapidTapPairIsNotMergedOrSuppressed() {
+        val c = coalescer()
+        c.onDiscreteEvent(EventType.SELECT, 0L)
+        c.onDiscreteEvent(EventType.SELECT, 150L)
+        val selects = emitted.filter { it.type == EventType.SELECT }
+        assertEquals("a fast tap pair must survive as two events", 2, selects.size)
+        assertEquals(0L, selects[0].timeMs)
+        assertEquals(150L, selects[1].timeMs)
+    }
+
+    /** A tap must never be delayed by, or merged into, the scroll window. */
+    @Test
+    fun tapIsEmittedImmediatelyEvenWithScrollPending() {
+        val c = coalescer()
+        c.onDetents(1, 0L)
+        c.onDetents(2, 10L)
+        c.onDiscreteEvent(EventType.SELECT, 20L)
+
+        val select = emitted.last()
+        assertEquals(EventType.SELECT, select.type)
+        assertEquals("the tap must carry its own tap-time stamp", 20L, select.timeMs)
+        assertEquals("taps and scroll steps must never be merged", 0, select.steps)
+        assertEquals(
+            "the pending scroll flushes before the tap, preserving order",
+            EventType.SCROLL, emitted[emitted.size - 2].type,
+        )
+    }
+
     @Test
     fun discreteEventsAreNeverCoalesced() {
         val c = coalescer()

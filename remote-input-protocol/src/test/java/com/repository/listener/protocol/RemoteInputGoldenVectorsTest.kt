@@ -130,6 +130,71 @@ class RemoteInputGoldenVectorsTest {
         }
     }
 
+    /**
+     * REJECT vectors. The accept-only vectors above cannot catch a receiver whose
+     * range check is still the superseded `abs(steps) > 16`: such a receiver
+     * reproduces every valid vector byte for byte and passes. Drift is only caught
+     * by asserting what must be REFUSED.
+     *
+     * The glasses repo must assert each of these is rejected, not merely that the
+     * valid ones are accepted.
+     */
+    @Test
+    fun rejectVectorsAreRefusedByTheDecoder() {
+        val valid = RemoteInputEvent(
+            sid = 1, seq = 1, type = EventType.SCROLL, steps = 1, wms = 1000,
+        )
+        val template = RemoteInputProtocol.encodeEvent(key, valid)
+
+        // byte[1] is steps (int8). Everything outside +/-MAX_STEPS_PER_EVENT must
+        // be refused rather than accepted-and-wrapped.
+        val badSteps = listOf<Byte>(9, 16, 17, 127, -9, -16, -17, -128)
+        for (s in badSteps) {
+            val frame = template.copyOf().also { it[1] = s }
+            assertRejected("steps=$s") { RemoteInputProtocol.decodeEvent(frame) }
+        }
+
+        // SCROLL must carry a non-zero magnitude.
+        assertRejected("SCROLL with zero steps") {
+            RemoteInputProtocol.decodeEvent(template.copyOf().also { it[1] = 0 })
+        }
+
+        // A non-SCROLL type must not carry steps.
+        val select = RemoteInputProtocol.encodeEvent(
+            key, valid.copy(type = EventType.SELECT, steps = 0),
+        )
+        assertRejected("SELECT carrying steps") {
+            RemoteInputProtocol.decodeEvent(select.copyOf().also { it[1] = 3 })
+        }
+
+        // Type codes outside the enum.
+        for (code in listOf<Byte>(0, 7, 99, -1)) {
+            assertRejected("type code=$code") {
+                RemoteInputProtocol.decodeEvent(template.copyOf().also { it[0] = code })
+            }
+        }
+
+        // Reserved bytes 22..25 must be zero.
+        for (i in 22..25) {
+            assertRejected("reserved byte $i set") {
+                RemoteInputProtocol.decodeEvent(template.copyOf().also { it[i] = 1 })
+            }
+        }
+
+        // Length is checked EXACTLY, not >=.
+        assertRejected("short frame") { RemoteInputProtocol.decodeEvent(template.copyOf(25)) }
+        assertRejected("long frame") { RemoteInputProtocol.decodeEvent(template.copyOf(27)) }
+    }
+
+    private fun assertRejected(label: String, block: () -> Unit) {
+        try {
+            block()
+            throw AssertionError("expected rejection but decode succeeded: $label")
+        } catch (expected: RemoteInputProtocol.MalformedFrameException) {
+            // Correct: rejected as malformed rather than silently accepted.
+        }
+    }
+
     @Test
     fun goldenVectorsCoverEveryEventType() {
         val covered = vectors().map { it.type }.toSet()
