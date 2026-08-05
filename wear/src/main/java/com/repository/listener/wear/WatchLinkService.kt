@@ -80,7 +80,7 @@ class WatchLinkService : Service() {
         fun current(): WatchLinkService? = instance
     }
 
-    /** Notified on link-state changes so the UI and the Tile can update. */
+    /** Notified on link-state changes so the UI and the complication can update. */
     fun interface StateListener {
         fun onStateChanged(state: LinkState)
     }
@@ -130,6 +130,10 @@ class WatchLinkService : Service() {
 
     @Volatile
     private var lastDetentMs = 0L
+
+    /** elapsedRealtime when the outstanding PING was handed to the radio. */
+    @Volatile
+    private var lastPingSentMs = 0L
 
     @Volatile
     var state: LinkState = LinkState.SETUP
@@ -418,6 +422,19 @@ class WatchLinkService : Service() {
 
     /** Applies a status frame received from the phone. */
     fun onStatus(bits: Int) {
+        // Round-trip measurement, taken on a SINGLE clock.
+        //
+        // The watch and the phone both report elapsedRealtime, but from different
+        // boots, so subtracting one from the other measures the clock offset, not
+        // latency. The phone replies to every PING with a status frame, so
+        // (status arrival - PING send) is a true round trip on the watch's own
+        // clock and needs no clock synchronisation at all.
+        val pingAt = lastPingSentMs
+        if (pingAt != 0L) {
+            val rtt = SystemClock.elapsedRealtime() - pingAt
+            lastPingSentMs = 0L
+            Log.i(TAG, "RTT ms=$rtt")
+        }
         handler.post {
             // The status path is unauthenticated, so a frame may only ever make
             // the watch more pessimistic. It can never assert health over a
@@ -433,6 +450,7 @@ class WatchLinkService : Service() {
     private val statusTick = object : Runnable {
         override fun run() {
             if (phoneNodeId == null) resolvePhoneNode()
+            lastPingSentMs = SystemClock.elapsedRealtime()
             sendEvent(EventType.PING, 0, SystemClock.elapsedRealtime())
             recomputeState()
             handler.postDelayed(this, pingIntervalMs())
@@ -467,7 +485,7 @@ class WatchLinkService : Service() {
         if (next != state) {
             state = next
             listener?.onStateChanged(next)
-            StatusTileService.requestUpdate(this)
+            LinkComplicationService.requestUpdate(this)
         }
     }
 

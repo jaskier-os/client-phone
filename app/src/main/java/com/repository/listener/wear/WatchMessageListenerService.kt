@@ -1,5 +1,6 @@
 package com.repository.listener.wear
 
+import android.os.SystemClock
 import android.util.Log
 import com.google.android.gms.wearable.MessageEvent
 import com.google.android.gms.wearable.Wearable
@@ -68,6 +69,21 @@ class WatchMessageListenerService : WearableListenerService() {
 
             val decoded = RemoteInputProtocol.decodeEvent(event.data)
             val tagHex = RemoteInputProtocol.toHex(decoded.tag)
+
+            // Log EVERY accepted frame, including the happy path.
+            //
+            // This exists because its absence already cost a long misdiagnosis: a
+            // correctly working listener that logs nothing is indistinguishable
+            // from one that is never invoked, and an empty logcat was mistaken for
+            // proof of non-delivery. Absence of logging is not absence of
+            // execution. `rx` is the receive-side timestamp used to measure the
+            // Data Layer hop against the watch's send stamp.
+            Log.i(
+                TAG,
+                "RX type=${decoded.event.type} seq=${decoded.event.seqUnsigned} " +
+                    "sid=${decoded.event.sidUnsigned} steps=${decoded.event.steps} " +
+                    "wms=${decoded.event.wmsUnsigned} rx=${SystemClock.elapsedRealtime()}",
+            )
 
             when (decoded.event.type) {
                 EventType.PING -> target.onPing()

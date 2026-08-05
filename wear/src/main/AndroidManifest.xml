@@ -44,8 +44,9 @@
             android:value="true" />
 
         <!--
-          exported=true is required for the Tile's LaunchAction to start it, and
-          it makes `am start` and instrumented tests possible. Because it is
+          exported=true is required for the complication's tap PendingIntent to
+          start it, and it makes `am start` and instrumented tests possible.
+          Because it is
           exported it must not perform any privileged action merely on launch:
           it does not open a session, does not emit input, and does not take
           keepScreenOn until the user genuinely interacts.
@@ -90,17 +91,36 @@
             </intent-filter>
         </service>
 
+        <!--
+          Publishes link status into a watch-face complication slot.
+
+          Everything here is load-bearing for the provider being OFFERED in the
+          picker, not just for it working once placed:
+            - android:label must be non-empty; it is the picker row text.
+            - android:icon must be set; the picker renders it beside the label.
+            - the BIND_COMPLICATION_PROVIDER permission and exported=true are what
+              let the watch-face host bind us; without both we are skipped.
+            - SUPPORTED_TYPES must intersect the slot's own supported types or we
+              are absent from that specific slot and it looks like filtering.
+          UPDATE_PERIOD_SECONDS is 0 because updates are pushed on state changes;
+          any non-zero value would wake this service on a timer all day.
+        -->
         <service
-            android:name=".StatusTileService"
+            android:name=".LinkComplicationService"
+            android:description="@string/complication_description"
             android:exported="true"
-            android:label="@string/tile_label"
-            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            android:icon="@drawable/ic_complication"
+            android:label="@string/complication_label"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
             <intent-filter>
-                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
             </intent-filter>
             <meta-data
-                android:name="androidx.wear.tiles.PREVIEW"
-                android:resource="@drawable/tile_preview" />
+                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+                android:value="SHORT_TEXT,LONG_TEXT,RANGED_VALUE,SMALL_IMAGE,ICON" />
+            <meta-data
+                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+                android:value="0" />
         </service>
 
     </application>

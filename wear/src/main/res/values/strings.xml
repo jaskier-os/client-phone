@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Glasses Remote</string>
-    <string name="tile_label">Glasses Remote</string>
+
+    <!--
+      The row label in the watch-face complication picker. Must be non-empty:
+      a provider with a blank label is silently dropped from the picker list.
+    -->
+    <string name="complication_label">Glasses Remote</string>
+
+    <!-- Shown under the label in pickers that render a second line. -->
+    <string name="complication_description">Glasses link status</string>
 </resources>

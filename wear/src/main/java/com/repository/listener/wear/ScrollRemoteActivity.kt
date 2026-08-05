@@ -39,7 +39,8 @@ import androidx.wear.compose.material3.Text
 /**
  * The remote scroll screen.
  *
- * This activity is exported (the Tile's LaunchAction requires it), so it must not
+ * This activity is exported (the complication's tap PendingIntent requires it), so
+ * it must not
  * perform anything privileged merely on launch: it does NOT open the session, does
  * NOT emit input, and does NOT hold the screen on until the user genuinely
  * interacts. The session belongs to [WatchLinkService]; this screen attaches to it.

@@ -134,6 +134,10 @@ class WatchInputBridge(
         lastForwarded = event.seq
         haveForwarded = true
         lastSendDropped = false
+        // Log the successful forward too. Only logging failures makes a healthy
+        // path silent, which is what made the earlier delivery question
+        // undiagnosable from logs alone.
+        Log.i(TAG, "FWD type=${event.type} seq=${event.seqUnsigned} steps=${event.steps}")
     }
 
     /** Called when the glasses report whether their input sink is attached. */

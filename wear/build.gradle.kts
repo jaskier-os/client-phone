@@ -101,16 +101,14 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-service:2.8.6")
 
-    // Tiles.
-    implementation("androidx.wear.tiles:tiles:1.6.2")
-    implementation("androidx.wear.protolayout:protolayout:1.4.2")
-    implementation("androidx.wear.protolayout:protolayout-material3:1.4.2")
-    // TileService returns ListenableFuture, so Guava is a direct requirement.
-    implementation("com.google.guava:guava:33.3.1-android")
+    // Watch-face complication data source. The -ktx artifact provides
+    // SuspendingComplicationDataSourceService and pulls in -data-source and -data
+    // transitively. Watchface RENDERING is deprecated in this line in favour of
+    // Watch Face Format; the complication data source APIs are not, and remain the
+    // supported way to publish into a slot.
+    implementation("androidx.wear.watchface:watchface-complications-data-source-ktx:1.2.1")
 
     testImplementation("junit:junit:4.13.2")
-    testImplementation("androidx.wear.tiles:tiles-testing:1.6.2")
-    testImplementation("org.robolectric:robolectric:4.13")
 
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
