@@ -389,9 +389,21 @@ class WatchLinkService : Service() {
         lastResolveMs = now
         resolveInFlight = true
 
+        com.google.android.gms.wearable.Wearable.getNodeClient(this).connectedNodes
+            .addOnSuccessListener { nodes ->
+                Log.i(TAG, "connectedNodes=${nodes.size} " +
+                    nodes.joinToString { "${it.displayName}/${it.id}/nearby=${it.isNearby}" })
+            }
+            .addOnFailureListener { e -> Log.w(TAG, "connectedNodes failed: ${e.message}") }
+
         capabilityClient.getCapability(CAP_PHONE_INPUT_SINK, CapabilityClient.FILTER_REACHABLE)
             .addOnSuccessListener { info ->
                 val node = info.nodes.firstOrNull { it.isNearby } ?: info.nodes.firstOrNull()
+                Log.i(
+                    TAG,
+                    "capability nodes=${info.nodes.size} " +
+                        info.nodes.joinToString { "${it.displayName}/${it.id}/nearby=${it.isNearby}" },
+                )
                 phoneNodeId = node?.id
                 if (node != null) everSawPhoneNode = true
                 resolveInFlight = false
