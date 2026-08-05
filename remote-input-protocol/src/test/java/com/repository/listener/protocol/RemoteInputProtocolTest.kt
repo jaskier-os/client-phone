@@ -50,7 +50,7 @@ class RemoteInputProtocolTest {
 
     @Test
     fun encodingA_roundTripsStepsBoundaries() {
-        for (steps in listOf(-16, -8, -1, 1, 8, 16)) {
+        for (steps in listOf(-8, -4, -1, 1, 4, 8)) {
             val e = event(steps = steps)
             val decoded = RemoteInputProtocol.decodeEvent(RemoteInputProtocol.encodeEvent(key, e))
             assertEquals("steps $steps", steps, decoded.event.steps)

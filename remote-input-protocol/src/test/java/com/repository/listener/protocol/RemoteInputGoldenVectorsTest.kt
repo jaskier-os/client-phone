@@ -44,8 +44,9 @@ class RemoteInputGoldenVectorsTest {
         RemoteInputEvent(sid = 1, seq = 0, type = EventType.OPEN, steps = 0, wms = 0),
         RemoteInputEvent(sid = 1, seq = 1, type = EventType.SCROLL, steps = 1, wms = 1000),
         RemoteInputEvent(sid = 1, seq = 2, type = EventType.SCROLL, steps = -1, wms = 1060),
-        RemoteInputEvent(sid = 1, seq = 3, type = EventType.SCROLL, steps = 16, wms = 1120),
-        RemoteInputEvent(sid = 1, seq = 4, type = EventType.SCROLL, steps = -16, wms = 1180),
+        // The cap magnitudes, where an int8 sign error would surface.
+        RemoteInputEvent(sid = 1, seq = 3, type = EventType.SCROLL, steps = 8, wms = 1120),
+        RemoteInputEvent(sid = 1, seq = 4, type = EventType.SCROLL, steps = -8, wms = 1180),
         RemoteInputEvent(sid = 1, seq = 5, type = EventType.SELECT, steps = 0, wms = 1240),
         RemoteInputEvent(sid = 1, seq = 6, type = EventType.BACK, steps = 0, wms = 1300),
         RemoteInputEvent(sid = 1, seq = 7, type = EventType.PING, steps = 0, wms = 11300),

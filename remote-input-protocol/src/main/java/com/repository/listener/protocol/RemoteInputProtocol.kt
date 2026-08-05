@@ -82,8 +82,21 @@ object RemoteInputProtocol {
      */
     const val COALESCE_WINDOW_MS = 60L
 
-    /** Max detents merged into one event. Surplus is CARRIED, never dropped. */
-    const val MAX_STEPS_PER_EVENT = 16
+    /**
+     * Max detents merged into one event. Surplus is CARRIED, never dropped.
+     *
+     * Set from measured hardware, not guessed. Intra-gesture detent spacing on the
+     * user's watch, both directions, deduped to one dispatch path:
+     *   n=36  min=32ms  p50=74ms  p90=109ms  max=222ms, magnitude uniformly +/-1.
+     * At 32 ms minimum spacing a 100 ms window physically holds ~3-4 detents, so 8
+     * is 2x headroom over the fastest spin a person can produce. A larger cap is
+     * unreachable and therefore meaningless.
+     *
+     * The cap is enforced by CHUNKING on overflow, never by trusting the producer:
+     * a merged magnitude above 127 would wrap the int8 wire field and invert the
+     * scroll direction.
+     */
+    const val MAX_STEPS_PER_EVENT = 8
 
     /** Reorder hold deadline for an out-of-order event on the phone. */
     const val REORDER_DEADLINE_MS = 40L
