@@ -121,6 +121,64 @@ class RcMirrorStore {
         Unit
     }
 
+    /**
+     * Projects a stored orchestrator transcript into rows, applying the same superseded-prefix rule
+     * the phone RC UI applies (a streaming partial is dropped when the NEXT rc_message continues
+     * it). Idempotent: a session that already holds rows is left untouched, so a second seed after
+     * a lazy transcript fetch cannot duplicate the thread.
+     */
+    fun seedFromTranscript(sessionId: String, transcriptJson: String) = synchronized(lock) {
+        if (sessions[sessionId]?.rows?.isNotEmpty() == true) return@synchronized
+        val arr = try {
+            org.json.JSONArray(transcriptJson)
+        } catch (e: Exception) {
+            return@synchronized
+        }
+        val s = session(sessionId)
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val data = obj.optJSONObject(DATA)
+            when (obj.optString("type", "")) {
+                "user_message" -> {
+                    val text = data?.optString("text", "").orEmpty()
+                    if (text.isNotEmpty()) add(s, "user", strip(text))
+                }
+                "rc_message" -> {
+                    val text = data?.optString("text", "").orEmpty()
+                    if (text.isNotEmpty() && !isSuperseded(arr, i, text)) {
+                        add(s, "assistant", strip(text))
+                    }
+                }
+                "rc_permission_request" -> {
+                    if (data != null) {
+                        val description = data.optString("description", "")
+                        val label = if (description.isNotEmpty()) description
+                        else data.optString("toolName", "")
+                        if (label.isNotEmpty()) {
+                            add(s, "prompt", strip(label), options = optionsOf(data))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** True when the next rc_message CONTINUES this text, i.e. this is an earlier partial. */
+    private fun isSuperseded(arr: org.json.JSONArray, index: Int, text: String): Boolean {
+        for (j in (index + 1) until arr.length()) {
+            val next = arr.optJSONObject(j) ?: continue
+            if (next.optString("type", "") != "rc_message") continue
+            val nextText = next.optJSONObject(DATA)?.optString("text", "").orEmpty()
+            return nextText.length > text.length && nextText.startsWith(text)
+        }
+        return false
+    }
+
+    private fun optionsOf(data: org.json.JSONObject): List<String> {
+        val raw = data.optJSONArray("options") ?: return emptyList()
+        return (0 until raw.length()).mapNotNull { raw.optString(it, "").ifEmpty { null } }
+    }
+
     /** Session ids currently held, least-recently-accessed first. */
     fun sessionIds(): List<String> = synchronized(lock) { sessions.keys.toList() }
 
@@ -169,6 +227,8 @@ class RcMirrorStore {
 
         /** A tools row is truncated to ROW_CHARS anyway; this bounds the uncommitted set. */
         const val MAX_PENDING_TOOL_NAMES = 64
+
+        private const val DATA = "data"
 
         private val FENCE = Regex("```[\\s\\S]*?```")
         private val LINK = Regex("\\[([^\\]]*)\\]\\([^)]*\\)")
