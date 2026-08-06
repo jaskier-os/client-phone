@@ -63,6 +63,55 @@ class RcMirrorStoreTest {
     }
 
     @Test
+    fun aLateCumulativeTextAfterCommitDoesNotCommitTheProseTwice() {
+        val store = RcMirrorStore()
+        store.noteAssistantText("s1", "Hello world")
+        assertEquals(1, store.commitTurn("s1").size)
+        // A trailing rc_message for the finished turn re-seeds the same cumulative text.
+        store.noteAssistantText("s1", "Hello world")
+        assertEquals(emptyList<RcRow>(), store.commitTurn("s1"))
+        assertEquals(0L, store.lastSeq("s1"))
+    }
+
+    @Test
+    fun aGenuinelyNewTurnStillCommitsAfterAnIdenticalPreviousTurn() {
+        val store = RcMirrorStore()
+        store.noteAssistantText("s1", "same")
+        store.commitTurn("s1")
+        store.appendUser("s1", "ask again")
+        store.noteAssistantText("s1", "same")
+        assertEquals(1, store.commitTurn("s1").size)
+    }
+
+    @Test
+    fun cumulativeAssistantTextIsTruncatedOnIngestNotOnlyAtCommit() {
+        val store = RcMirrorStore()
+        store.noteAssistantText("s1", "y".repeat(200_000))
+        val rows = store.commitTurn("s1")
+        assertEquals(1, rows.size)
+        assertEquals(300, rows[0].text.length)
+    }
+
+    @Test
+    fun promptOptionsAreCopiedSoALaterMutationCannotChangeTheRow() {
+        val store = RcMirrorStore()
+        val options = mutableListOf("Yes", "No")
+        val row = store.appendPrompt("s1", "Allow?", options)
+        options.add("Always")
+        assertEquals(listOf("Yes", "No"), row.options)
+    }
+
+    @Test
+    fun anUncommittedTurnDoesNotAccumulateToolNamesWithoutBound() {
+        val store = RcMirrorStore()
+        repeat(5_000) { store.noteTool("s1", "Tool$it") }
+        val rows = store.commitTurn("s1")
+        assertEquals(1, rows.size)
+        assertEquals(5_000, rows[0].toolCount)
+        assertTrue(rows[0].text.length <= 300)
+    }
+
+    @Test
     fun rowsAreCappedAtFortyDroppingOldest() {
         val store = RcMirrorStore()
         repeat(45) { store.appendUser("s1", "m$it") }

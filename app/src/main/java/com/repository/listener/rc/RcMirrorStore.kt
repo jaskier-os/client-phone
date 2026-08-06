@@ -28,6 +28,8 @@ class RcMirrorStore {
         var droppedAbove: Boolean = false
         /** LAST cumulative assistant text of the in-flight turn. Never a concatenation. */
         var pendingAssistant: String? = null
+        /** Text of the most recently committed assistant row, to reject a re-committed turn. */
+        var lastCommittedAssistant: String? = null
         val pendingToolNames = LinkedHashSet<String>()
         var pendingToolCount: Int = 0
     }
@@ -45,22 +47,32 @@ class RcMirrorStore {
      * appending would duplicate prose quadratically.
      */
     fun noteAssistantText(sessionId: String, text: String) = synchronized(lock) {
-        session(sessionId).pendingAssistant = text
+        // Stripped and truncated on INGEST, not at commit: the raw cumulative text of a long turn
+        // runs to hundreds of KB, and an interrupted turn never reaches commitTurn to release it.
+        session(sessionId).pendingAssistant = strip(text)
     }
 
     fun noteTool(sessionId: String, toolName: String) = synchronized(lock) {
         val s = session(sessionId)
-        s.pendingToolNames.add(toolName)
+        // The joined row is truncated at commit anyway; the set itself must not grow unbounded
+        // when a turn never commits.
+        if (s.pendingToolNames.size < MAX_PENDING_TOOL_NAMES) s.pendingToolNames.add(toolName)
         s.pendingToolCount++
+        s.lastCommittedAssistant = null
     }
 
     fun appendUser(sessionId: String, text: String): RcRow = synchronized(lock) {
-        add(session(sessionId), "user", strip(text))
+        val s = session(sessionId)
+        // A user message opens a genuinely new turn, so an identical reply is no longer a replay.
+        s.lastCommittedAssistant = null
+        add(s, "user", strip(text))
     }
 
     fun appendPrompt(sessionId: String, text: String, options: List<String>): RcRow =
         synchronized(lock) {
-            add(session(sessionId), "prompt", strip(text), options = options)
+            val s = session(sessionId)
+            s.lastCommittedAssistant = null
+            add(s, "prompt", strip(text), options = options.toList())
         }
 
     /**
@@ -74,8 +86,13 @@ class RcMirrorStore {
             out.add(add(s, "tools", strip(s.pendingToolNames.joinToString(", ")),
                 toolCount = s.pendingToolCount))
         }
-        val assistant = s.pendingAssistant?.let { strip(it) }
-        if (!assistant.isNullOrBlank()) out.add(add(s, "assistant", assistant))
+        val assistant = s.pendingAssistant
+        // A late rc_message re-seeds the same cumulative text after a commit; committing it again
+        // would emit the whole turn's prose a second time.
+        if (!assistant.isNullOrBlank() && assistant != s.lastCommittedAssistant) {
+            out.add(add(s, "assistant", assistant))
+            s.lastCommittedAssistant = assistant
+        }
         s.pendingAssistant = null
         s.pendingToolNames.clear()
         s.pendingToolCount = 0
@@ -149,6 +166,9 @@ class RcMirrorStore {
          * Worst case here stays MAX_ROWS x ROW_CHARS x MAX_SESSIONS ~= 96 KB.
          */
         const val MAX_SESSIONS = 8
+
+        /** A tools row is truncated to ROW_CHARS anyway; this bounds the uncommitted set. */
+        const val MAX_PENDING_TOOL_NAMES = 64
 
         private val FENCE = Regex("```[\\s\\S]*?```")
         private val LINK = Regex("\\[([^\\]]*)\\]\\([^)]*\\)")
