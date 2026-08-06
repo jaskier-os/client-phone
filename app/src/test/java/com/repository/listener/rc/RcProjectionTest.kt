@@ -38,6 +38,78 @@ class RcProjectionTest {
     }
 
     @Test
+    fun aLongerNonPrefixTurnDoesNotSupersedeAShorterEarlierTurn() {
+        // A length-only comparison would drop the first turn entirely -- the "old transcript" bug.
+        val store = RcMirrorStore()
+        store.seedFromTranscript(
+            "s1",
+            """[{"type":"rc_message","data":{"text":"ok"}},
+                {"type":"rc_message","data":{"text":"a completely different, longer turn"}}]"""
+        )
+        val rows = store.tail("s1", n = 100).first
+        assertEquals(listOf("ok", "a completely different, longer turn"), rows.map { it.text })
+    }
+
+    @Test
+    fun onlyTheImmediatelyFollowingPartialDecidesSupersession() {
+        // Partial 1 is a prefix of partial 3 but NOT of partial 2, so entry 2 is a NEW turn and
+        // entry 1 must survive. Scanning all later entries would wrongly drop it.
+        val store = RcMirrorStore()
+        store.seedFromTranscript(
+            "s1",
+            """[{"type":"rc_message","data":{"text":"Hel"}},
+                {"type":"rc_message","data":{"text":"zzz"}},
+                {"type":"rc_message","data":{"text":"Hello there"}}]"""
+        )
+        assertEquals(
+            listOf("Hel", "zzz", "Hello there"),
+            store.tail("s1", n = 100).first.map { it.text }
+        )
+    }
+
+    @Test
+    fun consecutivePartialsOfOneTurnCollapseToTheLast() {
+        val store = RcMirrorStore()
+        store.seedFromTranscript(
+            "s1",
+            """[{"type":"rc_message","data":{"text":"He"}},
+                {"type":"rc_message","data":{"text":"Hell"}},
+                {"type":"rc_message","data":{"text":"Hello world"}}]"""
+        )
+        assertEquals(listOf("Hello world"), store.tail("s1", n = 100).first.map { it.text })
+    }
+
+    @Test
+    fun aLegacyFlatTextEntryWithoutATypeIsSeeded() {
+        val store = RcMirrorStore()
+        store.seedFromTranscript(
+            "s1",
+            """[{"role":"user","text":"hi"},{"role":"assistant","text":"hello"}]"""
+        )
+        val rows = store.tail("s1", n = 100).first
+        assertEquals(listOf("user", "assistant"), rows.map { it.role })
+        assertEquals(listOf("hi", "hello"), rows.map { it.text })
+    }
+
+    @Test
+    fun aSeededTurnIsNotReCommittedAsADuplicateByTheLivePath() {
+        val store = RcMirrorStore()
+        store.seedFromTranscript("s1", """[{"type":"rc_message","data":{"text":"Hello world"}}]""")
+        // The live stream re-delivers the same cumulative text for the turn already in history.
+        store.noteAssistantText("s1", "Hello world")
+        assertEquals(emptyList<RcRow>(), store.commitTurn("s1"))
+        assertEquals(1, store.tail("s1", n = 100).first.size)
+    }
+
+    @Test
+    fun seedingIsSkippedOnceLiveRowsExistSoSeqStaysMonotonic() {
+        val store = RcMirrorStore()
+        store.appendUser("s1", "live")
+        store.seedFromTranscript("s1", transcript)
+        assertEquals(listOf("live"), store.tail("s1", n = 100).first.map { it.text })
+    }
+
+    @Test
     fun markdownIsStrippedWhileSeeding() {
         val store = RcMirrorStore()
         store.seedFromTranscript(

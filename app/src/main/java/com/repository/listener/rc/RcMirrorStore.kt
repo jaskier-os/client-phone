@@ -30,6 +30,8 @@ class RcMirrorStore {
         var pendingAssistant: String? = null
         /** Text of the most recently committed assistant row, to reject a re-committed turn. */
         var lastCommittedAssistant: String? = null
+        /** True once a transcript has been projected into this session. */
+        var seeded: Boolean = false
         val pendingToolNames = LinkedHashSet<String>()
         var pendingToolCount: Int = 0
     }
@@ -124,29 +126,41 @@ class RcMirrorStore {
     /**
      * Projects a stored orchestrator transcript into rows, applying the same superseded-prefix rule
      * the phone RC UI applies (a streaming partial is dropped when the NEXT rc_message continues
-     * it). Idempotent: a session that already holds rows is left untouched, so a second seed after
-     * a lazy transcript fetch cannot duplicate the thread.
+     * it).
+     *
+     * Seeds at most once per session, and only while the session holds no rows: seq is minted
+     * monotonically, so history cannot be spliced in under rows the glasses have already rendered.
+     * Tool rows are deliberately not projected from history -- they are collapsed per turn by
+     * [noteTool] / [commitTurn] on the live path, and the transcript keeps them per call.
      */
     fun seedFromTranscript(sessionId: String, transcriptJson: String) = synchronized(lock) {
-        if (sessions[sessionId]?.rows?.isNotEmpty() == true) return@synchronized
+        val existing = sessions[sessionId]
+        if (existing != null && (existing.seeded || existing.rows.isNotEmpty())) return@synchronized
         val arr = try {
             org.json.JSONArray(transcriptJson)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             return@synchronized
         }
         val s = session(sessionId)
+        s.seeded = true
         for (i in 0 until arr.length()) {
             val obj = arr.optJSONObject(i) ?: continue
             val data = obj.optJSONObject(DATA)
-            when (obj.optString("type", "")) {
+            when (obj.optString("type", "text")) {
+                // A legacy flat entry: the type key is absent and role/text sit at the top level.
+                "text" -> {
+                    val text = obj.optString("text", "")
+                    val role = if (obj.optString("role", "assistant") == "user") "user" else "assistant"
+                    if (text.isNotEmpty()) addSeeded(s, role, strip(text))
+                }
                 "user_message" -> {
                     val text = data?.optString("text", "").orEmpty()
-                    if (text.isNotEmpty()) add(s, "user", strip(text))
+                    if (text.isNotEmpty()) addSeeded(s, "user", strip(text))
                 }
                 "rc_message" -> {
                     val text = data?.optString("text", "").orEmpty()
                     if (text.isNotEmpty() && !isSuperseded(arr, i, text)) {
-                        add(s, "assistant", strip(text))
+                        addSeeded(s, "assistant", strip(text))
                     }
                 }
                 "rc_permission_request" -> {
@@ -155,12 +169,31 @@ class RcMirrorStore {
                         val label = if (description.isNotEmpty()) description
                         else data.optString("toolName", "")
                         if (label.isNotEmpty()) {
-                            add(s, "prompt", strip(label), options = optionsOf(data))
+                            addSeeded(s, "prompt", strip(label), options = optionsOf(data))
                         }
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Adds a seeded row, keeping [Session.lastCommittedAssistant] in step so a turn already present
+     * in the transcript is not re-committed as a duplicate by the next [commitTurn].
+     */
+    private fun addSeeded(
+        s: Session,
+        role: String,
+        text: String,
+        options: List<String> = emptyList()
+    ) {
+        // Consecutive identical assistant rows are collapsed, as the phone RC UI does.
+        if (role == "assistant") {
+            val prev = s.rows.lastOrNull()
+            if (prev != null && prev.role == "assistant" && prev.text == text) return
+        }
+        add(s, role, text, options = options)
+        s.lastCommittedAssistant = if (role == "assistant") text else null
     }
 
     /** True when the next rc_message CONTINUES this text, i.e. this is an earlier partial. */
