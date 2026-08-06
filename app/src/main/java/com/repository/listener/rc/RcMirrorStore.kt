@@ -1,0 +1,157 @@
+package com.repository.listener.rc
+
+/**
+ * One HUD-ready row of a mirrored remote-control session.
+ *
+ * `seq` is minted only inside [RcMirrorStore]: the orchestrator's `rc_message` carries no id, so
+ * there is nothing on the wire to derive an ordering from.
+ */
+data class RcRow(
+    val seq: Long,
+    val role: String,                        // user | assistant | tools | prompt
+    val text: String,                        // <= ROW_CHARS, markdown-stripped
+    val toolCount: Int = 0,
+    val options: List<String> = emptyList()  // non-empty only for role == "prompt"
+)
+
+/**
+ * Bounded projection of orchestrator RC events into rows the glasses can render.
+ *
+ * The store is written from the OkHttp WS reader thread and read from the BT reader thread and the
+ * main looper, so every public method takes [lock].
+ */
+class RcMirrorStore {
+
+    private class Session {
+        val rows = ArrayDeque<RcRow>()
+        var nextSeq: Long = 0L
+        var droppedAbove: Boolean = false
+        /** LAST cumulative assistant text of the in-flight turn. Never a concatenation. */
+        var pendingAssistant: String? = null
+        val pendingToolNames = LinkedHashSet<String>()
+        var pendingToolCount: Int = 0
+    }
+
+    private val lock = Any()
+
+    private val sessions = object : LinkedHashMap<String, Session>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Session>?): Boolean =
+            size > MAX_SESSIONS
+    }
+
+    /**
+     * Records the latest cumulative assistant text for the in-flight turn. STORES, never appends:
+     * `rc_message.text` is cumulative (the phone UI itself replaces rather than appends), so
+     * appending would duplicate prose quadratically.
+     */
+    fun noteAssistantText(sessionId: String, text: String) = synchronized(lock) {
+        session(sessionId).pendingAssistant = text
+    }
+
+    fun noteTool(sessionId: String, toolName: String) = synchronized(lock) {
+        val s = session(sessionId)
+        s.pendingToolNames.add(toolName)
+        s.pendingToolCount++
+    }
+
+    fun appendUser(sessionId: String, text: String): RcRow = synchronized(lock) {
+        add(session(sessionId), "user", strip(text))
+    }
+
+    fun appendPrompt(sessionId: String, text: String, options: List<String>): RcRow =
+        synchronized(lock) {
+            add(session(sessionId), "prompt", strip(text), options = options)
+        }
+
+    /**
+     * Flushes the pending tool row and the last cumulative assistant text as at most two rows, the
+     * tool row first. An empty projection commits nothing and mints no seq.
+     */
+    fun commitTurn(sessionId: String): List<RcRow> = synchronized(lock) {
+        val s = session(sessionId)
+        val out = ArrayList<RcRow>(2)
+        if (s.pendingToolNames.isNotEmpty()) {
+            out.add(add(s, "tools", strip(s.pendingToolNames.joinToString(", ")),
+                toolCount = s.pendingToolCount))
+        }
+        val assistant = s.pendingAssistant?.let { strip(it) }
+        if (!assistant.isNullOrBlank()) out.add(add(s, "assistant", assistant))
+        s.pendingAssistant = null
+        s.pendingToolNames.clear()
+        s.pendingToolCount = 0
+        out
+    }
+
+    /** @return the newest [n] rows plus whether older rows exist above them. */
+    fun tail(sessionId: String, n: Int = TAIL_ROWS): Pair<List<RcRow>, Boolean> =
+        synchronized(lock) {
+            val s = sessions[sessionId] ?: return emptyList<RcRow>() to false
+            val all = s.rows.toList()
+            if (all.size <= n) return all to s.droppedAbove
+            all.subList(all.size - n, all.size).toList() to true
+        }
+
+    fun lastSeq(sessionId: String): Long = synchronized(lock) {
+        sessions[sessionId]?.rows?.lastOrNull()?.seq ?: -1L
+    }
+
+    /**
+     * Drops a session's rows. This is a PROMPTNESS optimisation only, never the memory bound: its
+     * caller `onRcSessionEnd` never fires on a dropped WS, a PC-side CLI kill or a restart.
+     */
+    fun clear(sessionId: String) = synchronized(lock) {
+        sessions.remove(sessionId)
+        Unit
+    }
+
+    /** Session ids currently held, least-recently-accessed first. */
+    fun sessionIds(): List<String> = synchronized(lock) { sessions.keys.toList() }
+
+    private fun session(sessionId: String): Session =
+        sessions.getOrPut(sessionId) { Session() }
+
+    private fun add(
+        s: Session,
+        role: String,
+        text: String,
+        toolCount: Int = 0,
+        options: List<String> = emptyList()
+    ): RcRow {
+        val row = RcRow(s.nextSeq++, role, text, toolCount, options)
+        s.rows.addLast(row)
+        while (s.rows.size > MAX_ROWS) {
+            s.rows.removeFirst()
+            s.droppedAbove = true
+        }
+        return row
+    }
+
+    /** Markdown stripper, pure. Fenced code -> [code], inline markers dropped, links -> label. */
+    private fun strip(raw: String): String {
+        var t = FENCE.replace(raw, "[code]")
+        t = LINK.replace(t) { it.groupValues[1] }
+        t = t.replace("`", "")
+        t = EMPHASIS.replace(t, "")
+        t = t.trim()
+        return if (t.length <= ROW_CHARS) t else t.take(ROW_CHARS - 3) + "..."
+    }
+
+    companion object {
+        const val TAIL_ROWS = 20
+        const val ROW_CHARS = 300
+        const val MAX_ROWS = 40
+
+        /**
+         * The access-order LRU is the SOLE memory bound of this store, not a nice-to-have.
+         * `onRcSessionEnd` deliberately retains its `rcDumpState` entry and only fires when the
+         * orchestrator says so: a dropped WS, a PC-side CLI kill or an app restart never reach it.
+         * [clear] is therefore a promptness optimisation and nothing may rely on it firing.
+         * Worst case here stays MAX_ROWS x ROW_CHARS x MAX_SESSIONS ~= 96 KB.
+         */
+        const val MAX_SESSIONS = 8
+
+        private val FENCE = Regex("```[\\s\\S]*?```")
+        private val LINK = Regex("\\[([^\\]]*)\\]\\([^)]*\\)")
+        private val EMPHASIS = Regex("(\\*\\*|\\*|__|_|~~)")
+    }
+}
