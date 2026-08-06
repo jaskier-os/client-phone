@@ -1923,31 +1923,12 @@ class PhoneBtHost(private val context: Context) {
      */
     private fun sendChunkedJson(channel: String, json: String, label: String, prefix: String? = null) {
         try {
-            if (json.length <= MAX_CAPS_CHARS) {
-                val caps = RelayCaps()
-                prefix?.let { caps.write(it) }
-                caps.write(json)
-                caps.write("1")
-                rfcommClient.send(channel, *caps.asArray())
-            } else {
-                var start = 0
-                var chunkIndex = 0
-                while (start < json.length) {
-                    var end = minOf(start + MAX_CAPS_CHARS, json.length)
-                    // Avoid splitting a surrogate pair
-                    if (end < json.length && Character.isHighSurrogate(json[end - 1])) end--
-                    val caps = RelayCaps()
-                    prefix?.let { caps.write(it) }
-                    caps.write(json.substring(start, end))
-                    val isFinal = end >= json.length
-                    caps.write(if (isFinal) "1" else "0")
-                    rfcommClient.send(channel, *caps.asArray())
-                    if (!isFinal) Thread.sleep(50)
-                    start = end
-                    chunkIndex++
-                }
-                log("$label chunking: ${json.length} chars -> $chunkIndex chunks")
+            val chunks = ChunkFramer.frame(prefix, json, MAX_CAPS_CHARS)
+            chunks.forEachIndexed { i, args ->
+                rfcommClient.send(channel, *args)
+                if (i != chunks.lastIndex) Thread.sleep(50)
             }
+            if (chunks.size > 1) log("$label chunking: ${json.length} chars -> ${chunks.size} chunks")
             txByteCount.addAndGet(estimateCapsSize(json))
             log("$label sent to glasses (${json.length} chars)")
         } catch (e: Exception) {
