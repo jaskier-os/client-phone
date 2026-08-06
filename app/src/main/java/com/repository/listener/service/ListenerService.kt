@@ -9228,6 +9228,11 @@ class ListenerService : LifecycleService(),
     override fun onRcPermissionRequest(sessionId: String, toolName: String, toolArgs: String, requestId: String, description: String?) {
         thinkingRcStartTimes.remove(sessionId)
         touchRcSession(sessionId)
+        // No options: the orchestrator's rc_permission_request carries none, and CH_RC_ANSWER_REQ
+        // routes to sendRcUserResponse (spec 1.6) rather than sendRcPermissionResponse -- so an
+        // option answered on the glasses would not resolve the pending permission. The prompt text
+        // still mirrors; the answer is given on the phone. Wiring this end-to-end needs an
+        // orchestrator protocol change and is out of scope here.
         rcMirror.appendPrompt(sessionId, description ?: toolName, emptyList())
         pushRcState(force = true)
         val data = JSONObject().apply {
@@ -9351,6 +9356,9 @@ class ListenerService : LifecycleService(),
     override fun onRcUserInput(sessionId: String, prompt: String, requestId: String) {
         thinkingRcStartTimes.remove(sessionId)
         touchRcSession(sessionId)
+        // No options: rc_user_input's answer is free text the orchestrator does not enumerate, so
+        // there is nothing to offer as a selectable list. The prompt text mirrors to the glasses;
+        // the answer is typed on the phone.
         rcMirror.appendPrompt(sessionId, prompt, emptyList())
         pushRcState(force = true)
         val data = JSONObject().apply {
