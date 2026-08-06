@@ -7192,16 +7192,15 @@ class ListenerService : LifecycleService(),
                     }
                     "message" -> {
                         thinkingRcStartTimes.remove(sessionId)
-                        // Mirror onRcMessage: detect true->false transition for unread + glasses fan-out.
+                        // Mirror onRcMessage: detect a true->false transition for unread.
                         // If the entry doesn't exist yet (replay path for a session this process
-                        // hasn't seen), create it now with the current turning value and unread=false
-                        // -- we have no previous turning state, so we cannot detect a transition,
-                        // and we must NOT fire a glasses notification on the first observation.
+                        // hasn't seen), create it now with the current turning value and
+                        // unread=false -- we have no previous turning state, so we cannot detect a
+                        // transition on the first observation.
                         val newTurning = !isFinal
                         if (rcDumpState[sessionId] == null) {
                             // Replay path: a "message" arrived for a sessionId we never saw a
-                            // "start" for. Use whatever workDir came in this rc_inject_event
-                            // (may be ""); folderNameFromWorkDir() drops blank/"null" names.
+                            // "start" for. Use whatever workDir came in this rc_inject_event.
                             rcDumpState[sessionId] = RcDumpEntry(workDir = workDir, status = "active", turning = newTurning, unread = false)
                         }
                         val turnFinished = resolveRcTurnTransition(sessionId, isFinal)
@@ -7219,6 +7218,7 @@ class ListenerService : LifecycleService(),
                             val commitRunnable = Runnable {
                                 rcTurnFinishRunnables.remove(sessionId)
                                 val rows = rcMirror.commitTurn(sessionId)
+                                rcSeenToolCallIds.clear()
                                 if (rcBridge.openSessionId == sessionId &&
                                     rcBridge.pushRows(sessionId, rows)) {
                                     markRcRead(sessionId)
@@ -7233,7 +7233,6 @@ class ListenerService : LifecycleService(),
                                 putExtra(EXTRA_RC_UNREAD, true)
                             })
                         }
-                        pushRcState()
                         val msgData = JSONObject().apply {
                             put("text", text)
                             put("isFinal", isFinal)
@@ -7247,6 +7246,10 @@ class ListenerService : LifecycleService(),
                             putExtra(EXTRA_RC_SESSION_ID, sessionId)
                             putExtra(EXTRA_RC_DATA, msgData)
                         })
+                        // Last, exactly as the live path does it: markRcTurning above mutates the
+                        // very fields the snapshot reports, so pushing earlier would send a frame
+                        // that is one step stale.
+                        pushRcState()
                     }
                     "end" -> {
                         thinkingRcStartTimes.remove(sessionId)
@@ -9018,7 +9021,7 @@ class ListenerService : LifecycleService(),
         // same footing -- only the debounce runnable decides a turn has ended.
         if (text.isNotBlank()) rcMirror.noteAssistantText(sessionId, text)
         if (turnFinished) {
-            // Debounce glasses notification: agentic Claude Code emits isFinal=true
+            // Debounce the turn-finish commit: agentic Claude Code emits isFinal=true
             // between tool calls, so firing immediately would spam "Done" during
             // tool chains. Wait RC_DONE_DEBOUNCE_MS; onRcToolStatus cancels if
             // a tool event arrives, proving the turn isn't really finished.
@@ -9105,7 +9108,7 @@ class ListenerService : LifecycleService(),
      *  - if entry doesn't exist, leaves the map untouched (caller is responsible
      *    for creating it -- workDir/status come from caller context)
      * Returns true iff this was a real true->false transition AND the entry existed,
-     * so callers know whether to fire glasses notification + ACTION_RC_UNREAD_CHANGED.
+     * so callers know whether to commit the turn + broadcast ACTION_RC_UNREAD_CHANGED.
      */
     private fun resolveRcTurnTransition(sessionId: String, isFinal: Boolean): Boolean {
         val newTurning = !isFinal
@@ -9246,7 +9249,7 @@ class ListenerService : LifecycleService(),
         if (rcSessionTurning.containsKey(sessionId)) {
             markRcTurning(sessionId, true)
         }
-        // Cancel pending glasses "Done" notification -- turn isn't over yet.
+        // Cancel the pending turn-finish commit -- the turn is not over yet.
         rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
         // Re-mark turning in rcDumpState so the next isFinal can fire a real transition.
         rcDumpState.compute(sessionId) { _, prev ->
@@ -9322,7 +9325,7 @@ class ListenerService : LifecycleService(),
     override fun onRcThinking(sessionId: String, text: String, startedAt: Long) {
         val effectiveStart = if (startedAt > 0L) startedAt else System.currentTimeMillis()
         thinkingRcStartTimes[sessionId] = effectiveStart
-        // Cancel pending glasses "Done" notification -- still working.
+        // Cancel the pending turn-finish commit -- still working.
         rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
         // rcDumpState must stay in lockstep with the ACTION_RC_THINKING broadcast below.
         rcDumpState[sessionId]?.let { existing ->
