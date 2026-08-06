@@ -23,8 +23,12 @@ class ChunkSender(
     private val sleep: (ms: Long) -> Unit = { Thread.sleep(it) }
 ) {
 
-    fun send(channel: String, prefix: String?, json: String, maxChars: Int) {
-        val chunks = ChunkFramer.frame(channel, prefix, json, maxChars)
+    fun send(channel: String, prefix: String?, json: String, maxChars: Int) =
+        send(channel, listOfNotNull(prefix), json, maxChars)
+
+    /** [leading] is the channel's header args, repeated on every chunk. See [ChunkFramer.frame]. */
+    fun send(channel: String, leading: List<String>, json: String, maxChars: Int) {
+        val chunks = ChunkFramer.frame(channel, leading, json, maxChars)
         executor.execute {
             try {
                 chunks.forEachIndexed { i, args ->

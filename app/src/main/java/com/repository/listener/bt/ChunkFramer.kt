@@ -14,35 +14,32 @@ import java.util.concurrent.atomic.AtomicLong
 object ChunkFramer {
 
     /**
-     * @return one Array<String> of send-args per chunk, in order.
-     *         Layout: [prefix?] + [chunk] + [isFinal "1"/"0"].
-     */
-    fun frame(prefix: String?, json: String, maxChars: Int): List<Array<String>> {
-        require(maxChars > 0) { "maxChars must be > 0" }
-        return split(json, maxChars).map { (piece, isFinal) ->
-            val flag = if (isFinal) "1" else "0"
-            if (prefix != null) arrayOf(prefix, piece, flag) else arrayOf(piece, flag)
-        }
-    }
-
-    /**
      * Frames a payload with a trailing stream id and sequence number.
      *
-     * Layout: [prefix?] + [chunk] + [isFinal] + [streamId] + [seq]. The leading positions are
-     * byte-identical to [frame] above, so a receiver that reads fixed indices sees no difference;
-     * the trailing pair is what lets a receiver detect a lost chunk instead of concatenating
-     * across a gap.
+     * Layout: [leading...] + [chunk] + [isFinal] + [streamId] + [seq]. The trailing pair is what
+     * lets the receiver detect a lost chunk instead of concatenating across a gap; the glasses
+     * assembler refuses any frame without it, so EVERY chunked channel must go through here.
+     *
+     * [leading] is the channel's own header args, repeated verbatim on every chunk. Most channels
+     * have none or one (a conversation or chat id); CH_CONTACTS has three (op, mac, hash) and the
+     * glasses read its prefix at index 2, which is why this is a list and not a single nullable.
      */
-    fun frame(channel: String, prefix: String?, json: String, maxChars: Int): List<Array<String>> {
+    fun frame(
+        channel: String,
+        leading: List<String>,
+        json: String,
+        maxChars: Int
+    ): List<Array<String>> {
         require(maxChars > 0) { "maxChars must be > 0" }
         val streamId = "$SENTINEL$channel#${streamCounter.incrementAndGet()}"
         return split(json, maxChars).mapIndexed { i, (piece, isFinal) ->
             val flag = if (isFinal) "1" else "0"
-            val seq = i.toString()
-            if (prefix != null) arrayOf(prefix, piece, flag, streamId, seq)
-            else arrayOf(piece, flag, streamId, seq)
+            (leading + listOf(piece, flag, streamId, i.toString())).toTypedArray()
         }
     }
+
+    fun frame(channel: String, prefix: String?, json: String, maxChars: Int): List<Array<String>> =
+        frame(channel, listOfNotNull(prefix), json, maxChars)
 
     /** @return the payload pieces in order, each paired with whether it is the final piece. */
     private fun split(json: String, maxChars: Int): List<Pair<String, Boolean>> {

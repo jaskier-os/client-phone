@@ -1877,31 +1877,18 @@ class PhoneBtHost(private val context: Context) {
             val snap = com.repository.listener.phone.ContactsRepository.build(context)
             val agMac = agMacFromGlasses.ifEmpty { getAgMac() }
             val json = snap.json
-            val maxChunk = MAX_CAPS_CHARS
-            if (json.length <= maxChunk) {
-                val caps = RelayCaps()
-                caps.write("LIST"); caps.write(agMac); caps.write(snap.hash)
-                caps.write(json); caps.write("1")
-                rfcommClient.send(BtProtocol.CH_CONTACTS, *caps.asArray())
-            } else {
-                var start = 0
-                var idx = 0
-                while (start < json.length) {
-                    var end = minOf(start + maxChunk, json.length)
-                    if (end < json.length && Character.isHighSurrogate(json[end - 1])) end--
-                    val isFinal = end >= json.length
-                    val caps = RelayCaps()
-                    caps.write("LIST"); caps.write(agMac); caps.write(snap.hash)
-                    caps.write(json.substring(start, end))
-                    caps.write(if (isFinal) "1" else "0")
-                    rfcommClient.send(BtProtocol.CH_CONTACTS, *caps.asArray())
-                    if (!isFinal) Thread.sleep(50)
-                    start = end
-                    idx++
-                }
-                log("Contacts: list chunked ${json.length} chars -> $idx chunks")
-            }
-            log("Contacts: list sent (count=${snap.count}, ${json.length} chars)")
+            // Contacts carries THREE header args before the chunk, so it uses the multi-arg
+            // overload. It must not hand-roll its own loop: the glasses assembler refuses any
+            // frame without the trailing [streamId][seq], so an unframed contacts send does not
+            // merely skip gap detection -- it never arrives at all.
+            chunkSender.send(
+                BtProtocol.CH_CONTACTS,
+                listOf("LIST", agMac, snap.hash),
+                json,
+                MAX_CAPS_CHARS
+            )
+            txByteCount.addAndGet(estimateCapsSize(json))
+            log("Contacts: list queued (count=${snap.count}, ${json.length} chars)")
         } catch (e: Exception) {
             log("Contacts: sendContactsList failed: ${e.message}")
         }
