@@ -24,6 +24,13 @@ class RcBridge(
     private val cachedTranscript: (sessionId: String) -> String?
 ) {
 
+    /**
+     * Serializes the open-session read-modify-write. Without it two inbound frames can interleave
+     * so that openSessionId names one thread while the last frame emitted belonged to another,
+     * routing every later live row push to the wrong thread.
+     */
+    private val lock = Any()
+
     /** The session whose thread the glasses currently have open, or null when they are in the list. */
     @Volatile
     var openSessionId: String? = null
@@ -33,11 +40,11 @@ class RcBridge(
      * args = [sessionId, seenSeq]. Sending this IS the read acknowledgement. An empty sessionId
      * means the glasses left the thread: stop pushing live rows for it and reply nothing.
      */
-    fun handleMessagesReq(args: List<String>) {
+    fun handleMessagesReq(args: List<String>) = synchronized(lock) {
         val sessionId = args.getOrNull(0).orEmpty()
         if (sessionId.isEmpty()) {
             openSessionId = null
-            return
+            return@synchronized
         }
         val seenSeq = args.getOrNull(1)?.toLongOrNull() ?: -1L
         markRead(sessionId, seenSeq)
@@ -62,10 +69,11 @@ class RcBridge(
         val status = try {
             sendUserMessage(sessionId, text)
             "sent"
-        } catch (e: Exception) {
-            // A rejected send produces no turn and therefore no confirming row push, so this frame
-            // is the only thing standing between the user and a silently swallowed dictation.
-            "error:${e.message ?: e.javaClass.simpleName}"
+        } catch (t: Throwable) {
+            // Throwable, not Exception: an Error escaping here would leave the glasses with no
+            // reply at all, which is exactly the silently swallowed dictation this frame exists to
+            // prevent. A rejected send produces no turn and so no confirming row push.
+            "error:${t.message ?: t.javaClass.simpleName}"
         }
         send(BtProtocol.CH_RC_SEND_RESP, arrayOf(sessionId, clientMsgId, status))
     }
@@ -80,8 +88,8 @@ class RcBridge(
     }
 
     /** Live delta for the open thread. Rows for any other session are dropped. */
-    fun pushRows(sessionId: String, rows: List<RcRow>) {
-        if (rows.isEmpty() || sessionId != openSessionId) return
+    fun pushRows(sessionId: String, rows: List<RcRow>) = synchronized(lock) {
+        if (rows.isEmpty() || sessionId != openSessionId) return@synchronized
         emitRows(sessionId, rows to false)
     }
 
@@ -90,14 +98,27 @@ class RcBridge(
      * while it is still the open one: the user may have navigated away during the round trip, and
      * rows belonging to one session must never render tagged as another.
      */
-    fun onTranscript(sessionId: String, transcriptJson: String) {
-        if (sessionId != openSessionId) return
+    fun onTranscript(sessionId: String, transcriptJson: String) = synchronized(lock) {
+        if (sessionId != openSessionId) return@synchronized
         store.seedFromTranscript(sessionId, transcriptJson)
         emitRows(sessionId, store.tail(sessionId))
     }
 
     private fun emitRows(sessionId: String, tail: Pair<List<RcRow>, Boolean>) {
-        val (rows, moreAbove) = tail
+        var (rows, moreAbove) = tail
+        // Escaping can multiply a row's 300 chars sixfold (a control char becomes \u00xx), so the
+        // cap has to be enforced on the serialized bytes, not assumed from the row cap. Older rows
+        // are shed first and their loss is reported through `more`.
+        var body = serialize(rows, moreAbove)
+        while (rows.size > 1 && body.length > RcJson.MAX_FRAME_CHARS) {
+            rows = rows.drop(1)
+            moreAbove = true
+            body = serialize(rows, moreAbove)
+        }
+        send(BtProtocol.CH_RC_MESSAGES_RESP, arrayOf(sessionId, body))
+    }
+
+    private fun serialize(rows: List<RcRow>, moreAbove: Boolean): String {
         val sb = StringBuilder(512)
         sb.append("{\"rows\":[")
         rows.forEachIndexed { i, r ->
@@ -116,24 +137,8 @@ class RcBridge(
         sb.append("],\"more\":").append(moreAbove)
             .append(",\"lastSeq\":").append(rows.lastOrNull()?.seq ?: -1L)
             .append('}')
-        send(BtProtocol.CH_RC_MESSAGES_RESP, arrayOf(sessionId, sb.toString()))
-    }
-
-    private fun quote(raw: String): String {
-        val sb = StringBuilder(raw.length + 2)
-        sb.append('"')
-        for (c in raw) {
-            when {
-                c == '"' -> sb.append("\\\"")
-                c == '\\' -> sb.append("\\\\")
-                c == '\n' -> sb.append("\\n")
-                c == '\r' -> sb.append("\\r")
-                c == '\t' -> sb.append("\\t")
-                c < ' ' -> sb.append(String.format("\\u%04x", c.code))
-                else -> sb.append(c)
-            }
-        }
-        sb.append('"')
         return sb.toString()
     }
+
+    private fun quote(raw: String): String = RcJson.quote(raw)
 }

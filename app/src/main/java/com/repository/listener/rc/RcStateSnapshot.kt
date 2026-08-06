@@ -33,7 +33,7 @@ object RcStateSnapshot {
     const val FOLDER_CHARS = 40
 
     /** One RFCOMM frame's worth. An RC frame must never chunk. */
-    const val MAX_FRAME_CHARS = 10_000
+    const val MAX_FRAME_CHARS = RcJson.MAX_FRAME_CHARS
 
     fun build(wsConnected: Boolean, sessions: List<RcSessionState>): String {
         // The id tiebreak is load-bearing: the source is a ConcurrentHashMap whose iteration order
@@ -68,21 +68,5 @@ object RcStateSnapshot {
         return sb.toString()
     }
 
-    private fun quote(raw: String): String {
-        val sb = StringBuilder(raw.length + 2)
-        sb.append('"')
-        for (c in raw) {
-            when {
-                c == '"' -> sb.append("\\\"")
-                c == '\\' -> sb.append("\\\\")
-                c == '\n' -> sb.append("\\n")
-                c == '\r' -> sb.append("\\r")
-                c == '\t' -> sb.append("\\t")
-                c < ' ' -> sb.append(String.format("\\u%04x", c.code))
-                else -> sb.append(c)
-            }
-        }
-        sb.append('"')
-        return sb.toString()
-    }
+    private fun quote(raw: String): String = RcJson.quote(raw)
 }
