@@ -206,9 +206,12 @@ fun RemoteScreen(
             .focusRequester(focusRequester)
             .onFocusChanged { focused = it.isFocused }
             .focusable()
-            // One raw physical tap. No double-tap detection here on purpose: the
-            // glasses own that disambiguation against a 400 ms threshold, and a
-            // second detector would consume the pair and mask their logic.
+            // One raw physical tap, handed to the local gesture recogniser. Single
+            // vs double is resolved here, on the watch, against a 400 ms threshold,
+            // and leaves as a semantic SELECT or BACK. Recognising locally costs no
+            // network time: deferring on the receiver instead would make a single
+            // tap wait out the threshold plus the link RTT before anything happens.
+            // The phone relays the action verbatim; the glasses interpret it.
             .pointerInput(Unit) {
                 detectTapGestures(
                     onTap = { position ->
