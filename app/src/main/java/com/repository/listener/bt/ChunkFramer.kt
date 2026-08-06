@@ -1,5 +1,7 @@
 package com.repository.listener.bt
 
+import java.util.concurrent.atomic.AtomicLong
+
 /**
  * Pure, Android-free chunk building. Extracted verbatim from PhoneBtHost.sendChunkedJson so the
  * framing is JVM-testable. The arg layout is UNCHANGED and must stay wire-compatible with the
@@ -23,6 +25,25 @@ object ChunkFramer {
         }
     }
 
+    /**
+     * Frames a payload with a trailing stream id and sequence number.
+     *
+     * Layout: [prefix?] + [chunk] + [isFinal] + [streamId] + [seq]. The leading positions are
+     * byte-identical to [frame] above, so a receiver that reads fixed indices sees no difference;
+     * the trailing pair is what lets a receiver detect a lost chunk instead of concatenating
+     * across a gap.
+     */
+    fun frame(channel: String, prefix: String?, json: String, maxChars: Int): List<Array<String>> {
+        require(maxChars > 0) { "maxChars must be > 0" }
+        val streamId = "$SENTINEL$channel#${streamCounter.incrementAndGet()}"
+        return split(json, maxChars).mapIndexed { i, (piece, isFinal) ->
+            val flag = if (isFinal) "1" else "0"
+            val seq = i.toString()
+            if (prefix != null) arrayOf(prefix, piece, flag, streamId, seq)
+            else arrayOf(piece, flag, streamId, seq)
+        }
+    }
+
     /** @return the payload pieces in order, each paired with whether it is the final piece. */
     private fun split(json: String, maxChars: Int): List<Pair<String, Boolean>> {
         if (json.length <= maxChars) return listOf(json to true)
@@ -40,4 +61,12 @@ object ChunkFramer {
         }
         return out
     }
+
+    /**
+     * Marks a stream id. Must be a control character: chunks are raw JSON substrings and prefixes
+     * are conversation or chat ids, so any printable sentinel could occur naturally in either.
+     */
+    const val SENTINEL = "\u0001cs#"
+
+    private val streamCounter = AtomicLong(0)
 }

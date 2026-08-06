@@ -1917,16 +1917,24 @@ class PhoneBtHost(private val context: Context) {
         }
     }
 
+    /** One lock per channel, so a chunk loop is never interleaved with another on the same channel. */
+    private val chunkSendLocks = ConcurrentHashMap<String, Any>()
+
     /**
      * Send JSON to glasses via RelayCaps, chunking if payload exceeds CXR JNI limit.
      * Optional [prefix] is written as the first RelayCaps field in every chunk (e.g. conversationId).
      */
     private fun sendChunkedJson(channel: String, json: String, label: String, prefix: String? = null) {
         try {
-            val chunks = ChunkFramer.frame(prefix, json, MAX_CAPS_CHARS)
-            chunks.forEachIndexed { i, args ->
-                rfcommClient.send(channel, *args)
-                if (i != chunks.lastIndex) Thread.sleep(50)
+            val chunks = ChunkFramer.frame(channel, prefix, json, MAX_CAPS_CHARS)
+            // The whole split-and-send loop is serialized per channel. rfcommClient.send holds its
+            // write lock for a single frame only, and these wrappers are called from the IO pool,
+            // so without this two large sends on one channel interleave their chunks on the wire.
+            synchronized(chunkSendLocks.getOrPut(channel) { Any() }) {
+                chunks.forEachIndexed { i, args ->
+                    rfcommClient.send(channel, *args)
+                    if (i != chunks.lastIndex) Thread.sleep(50)
+                }
             }
             if (chunks.size > 1) log("$label chunking: ${json.length} chars -> ${chunks.size} chunks")
             txByteCount.addAndGet(estimateCapsSize(json))
