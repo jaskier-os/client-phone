@@ -138,6 +138,13 @@ class ChunkFramerTest {
     }
 
     @Test
+    fun streamIdsAreNotSeededAtZeroSoARestartCannotReplayThem() {
+        val n = ChunkFramer.frame("ch.a", prefix = null, json = "{}", maxChars = 10_000)[0][2]
+            .substringAfterLast('#').toLong()
+        assertTrue("stream counter must not restart from a low value, got $n", n > 1_000_000L)
+    }
+
+    @Test
     fun everyChunkOfOneCallSharesOneStreamIdAndSeqCountsFromZero() {
         val out = ChunkFramer.frame("ch.a", prefix = null, json = "x".repeat(25), maxChars = 10)
         assertEquals(3, out.size)

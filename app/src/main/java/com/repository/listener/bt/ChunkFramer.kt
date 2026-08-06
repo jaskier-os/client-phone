@@ -68,5 +68,9 @@ object ChunkFramer {
      */
     const val SENTINEL = "\u0001cs#"
 
-    private val streamCounter = AtomicLong(0)
+    /**
+     * Seeded from the wall clock so a stream id minted after a process restart cannot collide with
+     * one a receiver is still buffering. A plain zero-based counter would restart at 1 every launch.
+     */
+    private val streamCounter = AtomicLong(System.currentTimeMillis())
 }
