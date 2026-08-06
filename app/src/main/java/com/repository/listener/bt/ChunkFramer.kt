@@ -30,8 +30,10 @@ object ChunkFramer {
         var start = 0
         while (start < json.length) {
             var end = minOf(start + maxChars, json.length)
-            // Avoid splitting a surrogate pair
-            if (end < json.length && Character.isHighSurrogate(json[end - 1])) end--
+            // Avoid splitting a surrogate pair. The end - 1 > start guard keeps the pullback from
+            // producing an empty piece (and thus a non-terminating loop) when maxChars is 1; the
+            // original inline loop had no such guard. Unreachable at MAX_CAPS_CHARS.
+            if (end < json.length && end - 1 > start && Character.isHighSurrogate(json[end - 1])) end--
             val isFinal = end >= json.length
             out.add(json.substring(start, end) to isFinal)
             start = end

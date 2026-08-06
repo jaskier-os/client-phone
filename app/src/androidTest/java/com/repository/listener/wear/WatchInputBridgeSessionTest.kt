@@ -79,6 +79,9 @@ class WatchInputBridgeSessionTest {
     @After
     fun tearDown() {
         if (::bridge.isInitialized) bridge.shutdown()
+        // Static, and the relay-teardown tests set it. Leaving it true would make the
+        // NEXT test's bridge reach for a relay that does not exist.
+        com.repository.listener.service.ListenerService.audioRelayActive = false
     }
 
     /**
@@ -332,6 +335,74 @@ class WatchInputBridgeSessionTest {
         assertTrue(
             "a completed wake must clear immediately",
             !statusHas(RemoteInputProtocol.StatusFlags.WAKING_GLASSES),
+        )
+    }
+
+    /**
+     * A real user action tears down the desktop audio relay; keepalive traffic must not.
+     *
+     * Inverting the priority so input wins is the easy half. The half that is easy to
+     * get wrong is the TRIGGER: a PING arrives every 10 s whether or not anyone has
+     * touched the watch, so triggering on it would tear the relay down forever and make
+     * desktop audio permanently unusable. OPEN is the same -- it fires whenever the
+     * watch app is merely foregrounded. That distinction IS the feature.
+     */
+    @Test
+    fun onlyRealInputTearsDownTheAudioRelay() {
+        val reasons = mutableListOf<String>()
+        val relayUp = java.util.concurrent.atomic.AtomicBoolean(true)
+        bridge = WatchInputBridge(
+            inputClient = transport,
+            statusSender = { bits -> synchronized(statuses) { statuses += bits } },
+            stopAudioRelay = { reason ->
+                synchronized(reasons) { reasons += reason }
+                relayUp.getAndSet(false)
+            },
+        )
+        // The bridge early-outs on this flag, so without it the SCROLL assertion below
+        // would fail for the wrong reason and the PING assertion would pass vacuously.
+        com.repository.listener.service.ListenerService.audioRelayActive = true
+
+        feed(sid = 110, seq = 1, type = EventType.OPEN)
+        feed(sid = 110, seq = 2, type = EventType.PING)
+        drain()
+        assertEquals(
+            "keepalive and session traffic must NOT stop the relay; doing so would " +
+                "kill desktop audio every 10 seconds forever",
+            emptyList<String>(), synchronized(reasons) { reasons.toList() },
+        )
+        assertTrue("the relay must still be up", relayUp.get())
+
+        feed(sid = 110, seq = 3, type = EventType.SCROLL, steps = 1)
+        drain()
+        assertEquals(
+            "a real user action must stop the relay",
+            listOf("watch SCROLL"), synchronized(reasons) { reasons.toList() },
+        )
+    }
+
+    /**
+     * A burst must not attempt a teardown per frame: the bezel produces up to ~30
+     * detents/s and the relay is already down after the first one.
+     */
+    @Test
+    fun aBurstAttemptsAtMostOneTeardown() {
+        val calls = java.util.concurrent.atomic.AtomicInteger(0)
+        val relayUp = java.util.concurrent.atomic.AtomicBoolean(true)
+        bridge = WatchInputBridge(
+            inputClient = transport,
+            statusSender = { bits -> synchronized(statuses) { statuses += bits } },
+            stopAudioRelay = { calls.incrementAndGet(); relayUp.getAndSet(false) },
+        )
+        com.repository.listener.service.ListenerService.audioRelayActive = true
+
+        feed(sid = 111, seq = 1, type = EventType.OPEN)
+        for (i in 2..31) feed(sid = 111, seq = i, type = EventType.SCROLL, steps = 1)
+        drain()
+
+        assertTrue(
+            "30 detents must not attempt 30 teardowns; got ${calls.get()}",
+            calls.get() <= 1,
         )
     }
 
