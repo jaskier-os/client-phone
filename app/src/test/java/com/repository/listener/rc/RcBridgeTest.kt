@@ -19,13 +19,14 @@ class RcBridgeTest {
         val userResponses = mutableListOf<Triple<String, String, String>>()
         val reads = mutableListOf<Pair<String, Long>>()
         val transcriptRequests = mutableListOf<String>()
+        var linkUp = true
         var observeOpenDuringMarkRead = false
         val openDuringMarkRead = mutableListOf<String?>()
         private var bridgeRef: RcBridge? = null
 
         val bridge: RcBridge = RcBridge(
             store = store,
-            send = { channel, args -> sent.add(channel to args.toList()) },
+            send = { channel, args -> sent.add(channel to args.toList()); linkUp },
             sendUserMessage = { sid, text ->
                 userMessages.add(sid to text); sendUserMessageImpl(sid, text)
             },
@@ -152,6 +153,21 @@ class RcBridgeTest {
         assertEquals("tools", row.getString("r"))
         assertEquals("Read, Grep", row.getString("x"))
         assertEquals(7, row.getInt("c"))
+    }
+
+    @Test
+    fun aRowPushReportsWhetherTheFrameReachedTheGlasses() {
+        val h = Harness()
+        h.bridge.handleMessagesReq(listOf("sess-1", "-1"))
+        assertTrue(h.bridge.pushRows("sess-1", listOf(RcRow(1, "assistant", "done"))))
+        h.linkUp = false
+        assertTrue(!h.bridge.pushRows("sess-1", listOf(RcRow(2, "assistant", "later"))))
+    }
+
+    @Test
+    fun aRowPushForAClosedThreadReportsNotDelivered() {
+        val h = Harness()
+        assertTrue(!h.bridge.pushRows("sess-1", listOf(RcRow(1, "assistant", "done"))))
     }
 
     @Test

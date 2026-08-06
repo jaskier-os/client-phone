@@ -16,7 +16,8 @@ import com.repository.listener.bt.BtProtocol
  */
 class RcBridge(
     private val store: RcMirrorStore,
-    private val send: (channel: String, args: Array<String>) -> Unit,
+    /** Writes one frame, returning whether it actually reached the socket. */
+    private val send: (channel: String, args: Array<String>) -> Boolean,
     private val sendUserMessage: (sessionId: String, text: String) -> Unit,
     private val sendUserResponse: (sessionId: String, requestId: String, text: String) -> Unit,
     private val markRead: (sessionId: String, seenSeq: Long) -> Unit,
@@ -87,10 +88,15 @@ class RcBridge(
         sendUserResponse(sessionId, requestId, text)
     }
 
-    /** Live delta for the open thread. Rows for any other session are dropped. */
-    fun pushRows(sessionId: String, rows: List<RcRow>) = synchronized(lock) {
-        if (rows.isEmpty() || sessionId != openSessionId) return@synchronized
-        emitRows(sessionId, rows to false)
+    /**
+     * Live delta for the open thread. Rows for any other session are dropped.
+     *
+     * @return true when the frame reached the glasses. Delivering rows to an open thread counts as
+     *         the read, so a dropped frame must never be mistaken for one the user has seen.
+     */
+    fun pushRows(sessionId: String, rows: List<RcRow>): Boolean = synchronized(lock) {
+        if (rows.isEmpty() || sessionId != openSessionId) return false
+        return emitRows(sessionId, rows to false)
     }
 
     /**
@@ -104,7 +110,7 @@ class RcBridge(
         emitRows(sessionId, store.tail(sessionId))
     }
 
-    private fun emitRows(sessionId: String, tail: Pair<List<RcRow>, Boolean>) {
+    private fun emitRows(sessionId: String, tail: Pair<List<RcRow>, Boolean>): Boolean {
         var (rows, moreAbove) = tail
         // Escaping can multiply a row's 300 chars sixfold (a control char becomes \u00xx), so the
         // cap has to be enforced on the serialized bytes, not assumed from the row cap. Older rows
@@ -115,7 +121,7 @@ class RcBridge(
             moreAbove = true
             body = serialize(rows, moreAbove)
         }
-        send(BtProtocol.CH_RC_MESSAGES_RESP, arrayOf(sessionId, body))
+        return send(BtProtocol.CH_RC_MESSAGES_RESP, arrayOf(sessionId, body))
     }
 
     private fun serialize(rows: List<RcRow>, moreAbove: Boolean): String {

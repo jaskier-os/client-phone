@@ -9029,8 +9029,10 @@ class ListenerService : LifecycleService(),
                 // -- without that the bar stays lit behind a thread the user is actively reading,
                 // because the glasses never send another messages request.
                 val rows = rcMirror.commitTurn(sessionId)
-                if (rcBridge.openSessionId == sessionId) {
-                    rcBridge.pushRows(sessionId, rows)
+                rcSeenToolCallIds.clear()
+                // Clearing unread is conditional on the rows actually reaching the glasses: a
+                // dropped frame that still cleared the bar would lose the turn silently.
+                if (rcBridge.openSessionId == sessionId && rcBridge.pushRows(sessionId, rows)) {
                     markRcRead(sessionId)
                 }
                 pushRcState(force = true)
@@ -9157,6 +9159,10 @@ class ListenerService : LifecycleService(),
         }
         val json = com.repository.listener.rc.RcStateSnapshot.build(orchestratorConnected, sessions)
         if (!force && json == lastPushedStateJson) return@synchronized
+        // Written synchronously, one frame, exactly as every other single-frame send in PhoneBtHost
+        // already is from these same threads. The multi-second hazard was the chunked sleep loop,
+        // and that now runs on its own sender thread. Keeping this synchronous also keeps state
+        // frames ordered against the row frames RcBridge writes.
         // Cached only on a confirmed write: a dropped frame must not be deduped away next time.
         lastPushedStateJson = if (phoneBtHost.sendRcStateIfConnected(json)) json else null
     }
@@ -9165,6 +9171,13 @@ class ListenerService : LifecycleService(),
 
     /** sessionId -> last time anything happened on it, for the 8-most-recent truncation. */
     private val rcLastActivityMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Tool call ids already counted, so the several status events of one call are not counted
+     * several times. Bounded because one tool chain is finite and the set is cleared per turn.
+     */
+    private val rcSeenToolCallIds: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
 
     private fun touchRcSession(sessionId: String) {
         rcLastActivityMs[sessionId] = System.currentTimeMillis()
@@ -9244,9 +9257,12 @@ class ListenerService : LifecycleService(),
             prev?.copy(turning = true)
         }
         touchRcSession(sessionId)
-        // Only "calling" is a distinct tool invocation; a completion event for the same call would
-        // otherwise double the count.
-        if (status == "calling") rcMirror.noteTool(sessionId, toolName)
+        // Count each invocation once. "calling" and "running" are both in-flight states for one
+        // call and a tool may arrive first as either, so key on the toolCallId when there is one
+        // and fall back to the in-flight statuses otherwise.
+        val firstEventForCall = if (toolCallId != null) rcSeenToolCallIds.add(toolCallId)
+        else status == "calling" || status == "running"
+        if (firstEventForCall) rcMirror.noteTool(sessionId, toolName)
         pushRcState()
         val data = JSONObject().apply {
             put("toolName", toolName)
@@ -10757,8 +10773,9 @@ class ListenerService : LifecycleService(),
     override fun onGlassesDisconnected() {
         LogCollector.i(TAG, "Glasses disconnected from BT")
         // Without this the byte-identical dedup would permanently suppress the corrective resync
-        // the next link-up owes: the glasses come back holding nothing.
-        lastPushedStateJson = null
+        // the next link-up owes: the glasses come back holding nothing. Under the push lock so it
+        // cannot be overwritten by a push already past its own send.
+        synchronized(rcStatePushLock) { lastPushedStateJson = null }
         // Clean up mouse HID bridge -- glasses can't send reports anymore
         phoneBtHost.onMouseReport = null
         phoneHidMouse?.destroy()

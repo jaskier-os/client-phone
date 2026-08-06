@@ -1920,31 +1920,26 @@ class PhoneBtHost(private val context: Context) {
         }
     }
 
-    /** One lock per channel, so a chunk loop is never interleaved with another on the same channel. */
-    private val chunkSendLocks = ConcurrentHashMap<String, Any>()
+    /**
+     * All chunked sends run here, one whole split-and-send loop at a time. This both keeps the
+     * seconds of inter-chunk sleep off the main looper and the WS reader thread, and serializes the
+     * loops so two large sends cannot interleave their chunks on the wire.
+     */
+    private val chunkSender = ChunkSender(
+        send = { channel, args -> rfcommClient.send(channel, *args) }
+    ).also { it.onError = { channel, e -> log("Chunked send on $channel failed: ${e.message}") } }
 
     /**
      * Send JSON to glasses via RelayCaps, chunking if payload exceeds CXR JNI limit.
      * Optional [prefix] is written as the first RelayCaps field in every chunk (e.g. conversationId).
+     *
+     * Asynchronous: the frames are written on the chunk-sender thread. No caller reads a result or
+     * sequences a later send against this one.
      */
     private fun sendChunkedJson(channel: String, json: String, label: String, prefix: String? = null) {
-        try {
-            val chunks = ChunkFramer.frame(channel, prefix, json, MAX_CAPS_CHARS)
-            // The whole split-and-send loop is serialized per channel. rfcommClient.send holds its
-            // write lock for a single frame only, and these wrappers are called from the IO pool,
-            // so without this two large sends on one channel interleave their chunks on the wire.
-            synchronized(chunkSendLocks.getOrPut(channel) { Any() }) {
-                chunks.forEachIndexed { i, args ->
-                    rfcommClient.send(channel, *args)
-                    if (i != chunks.lastIndex) Thread.sleep(50)
-                }
-            }
-            if (chunks.size > 1) log("$label chunking: ${json.length} chars -> ${chunks.size} chunks")
-            txByteCount.addAndGet(estimateCapsSize(json))
-            log("$label sent to glasses (${json.length} chars)")
-        } catch (e: Exception) {
-            log("Failed to send $label: ${e.message}")
-        }
+        chunkSender.send(channel, prefix, json, MAX_CAPS_CHARS)
+        txByteCount.addAndGet(estimateCapsSize(json))
+        log("$label queued for glasses (${json.length} chars)")
     }
 
     /**
