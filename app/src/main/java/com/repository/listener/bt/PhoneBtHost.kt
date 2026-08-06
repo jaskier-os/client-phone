@@ -1186,6 +1186,9 @@ class PhoneBtHost(private val context: Context) {
                             log("Telegram chat list requested by glasses (limit=$limit)")
                             onTelegramChatListRequested?.invoke(limit)
                         }
+                        BtProtocol.CH_RC_MESSAGES_REQ -> onRcMessagesReq?.invoke(argStrings(args, 2))
+                        BtProtocol.CH_RC_SEND_REQ -> onRcSendReq?.invoke(argStrings(args, 3))
+                        BtProtocol.CH_RC_ANSWER_REQ -> onRcAnswerReq?.invoke(argStrings(args, 3))
                         BtProtocol.CH_TG_MESSAGES_REQ -> {
                             try {
                                 val chatId = args.at(0).getString()
@@ -1969,6 +1972,24 @@ class PhoneBtHost(private val context: Context) {
 
     fun sendRcStateIfConnected(json: String): Boolean =
         sendRcIfConnected(BtProtocol.CH_RC_STATE_PUSH, json)
+
+    /** Inbound RC frames, delegated whole to RcBridge so this class holds none of the logic. */
+    var onRcMessagesReq: ((List<String>) -> Unit)? = null
+    var onRcSendReq: ((List<String>) -> Unit)? = null
+    var onRcAnswerReq: ((List<String>) -> Unit)? = null
+
+    /**
+     * Reads up to [max] RelayCaps fields as strings. RelayCaps has no arity accessor, so a missing
+     * field is read as absent rather than probed for.
+     */
+    private fun argStrings(args: RelayCaps, max: Int): List<String> {
+        val out = ArrayList<String>(max)
+        for (i in 0 until max) {
+            val v = try { args.at(i).getString() } catch (e: Exception) { null } ?: break
+            out.add(v)
+        }
+        return out
+    }
 
     fun sendChatListResponse(chatsJson: String) =
         sendChunkedJson(BtProtocol.CH_CHAT_LIST_RESPONSE, chatsJson, "Chat list")

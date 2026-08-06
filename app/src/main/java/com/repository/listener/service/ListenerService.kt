@@ -1026,6 +1026,7 @@ class ListenerService : LifecycleService(),
                     val text = intent.getStringExtra(EXTRA_RC_DATA) ?: return
                     LogCollector.i(TAG, "RC proactive user message from UI: session=$sessionId text=${text.take(40)}")
                     markRcTurning(sessionId, true)
+                    noteRcUserMessage(sessionId, text)
                     serviceScope.launch(Dispatchers.IO) {
                         orchestratorClient.sendRcUserMessage(sessionId, text)
                     }
@@ -3152,6 +3153,9 @@ class ListenerService : LifecycleService(),
         phoneBtHost.onTelegramMessagesRequested = { chatId, limit, topicId, offsetId ->
             serviceScope.launch(Dispatchers.IO) { orchestratorClient.sendTelegramMessages(chatId, limit, topicId, offsetId) }
         }
+        phoneBtHost.onRcMessagesReq = { args -> rcBridge.handleMessagesReq(args) }
+        phoneBtHost.onRcSendReq = { args -> rcBridge.handleSendReq(args) }
+        phoneBtHost.onRcAnswerReq = { args -> rcBridge.handleAnswerReq(args) }
         phoneBtHost.onTelegramSendRequested = { chatId, text, topicId ->
             serviceScope.launch(Dispatchers.IO) { orchestratorClient.sendTelegramSendMessage(chatId, text, topicId) }
         }
@@ -8958,6 +8962,7 @@ class ListenerService : LifecycleService(),
         // rcDumpState must stay in lockstep with the ACTION_RC_SESSION_START broadcast below.
         rcDumpState[sessionId] = RcDumpEntry(workDir, "active", false)
         touchRcSession(sessionId)
+        pushRcState(force = true)
         if (!rcSessionTurning.containsKey(sessionId)) {
             rcSessionTurning[sessionId] = false
             refreshRcNotification()
@@ -8981,6 +8986,10 @@ class ListenerService : LifecycleService(),
         rcGlassesNotifRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
         rcSessionTurning.remove(sessionId)
         rcTranscriptCache.remove(sessionId)
+        // Promptness only, NOT the memory bound: this hook never fires on a dropped WS, a PC-side
+        // CLI kill or a restart. The store's LRU is what actually bounds it.
+        rcMirror.clear(sessionId)
+        pushRcState(force = true)
         refreshRcNotification()
         LogCollector.i(TAG, "RC session ended: $sessionId")
         sendBroadcast(Intent(ACTION_RC_SESSION_END).apply {
@@ -9002,6 +9011,11 @@ class ListenerService : LifecycleService(),
             }
         }
         val unread = rcDumpState[sessionId]?.unread ?: false
+        // The text is cumulative, so this STORES the latest snapshot rather than appending, and
+        // nothing but the tiny state frame goes on the wire until the turn is really finished.
+        // isFinal carries a full snapshot too and fires between tool calls, so it is stored on the
+        // same footing -- only the debounce runnable decides a turn has ended.
+        if (text.isNotBlank()) rcMirror.noteAssistantText(sessionId, text)
         if (turnFinished) {
             // Debounce glasses notification: agentic Claude Code emits isFinal=true
             // between tool calls, so firing immediately would spam "Done" during
@@ -9010,6 +9024,16 @@ class ListenerService : LifecycleService(),
             rcGlassesNotifRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
             val r = Runnable {
                 rcGlassesNotifRunnables.remove(sessionId)
+                // Only here is a turn really over: raw isFinal fires between tool calls. Commit the
+                // rows, and if the glasses are sitting in this thread, delivering them IS the read
+                // -- without that the bar stays lit behind a thread the user is actively reading,
+                // because the glasses never send another messages request.
+                val rows = rcMirror.commitTurn(sessionId)
+                if (rcBridge.openSessionId == sessionId) {
+                    rcBridge.pushRows(sessionId, rows)
+                    markRcRead(sessionId)
+                }
+                pushRcState(force = true)
                 val entry = rcDumpState[sessionId]
                 val folder = folderNameFromWorkDir(entry?.workDir)
                 val title = entry?.sessionName
@@ -9072,6 +9096,7 @@ class ListenerService : LifecycleService(),
             putExtra(EXTRA_RC_SESSION_ID, sessionId)
             putExtra(EXTRA_RC_DATA, data)
         })
+        pushRcState()
     }
 
     /**
@@ -9146,6 +9171,18 @@ class ListenerService : LifecycleService(),
     }
 
     /**
+     * Records an outgoing user message as a row and pushes it straight to an open glasses thread.
+     * The glasses render NO optimistic local row -- seq is minted phone-side and the row schema
+     * carries no correlation id, so a local row could never be matched away and would render twice.
+     */
+    private fun noteRcUserMessage(sessionId: String, text: String) {
+        touchRcSession(sessionId)
+        val row = rcMirror.appendUser(sessionId, text)
+        rcBridge.pushRows(sessionId, listOf(row))
+        pushRcState(force = true)
+    }
+
+    /**
      * Clears the unread flag for the given RC session. Called when the user opens
      * the RC chat row in the chats list. Idempotent: re-broadcast only when the
      * flag actually changed. In-memory only -- matches the lifetime of rcDumpState.
@@ -9178,6 +9215,9 @@ class ListenerService : LifecycleService(),
 
     override fun onRcPermissionRequest(sessionId: String, toolName: String, toolArgs: String, requestId: String, description: String?) {
         thinkingRcStartTimes.remove(sessionId)
+        touchRcSession(sessionId)
+        rcMirror.appendPrompt(sessionId, description ?: toolName, emptyList())
+        pushRcState(force = true)
         val data = JSONObject().apply {
             put("toolName", toolName)
             put("toolArgs", toolArgs)
@@ -9203,6 +9243,11 @@ class ListenerService : LifecycleService(),
         rcDumpState.compute(sessionId) { _, prev ->
             prev?.copy(turning = true)
         }
+        touchRcSession(sessionId)
+        // Only "calling" is a distinct tool invocation; a completion event for the same call would
+        // otherwise double the count.
+        if (status == "calling") rcMirror.noteTool(sessionId, toolName)
+        pushRcState()
         val data = JSONObject().apply {
             put("toolName", toolName)
             put("status", status)
@@ -9290,6 +9335,9 @@ class ListenerService : LifecycleService(),
 
     override fun onRcUserInput(sessionId: String, prompt: String, requestId: String) {
         thinkingRcStartTimes.remove(sessionId)
+        touchRcSession(sessionId)
+        rcMirror.appendPrompt(sessionId, prompt, emptyList())
+        pushRcState(force = true)
         val data = JSONObject().apply {
             put("prompt", prompt)
             put("requestId", requestId)
@@ -9309,6 +9357,9 @@ class ListenerService : LifecycleService(),
         // broadcast". Stash the payload in an in-process cache and pass
         // only the sessionId via the broadcast.
         rcTranscriptCache[sessionId] = transcript
+        // Seeds and replies only when this session is still the one the glasses have open, so rows
+        // belonging to one thread can never render tagged as another after a navigation.
+        rcBridge.onTranscript(sessionId, transcript)
         sendBroadcast(Intent(ACTION_RC_TRANSCRIPT).apply {
             setPackage(packageName)
             putExtra(EXTRA_RC_SESSION_ID, sessionId)
@@ -10937,6 +10988,22 @@ class ListenerService : LifecycleService(),
      * like rcDumpState. Its 8-entry LRU is the sole memory bound (see RcMirrorStore.MAX_SESSIONS).
      */
     private val rcMirror = com.repository.listener.rc.RcMirrorStore()
+
+    /** Owns the six RC mirror channels so neither PhoneBtHost nor this class grows the logic. */
+    private val rcBridge = com.repository.listener.rc.RcBridge(
+        store = rcMirror,
+        send = { channel, args -> phoneBtHost.sendRcIfConnected(channel, *args) },
+        sendUserMessage = { sessionId, text ->
+            orchestratorClient.sendRcUserMessage(sessionId, text)
+            noteRcUserMessage(sessionId, text)
+        },
+        sendUserResponse = { sessionId, requestId, text ->
+            orchestratorClient.sendRcUserResponse(sessionId, requestId, text)
+        },
+        markRead = { sessionId, seenSeq -> markRcRead(sessionId, seenSeq) },
+        requestTranscript = { sessionId -> orchestratorClient.requestRcTranscript(sessionId) },
+        cachedTranscript = { sessionId -> rcTranscriptCache[sessionId] }
+    )
     // Pending "mark this session as done" runnables, keyed by sessionId. Used to
     // debounce isFinal MESSAGE events: agentic Claude Code emits isFinal=true
     // between tool calls (text -> tool -> text -> tool -> final), so clearing
