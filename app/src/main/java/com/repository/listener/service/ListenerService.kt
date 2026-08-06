@@ -5502,8 +5502,13 @@ class ListenerService : LifecycleService(),
             }
 
             "sideload_upload" -> {
-                val downloadUrl = params?.optString("downloadUrl", "") ?: ""
-                val fileName = params?.optString("fileName", "") ?: ""
+                // downloadUrl is injected by the orchestrator onto the command itself,
+                // not into params, so read either. Taking only params meant every
+                // upload over this route was refused as "missing downloadUrl".
+                val downloadUrl = params?.optString("downloadUrl", "")
+                    ?.ifEmpty { command.optString("downloadUrl", "") } ?: ""
+                val fileName = params?.optString("fileName", "")
+                    ?.ifEmpty { command.optString("fileName", "") } ?: ""
                 if (downloadUrl.isEmpty() || fileName.isEmpty()) {
                     orchestratorClient.sendDeviceResponse(
                         requestId, "sideload_upload",
