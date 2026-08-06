@@ -56,9 +56,8 @@ object ComplicationCopy {
         // Each refusal keeps its own word even at a seven-glyph budget. Collapsing
         // them to a shared "Refused" was tried and is wrong: the complication is
         // the surface the user reads WITHOUT opening the app, so it is the one
-        // place the reason matters most, and three states rendering identically
+        // place the reason matters most, and several states rendering identically
         // is the same indistinguishability the refusal signal exists to remove.
-        LinkState.REFUSED_HERE -> "Blocked"
         LinkState.REFUSED_FOLDED -> "Folded"
         LinkState.REFUSED_LOCKED -> "In use"
         LinkState.REFUSED -> "Refused"
@@ -85,7 +84,6 @@ object ComplicationCopy {
         LinkState.PHONE_ONLY -> "Glasses offline"
         LinkState.GLASSES_BUSY -> "Glasses busy"
         LinkState.DEGRADED -> "Losing input"
-        LinkState.REFUSED_HERE -> "Not allowed here"
         LinkState.REFUSED_FOLDED -> "Glasses folded"
         // Not "Glasses busy": GLASSES_BUSY already owns that phrasing and the two
         // are different problems -- that one is a display that is not listening,
@@ -128,7 +126,6 @@ object ComplicationCopy {
         // health these would sit alongside READY -- but the arc is read as "can I
         // use this right now", and a full arc while every tap is being declined
         // is exactly the false reassurance the refusal signal exists to end.
-        LinkState.REFUSED_HERE,
         LinkState.REFUSED_FOLDED,
         LinkState.REFUSED_LOCKED,
         LinkState.REFUSED,

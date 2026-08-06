@@ -170,9 +170,10 @@ class ComplicationCopyTest {
 
     @Test
     fun `every refusal reason maps to its own state, title and slot word`() {
-        // The whole point of carrying a reason is that "not allowed here",
-        // "folded" and "in use" send the user to different actions. If any two
-        // collapse to the same state or the same words, the reason was wasted.
+        // The whole point of carrying a reason is that "folded" and "in use" send
+        // the user to different actions. If any two collapse to the same state or
+        // the same words, the reason was wasted -- which is also why a denial with
+        // no action attached to it is not carried at all, but consumed silently.
         val mapped = RemoteInputProtocol.RefusalReason.values().map { reason ->
             stateFor(RemoteInputProtocol.StatusFlags.encodeReason(
                 healthyBits() or RemoteInputProtocol.StatusFlags.GLASSES_REFUSING_INPUT,

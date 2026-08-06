@@ -511,27 +511,32 @@ object RemoteInputProtocol {
 
     // ---- Status backchannel (phone -> watch), 1 byte ----
 
-    /**
-     * Advisory only, and deliberately NOT authenticated: the tag key lives on the
-     * watch and the glasses, not on the phone, so the phone cannot sign anything.
-     *
-     * The consequence is a real and accepted limitation, stated plainly rather
-     * than papered over: any app able to deliver on this path can forge a status
-     * frame. The containment is that status is advisory input to the watch's
-     * DISPLAY state only. It must never be allowed to make the watch send more,
-     * nor to clear a failure the watch observed locally -- see
-     * [applyAdvisory], which is where that rule is enforced.
-     */
+    // This whole backchannel is advisory only, and deliberately NOT authenticated: the tag
+    // key lives on the watch and the glasses, not on the phone, so the phone cannot sign
+    // anything.
+    //
+    // The consequence is a real and accepted limitation, stated plainly rather than papered
+    // over: any app able to deliver on this path can forge a status frame. The containment is
+    // that status is advisory input to the watch's DISPLAY state only. It must never be
+    // allowed to make the watch send more, nor to clear a failure the watch observed locally
+    // -- see applyAdvisory and foldStatus, which are where that rule is enforced.
+
     /**
      * Why the glasses are declining input, as carried to the watch.
      *
      * Ordinals are wire values: append only, never reorder.
      */
     enum class RefusalReason(val code: Int) {
-        /** Not permitted in the current UI state. The user must go back, or act on the glasses. */
-        NOT_ALLOWED(1),
-
-        /** The glasses are folded. */
+        /**
+         * The glasses are folded.
+         *
+         * Code 2, with no code 1 above it. Code 1 was `NOT_ALLOWED` -- "this action is
+         * not on the allowlist for this state" -- which is no longer reported at all:
+         * an action the gate does not permit is simply consumed, silently. It was the
+         * overwhelmingly common denial (every BACK at the top level produces one) and
+         * saying so told the user nothing they could act on, unlike these two. Codes are
+         * wire values, so the retired one is left unused rather than reassigned.
+         */
         FOLDED(2),
 
         /** A call, recording or reply owns the glasses UI. */
@@ -693,13 +698,17 @@ object RemoteInputProtocol {
          * without already being able to answer our pings.
          *
          * Every path that clears a health bit must therefore have a matching path that can
-         * set it, which is the invariant [assertNoAbsorbingHealthBit] pins down.
+         * set it, which is the invariant [assertNoAbsorbingBit] pins down.
          *
          * @param correlated true when this frame answers the watch's own outstanding PING.
          */
         fun foldStatus(current: Int, received: Int, correlated: Boolean): Int =
             applyAdvisory(
-                current = if (correlated) current or healthBitsIn(received) else current,
+                current = if (correlated) {
+                    (current or healthBitsIn(received)) and problemBitsIn(received).inv()
+                } else {
+                    current
+                },
                 received = received,
                 trusted = false,
             )
@@ -708,16 +717,61 @@ object RemoteInputProtocol {
             bits and (GLASSES_LINK_UP or PHONE_SERVICE_ALIVE or GLASSES_SINK_ATTACHED)
 
         /**
-         * Executable statement of the invariant: no health bit is absorbing.
+         * The problem bits NOT asserted by [bits], i.e. the ones it reports as resolved.
          *
-         * For each health bit, having lost it must not prevent regaining it once a
-         * correlated frame reports it healthy. Called from tests and from the watch's own
-         * startup, so the property is checked rather than merely documented -- a comment
-         * saying "do not latch this" is what failed the previous two times.
+         * Named for what it is used for: [foldStatus] clears exactly these off `current`
+         * when the frame is correlated. Problem bits are OR-folded by [applyAdvisory] so a
+         * forger can raise them, which -- with nothing able to lower them again -- made
+         * every one of them absorbing: a single refusal pinned the watch at
+         * "Not allowed here" for the life of the process while the phone was reporting no
+         * refusal at all on every subsequent frame. That is the fourth bug of this exact
+         * shape on this feature, so it is fixed the same structural way as the health bits
+         * rather than at one careful caller, and pinned by [assertNoAbsorbingBit].
          */
-        fun assertNoAbsorbingHealthBit() {
+        private fun problemBitsIn(bits: Int): Int =
+            (LAST_SEND_DROPPED or WAKING_GLASSES or GLASSES_REFUSING_INPUT) and bits.inv()
+
+        /**
+         * Executable statement of the invariant: NO bit is absorbing, in either direction.
+         *
+         * A health bit that has been lost must be regainable, and a problem bit that has
+         * been raised must be clearable, once a correlated frame says so. Called from tests,
+         * so the property is checked rather than merely documented -- a comment saying "do
+         * not latch this" is what failed every previous time.
+         *
+         * Both directions are asserted here because they are the same bug wearing two
+         * faces: the health direction pinned the watch at "Phone service down", and the
+         * problem direction pinned it at "Not allowed here". Checking only the direction
+         * that happened to break last is what let the second one ship.
+         */
+        fun assertNoAbsorbingBit() {
             val healthBits = listOf(GLASSES_LINK_UP, PHONE_SERVICE_ALIVE, GLASSES_SINK_ATTACHED)
+            val problemBits = listOf(LAST_SEND_DROPPED, WAKING_GLASSES, GLASSES_REFUSING_INPUT)
             val allHealthy = healthBits.fold(0) { acc, b -> acc or b }
+
+            // A problem bit raised once must be cleared by a frame that no longer reports it.
+            for (bit in problemBits) {
+                val latchedOn = foldStatus(
+                    current = allHealthy,
+                    received = allHealthy or bit,
+                    correlated = true,
+                )
+                check(latchedOn and bit != 0) {
+                    "status bit $bit was not raised by a frame reporting it, so the watch " +
+                        "would never learn about the problem at all"
+                }
+                val cleared = foldStatus(
+                    current = latchedOn,
+                    received = allHealthy,
+                    correlated = true,
+                )
+                check(cleared and bit == 0) {
+                    "status bit $bit is absorbing: once raised it can never be cleared, so " +
+                        "the watch would report a problem that has long since resolved for " +
+                        "the life of the process"
+                }
+            }
+
             for (bit in healthBits) {
                 val latchedOff = allHealthy and bit.inv()
                 val recovered = foldStatus(

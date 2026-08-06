@@ -148,17 +148,58 @@ class LinkTimingCoherenceTest {
     }
 
     /**
-     * The third instance of the absorbing-bit class, stated as an invariant over EVERY
-     * health bit rather than as a case for the one that was reported.
+     * The absorbing-bit class, stated as an invariant over EVERY bit in both directions
+     * rather than as a case for whichever one was last reported.
      *
-     * `applyAdvisory` is only ever called with `trusted = false`, and health was re-seeded
-     * only in `openSession()`, which runs once per process. So one `replyPhoneStopped`
-     * during the ordinary cold-start race pinned the watch at "Phone service down" for
-     * the life of the process, and reopening the phone app could not clear it.
+     * Health direction: `applyAdvisory` is only ever called with `trusted = false`, and
+     * health was re-seeded only in `openSession()`, which runs once per process. So one
+     * `replyPhoneStopped` during the ordinary cold-start race pinned the watch at "Phone
+     * service down" for the life of the process.
+     *
+     * Problem direction: problem bits are OR-folded and nothing lowered them, so a single
+     * refusal pinned the watch at "Not allowed here" indefinitely while every subsequent
+     * frame from the phone reported no refusal at all.
      */
     @Test
-    fun noHealthBitIsAbsorbing() {
-        StatusFlags.assertNoAbsorbingHealthBit()
+    fun noBitIsAbsorbing() {
+        StatusFlags.assertNoAbsorbingBit()
+    }
+
+    /**
+     * The problem-bit clear must be earned by CORRELATION, exactly like the health-bit
+     * recovery. Without this the fix for the latch would hand any writer on this
+     * unauthenticated channel the power to erase a failure the watch observed.
+     */
+    @Test
+    fun anUncorrelatedFrameCannotClearAProblemBit() {
+        val healthy = StatusFlags.decode(
+            StatusFlags.encode(
+                glassesLinkUp = true, phoneServiceAlive = true, lastSendDropped = false,
+                glassesSinkAttached = true, wakingGlasses = false,
+            )
+        )
+        val refusing = StatusFlags.decode(
+            StatusFlags.encode(
+                glassesLinkUp = true, phoneServiceAlive = true, lastSendDropped = false,
+                glassesSinkAttached = true, wakingGlasses = false,
+                glassesRefusingInput = true, refusalReason = RemoteInputProtocol.RefusalReason.LOCKED,
+            )
+        )
+        var bits = StatusFlags.foldStatus(healthy, refusing, correlated = true)
+        assertTrue(
+            "the refusal must be observed",
+            StatusFlags.isSet(bits, StatusFlags.GLASSES_REFUSING_INPUT),
+        )
+        repeat(5) { bits = StatusFlags.foldStatus(bits, healthy, correlated = false) }
+        assertTrue(
+            "an uncorrelated frame must never clear an observed refusal",
+            StatusFlags.isSet(bits, StatusFlags.GLASSES_REFUSING_INPUT),
+        )
+        bits = StatusFlags.foldStatus(bits, healthy, correlated = true)
+        assertTrue(
+            "a correlated frame reporting no refusal must clear it",
+            !StatusFlags.isSet(bits, StatusFlags.GLASSES_REFUSING_INPUT),
+        )
     }
 
     /**

@@ -190,27 +190,25 @@ enum class LinkState(
     /**
      * The link is healthy and the glasses are DECLINING input anyway.
      *
-     * These three are the only states that describe the far end's UI rather than
-     * the link, and they exist because the link being perfect explains nothing to
-     * a user whose taps are doing nothing. Each carries the reason the glasses
-     * gave, because "it is not working" and "you cannot do that HERE" send the
-     * user to completely different actions.
+     * These are the only states that describe the far end's UI rather than the
+     * link, and they exist because the link being perfect explains nothing to a
+     * user whose taps are doing nothing. Each carries the reason the glasses gave,
+     * because "unfold them" and "finish what is on screen" send the user to
+     * different actions.
+     *
+     * What is deliberately NOT here is a state for "that action is not permitted
+     * in this screen". The glasses still refuse those -- the gate is untouched --
+     * but the refusal is consumed silently rather than surfaced. It was by far the
+     * most common denial (every BACK at the top level produces one) and the only
+     * one with no action attached to it: unlike folded or busy, there is nothing
+     * for the user to go and fix. Telling them was pure alarm.
      *
      * Input stays ENABLED: the refusal describes the glasses' state a moment ago,
      * the user is very likely about to move somewhere input is accepted, and
      * gating sends on a stale refusal would remove the very gesture -- back --
      * that gets them out. The watch reports the refusal; it does not enforce it.
-     */
-    REFUSED_HERE(
-        title = "Not allowed here",
-        hint = "Double tap to go back",
-        severity = LinkSeverity.WORKING,
-        inputEnabled = true,
-        isRefusal = true,
-    ),
-
-    /**
-     * The glasses are folded, so nothing can be displayed to act on.
+     *
+     * This one: the glasses are folded, so nothing can be displayed to act on.
      *
      * WORKING rather than BLOCKED, despite reading like a hard stop. BLOCKED is
      * defined as "the watch is not sending", and this state does send -- the user
@@ -310,7 +308,6 @@ enum class LinkState(
             // nothing the user did had any effect.
             if (StatusFlags.isSet(bits, StatusFlags.GLASSES_REFUSING_INPUT)) {
                 return when (StatusFlags.decodeReason(bits)) {
-                    RemoteInputProtocol.RefusalReason.NOT_ALLOWED -> REFUSED_HERE
                     RemoteInputProtocol.RefusalReason.FOLDED -> REFUSED_FOLDED
                     RemoteInputProtocol.RefusalReason.LOCKED -> REFUSED_LOCKED
                     // A reason this build does not know, or none supplied at all.
