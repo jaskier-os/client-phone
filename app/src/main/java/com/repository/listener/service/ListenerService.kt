@@ -9094,8 +9094,14 @@ class ListenerService : LifecycleService(),
      * Clears the unread flag for the given RC session. Called when the user opens
      * the RC chat row in the chats list. Idempotent: re-broadcast only when the
      * flag actually changed. In-memory only -- matches the lifetime of rcDumpState.
+     *
+     * [seenSeq] is the highest row seq the caller has actually rendered. The glasses pass a real
+     * value so a turn committing between their render and this call keeps its unread bar; the phone
+     * UI renders everything it holds and passes the default.
      */
-    fun markRcRead(sessionId: String) {
+    fun markRcRead(sessionId: String, seenSeq: Long = Long.MAX_VALUE) {
+        if (!com.repository.listener.rc.RcReadPolicy.shouldClearUnread(
+                rcMirror.lastSeq(sessionId), seenSeq)) return
         var changed = false
         rcDumpState.compute(sessionId) { _, previous ->
             when {
@@ -10860,6 +10866,12 @@ class ListenerService : LifecycleService(),
 
     // sessionId -> turning? (true = AI currently generating for that session)
     private val rcSessionTurning = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+
+    /**
+     * Bounded projection of RC events into rows the glasses render. Dies with the service, exactly
+     * like rcDumpState. Its 8-entry LRU is the sole memory bound (see RcMirrorStore.MAX_SESSIONS).
+     */
+    private val rcMirror = com.repository.listener.rc.RcMirrorStore()
     // Pending "mark this session as done" runnables, keyed by sessionId. Used to
     // debounce isFinal MESSAGE events: agentic Claude Code emits isFinal=true
     // between tool calls (text -> tool -> text -> tool -> final), so clearing
