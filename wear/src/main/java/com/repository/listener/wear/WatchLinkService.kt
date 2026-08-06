@@ -606,7 +606,21 @@ class WatchLinkService : Service() {
             lastFrameSentMs != 0L &&
             now - lastFrameSentMs >= RemoteInputProtocol.SESSION_EXPIRY_MS
         ) {
-            Log.i(TAG, "re-opening sid=${sid.toUInt()} after ${now - lastFrameSentMs}ms silence")
+            // Mint a new sid rather than re-announcing the old one. Reusing it puts the
+            // receiver on its resume path, which keeps the previous session's sequence
+            // high-water mark -- correct while this process keeps counting up, but fatal
+            // once the process has restarted in between: the counter is back near zero,
+            // every frame lands under the mark, and the link rejects input for good while
+            // still looking healthy. A fresh sid is always higher, so it is never mistaken
+            // for a replay and it carries its own floor.
+            val previous = sid
+            sid = mintSid()
+            synchronized(sendLock) { seq = 0 }
+            Log.i(
+                TAG,
+                "re-opening as sid=${sid.toUInt()} (was ${previous.toUInt()}) " +
+                    "after ${now - lastFrameSentMs}ms silence",
+            )
             sessionOpenSent = false
         }
         // Every session must announce itself before it can act. OPEN itself is
