@@ -439,8 +439,11 @@ private fun DrawScope.drawWaves(engine: FeedbackEngine, tint: Color, stroke: Str
  * scroll the glasses for many seconds, and in the wrong direction.
  *
  * Dividing the factor back out restores the normalized -1..+1 per detent that the
- * hardware actually reports (verified via `dumpsys input`: SCROLL min=-1 max=+1),
- * and re-negating restores the sign convention where positive means forward/down.
+ * hardware actually reports (verified via `dumpsys input`: SCROLL min=-1 max=+1).
+ *
+ * Compose's negation is left in place rather than undone: turning the bezel
+ * clockwise then moves the glasses forward, which is the direction the wearer
+ * expects and the one the physical touchpad already gives for a forward swipe.
  *
  * The factor is queried per event rather than cached because it is
  * configuration-dependent and this is a single cheap field read. This function is
@@ -449,5 +452,5 @@ private fun DrawScope.drawWaves(engine: FeedbackEngine, tint: Color, stroke: Str
  */
 internal fun rawAxisScroll(view: View, verticalScrollPixels: Float): Float {
     val factor = ViewConfiguration.get(view.context).scaledVerticalScrollFactor
-    return if (factor <= 0f) -verticalScrollPixels else -verticalScrollPixels / factor.toFloat()
+    return if (factor <= 0f) verticalScrollPixels else verticalScrollPixels / factor.toFloat()
 }
