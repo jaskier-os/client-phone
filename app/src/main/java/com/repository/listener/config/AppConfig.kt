@@ -41,9 +41,10 @@ object AppConfig {
     private const val KEY_ASSISTANT_INTERLOCUTOR_LANGUAGE = "assistant_interlocutor_language"
     private const val KEY_ASSISTANT_INTERLOCUTOR_SOURCE = "assistant_interlocutor_source"
     private const val KEY_ASSISTANT_MODEL = "assistant_model"
-    // Fastest model + the only one the Communicator does not wrap in adaptive
-    // thinking, so it is the right default for the every-5-10s fact-check.
-    const val DEFAULT_ASSISTANT_MODEL = "haiku"
+    // haiku is faster and the only model the Communicator does not wrap in
+    // adaptive thinking, which suits the every-5-10s fact-check cadence, but
+    // its judgements were not good enough to be worth the latency it saves.
+    const val DEFAULT_ASSISTANT_MODEL = "sonnet"
     private const val KEY_GLASSES_CHAT_FONT_SIZE = "glasses_chat_font_size"
     private const val KEY_PINNED_CHAT_IDS = "pinned_chat_ids"
     private const val KEY_USER_SYSTEM_PROMPT = "user_system_prompt"
