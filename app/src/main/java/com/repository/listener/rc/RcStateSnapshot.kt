@@ -30,19 +30,34 @@ object RcStateSnapshot {
 
     const val MAX_SESSIONS = 8
     const val NAME_CHARS = 40
+    const val FOLDER_CHARS = 40
 
     /** One RFCOMM frame's worth. An RC frame must never chunk. */
     const val MAX_FRAME_CHARS = 10_000
 
     fun build(wsConnected: Boolean, sessions: List<RcSessionState>): String {
-        val visible = sessions.sortedByDescending { it.lastActivityMs }.take(MAX_SESSIONS)
+        // The id tiebreak is load-bearing: the source is a ConcurrentHashMap whose iteration order
+        // changes on resize, so without it an unchanged state would serialize differently each time
+        // and defeat the byte-equality dedup that replaced the coalescer.
+        val ordered = sessions
+            .sortedWith(compareByDescending<RcSessionState> { it.lastActivityMs }.thenBy { it.id })
+        var visible = ordered.take(MAX_SESSIONS)
+        // An RC frame must never chunk, and a session id has no safe truncation, so the cap is
+        // enforced by dropping the least recently active sessions until the frame fits.
+        while (visible.isNotEmpty() && serialize(wsConnected, visible).length > MAX_FRAME_CHARS) {
+            visible = visible.dropLast(1)
+        }
+        return serialize(wsConnected, visible)
+    }
+
+    private fun serialize(wsConnected: Boolean, visible: List<RcSessionState>): String {
         val sb = StringBuilder(256)
         sb.append("{\"ws\":").append(wsConnected).append(",\"s\":[")
         visible.forEachIndexed { i, s ->
             if (i > 0) sb.append(',')
             sb.append("{\"id\":").append(quote(s.id))
                 .append(",\"n\":").append(quote(s.name.take(NAME_CHARS)))
-                .append(",\"w\":").append(quote(s.folder))
+                .append(",\"w\":").append(quote(s.folder.take(FOLDER_CHARS)))
                 .append(",\"st\":").append(if (s.ended) "\"ended\"" else "\"open\"")
                 .append(",\"t\":").append(!s.ended && (s.turning || s.debouncePending))
                 .append(",\"u\":").append(!s.ended && s.unread)

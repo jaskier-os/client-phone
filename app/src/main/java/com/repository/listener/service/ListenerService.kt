@@ -8957,6 +8957,7 @@ class ListenerService : LifecycleService(),
         LogCollector.i(TAG, "RC session started: $sessionId workDir=$workDir")
         // rcDumpState must stay in lockstep with the ACTION_RC_SESSION_START broadcast below.
         rcDumpState[sessionId] = RcDumpEntry(workDir, "active", false)
+        touchRcSession(sessionId)
         if (!rcSessionTurning.containsKey(sessionId)) {
             rcSessionTurning[sessionId] = false
             refreshRcNotification()
@@ -8990,6 +8991,7 @@ class ListenerService : LifecycleService(),
 
     override fun onRcMessage(sessionId: String, text: String, isFinal: Boolean, requestId: String?, contextPct: Int, costUsd: Double) {
         thinkingRcStartTimes.remove(sessionId)
+        touchRcSession(sessionId)
         // rcDumpState must stay in lockstep with the ACTION_RC_MESSAGE broadcast below (turning = !isFinal).
         // Detect a real true->false transition so we set unread + fire the glasses
         // notification exactly once per turn-finish (not on every isFinal chunk).
@@ -9112,7 +9114,9 @@ class ListenerService : LifecycleService(),
      * [force] skips the comparison, and is used from the WS lifecycle and from glasses link-up
      * where the push must be authoritative rather than deduped away.
      */
-    private fun pushRcState(force: Boolean = false) {
+    private fun pushRcState(force: Boolean = false) = synchronized(rcStatePushLock) {
+        // Build INSIDE the lock: two threads building outside it can reorder such that an older
+        // snapshot is written last and then cached, pinning the glasses on stale state forever.
         val sessions = rcDumpState.entries.map { (id, e) ->
             com.repository.listener.rc.RcSessionState(
                 id = id,
@@ -9127,10 +9131,9 @@ class ListenerService : LifecycleService(),
             )
         }
         val json = com.repository.listener.rc.RcStateSnapshot.build(orchestratorConnected, sessions)
-        synchronized(rcStatePushLock) {
-            if (!force && json == lastPushedStateJson) return
-            if (phoneBtHost.sendRcStateIfConnected(json)) lastPushedStateJson = json
-        }
+        if (!force && json == lastPushedStateJson) return@synchronized
+        // Cached only on a confirmed write: a dropped frame must not be deduped away next time.
+        lastPushedStateJson = if (phoneBtHost.sendRcStateIfConnected(json)) json else null
     }
 
     private val rcStatePushLock = Any()

@@ -195,6 +195,16 @@ class GlassesRfcommClient(private val context: Context) {
         return true
     }
 
+    /**
+     * Write a frame if and only if the link is up right now. Never queues, never pages, never wakes
+     * over BLE. For state snapshots that are only valid at the instant they are built: a queued one
+     * would drain AFTER the authoritative link-up push and overwrite it with stale state.
+     *
+     * @return true only when the bytes were handed to the socket.
+     */
+    fun sendNowOrDrop(channel: String, vararg args: String): Boolean =
+        if (isConnected) sendNow(channel, args) else false
+
     private fun sendNow(channel: String, args: Array<out String>): Boolean {
         val out = outputStream ?: return false
         try {

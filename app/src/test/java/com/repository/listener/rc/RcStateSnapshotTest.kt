@@ -104,6 +104,39 @@ class RcStateSnapshotTest {
     }
 
     @Test
+    fun anOversizedFrameShedsSessionsUntilItFitsOneChunk() {
+        val sessions = (0 until 8).map {
+            session("s$it".repeat(900), lastActivityMs = it.toLong())
+        }
+        val json = RcStateSnapshot.build(true, sessions)
+        assertTrue("frame was ${json.length} chars", json.length <= RcStateSnapshot.MAX_FRAME_CHARS)
+        assertTrue(JSONObject(json).getJSONArray("s").length() < 8)
+    }
+
+    @Test
+    fun sessionsWithEqualActivityAreOrderedDeterministicallyByIdRegardlessOfInputOrder() {
+        val a = session("aaa")
+        val b = session("bbb")
+        val c = session("ccc")
+        assertEquals(
+            RcStateSnapshot.build(true, listOf(a, b, c)),
+            RcStateSnapshot.build(true, listOf(c, a, b))
+        )
+    }
+
+    @Test
+    fun theFolderIsTruncated() {
+        val json = JSONObject(RcStateSnapshot.build(true, listOf(session("a", folder = "f".repeat(200)))))
+        assertEquals(40, json.getJSONArray("s").getJSONObject(0).getString("w").length)
+    }
+
+    @Test
+    fun controlCharactersInAFieldAreEscapedSoTheFrameStaysValidJson() {
+        val json = RcStateSnapshot.build(true, listOf(session("a", name = "line\"one\n\tend\\")))
+        assertEquals("line\"one\n\tend\\", JSONObject(json).getJSONArray("s").getJSONObject(0).getString("n"))
+    }
+
+    @Test
     fun keyOrderIsDeterministic() {
         val json = RcStateSnapshot.build(true, listOf(session("a", unread = true, lastSeq = 3L)))
         assertEquals(

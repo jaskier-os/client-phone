@@ -1954,11 +1954,13 @@ class PhoneBtHost(private val context: Context) {
      * @return true when the frame was handed to the socket.
      */
     fun sendRcIfConnected(channel: String, vararg args: String): Boolean {
-        if (!rfcommConnected) return false
+        // sendNowOrDrop, not send: rfcommConnected is a callback-driven mirror of the socket state
+        // and is stale-true for the window between socket death and the callback, during which
+        // send() would silently enqueue. Only the client itself can answer atomically.
         return try {
-            rfcommClient.send(channel, *args)
-            txByteCount.addAndGet(estimateCapsSize(*args))
-            true
+            val sent = rfcommClient.sendNowOrDrop(channel, *args)
+            if (sent) txByteCount.addAndGet(estimateCapsSize(*args))
+            sent
         } catch (e: Exception) {
             log("Failed to send RC frame on $channel: ${e.message}")
             false
