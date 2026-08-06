@@ -7211,28 +7211,29 @@ class ListenerService : LifecycleService(),
                             }
                         }
                         val unread = rcDumpState[sessionId]?.unread ?: false
+                        // The projection is fed exactly as the live path feeds it, so a test hook
+                        // exercises the real mirror rather than a second copy of it that can drift.
+                        if (text.isNotBlank()) rcMirror.noteAssistantText(sessionId, text)
                         if (turnFinished) {
-                            rcGlassesNotifRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
-                            val notifRunnable = Runnable {
-                                rcGlassesNotifRunnables.remove(sessionId)
-                                try {
-                                    if (::phoneBtHost.isInitialized && phoneBtHost.isConnected) {
-                                        val entry = rcDumpState[sessionId]
-                                        val folder = folderNameFromWorkDir(entry?.workDir)
-                                        val title = entry?.sessionName
-                                        val notifTitle = listOfNotNull(folder, title).joinToString(": ").ifEmpty { "Jaskier" }
-                                        phoneBtHost.sendNotification("rcfinish-$sessionId", notifTitle, "Done", "", false)
-                                    }
-                                } catch (_: Exception) {}
+                            rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
+                            val commitRunnable = Runnable {
+                                rcTurnFinishRunnables.remove(sessionId)
+                                val rows = rcMirror.commitTurn(sessionId)
+                                if (rcBridge.openSessionId == sessionId &&
+                                    rcBridge.pushRows(sessionId, rows)) {
+                                    markRcRead(sessionId)
+                                }
+                                pushRcState(force = true)
                             }
-                            rcGlassesNotifRunnables[sessionId] = notifRunnable
-                            mainHandler.postDelayed(notifRunnable, RC_DONE_DEBOUNCE_MS)
+                            rcTurnFinishRunnables[sessionId] = commitRunnable
+                            mainHandler.postDelayed(commitRunnable, RC_DONE_DEBOUNCE_MS)
                             sendBroadcast(Intent(ACTION_RC_UNREAD_CHANGED).apply {
                                 setPackage(packageName)
                                 putExtra(EXTRA_RC_SESSION_ID, sessionId)
                                 putExtra(EXTRA_RC_UNREAD, true)
                             })
                         }
+                        pushRcState()
                         val msgData = JSONObject().apply {
                             put("text", text)
                             put("isFinal", isFinal)
@@ -8983,7 +8984,7 @@ class ListenerService : LifecycleService(),
             rcDumpState[sessionId] = existing.copy(status = "ended", turning = false)
         }
         cancelRcDoneClear(sessionId)
-        rcGlassesNotifRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
+        rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
         rcSessionTurning.remove(sessionId)
         rcTranscriptCache.remove(sessionId)
         // Promptness only, NOT the memory bound: this hook never fires on a dropped WS, a PC-side
@@ -9021,9 +9022,9 @@ class ListenerService : LifecycleService(),
             // between tool calls, so firing immediately would spam "Done" during
             // tool chains. Wait RC_DONE_DEBOUNCE_MS; onRcToolStatus cancels if
             // a tool event arrives, proving the turn isn't really finished.
-            rcGlassesNotifRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
+            rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
             val r = Runnable {
-                rcGlassesNotifRunnables.remove(sessionId)
+                rcTurnFinishRunnables.remove(sessionId)
                 // Only here is a turn really over: raw isFinal fires between tool calls. Commit the
                 // rows, and if the glasses are sitting in this thread, delivering them IS the read
                 // -- without that the bar stays lit behind a thread the user is actively reading,
@@ -9035,19 +9036,14 @@ class ListenerService : LifecycleService(),
                 if (rcBridge.openSessionId == sessionId && rcBridge.pushRows(sessionId, rows)) {
                     markRcRead(sessionId)
                 }
+                // No "Done" notification is pushed to the glasses: the forced state snapshot above
+                // already lights that session's unread bar in the chat list, and a notification on
+                // top of it was a duplicate alert plus a bar that outlived it.
                 pushRcState(force = true)
                 val entry = rcDumpState[sessionId]
                 val folder = folderNameFromWorkDir(entry?.workDir)
                 val title = entry?.sessionName
                 val notifTitle = listOfNotNull(folder, title).joinToString(": ").ifEmpty { "Claude Code" }
-                try {
-                    if (::phoneBtHost.isInitialized && phoneBtHost.isConnected) {
-                        val notifId = "rcfinish-$sessionId"
-                        phoneBtHost.sendNotification(notifId, notifTitle, "Done", "", false)
-                    }
-                } catch (e: Exception) {
-                    LogCollector.e(TAG, "Failed to send RC finish notification: ${e.message}")
-                }
                 // Heads-up notification on the phone itself.
                 try {
                     val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
@@ -9073,7 +9069,7 @@ class ListenerService : LifecycleService(),
                     LogCollector.e(TAG, "Failed to show RC done heads-up: ${e.message}")
                 }
             }
-            rcGlassesNotifRunnables[sessionId] = r
+            rcTurnFinishRunnables[sessionId] = r
             mainHandler.postDelayed(r, RC_DONE_DEBOUNCE_MS)
             // Tell the UI the unread bit flipped to true so it can repaint dot + badge.
             sendBroadcast(Intent(ACTION_RC_UNREAD_CHANGED).apply {
@@ -9151,7 +9147,7 @@ class ListenerService : LifecycleService(),
                 folder = e.workDir.substringAfterLast('/'),
                 ended = e.status == "ended",
                 turning = e.turning,
-                debouncePending = rcGlassesNotifRunnables.containsKey(id),
+                debouncePending = rcTurnFinishRunnables.containsKey(id),
                 unread = e.unread,
                 lastSeq = rcMirror.lastSeq(id),
                 lastActivityMs = rcLastActivityMs[id] ?: 0L
@@ -9251,7 +9247,7 @@ class ListenerService : LifecycleService(),
             markRcTurning(sessionId, true)
         }
         // Cancel pending glasses "Done" notification -- turn isn't over yet.
-        rcGlassesNotifRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
+        rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
         // Re-mark turning in rcDumpState so the next isFinal can fire a real transition.
         rcDumpState.compute(sessionId) { _, prev ->
             prev?.copy(turning = true)
@@ -9327,7 +9323,7 @@ class ListenerService : LifecycleService(),
         val effectiveStart = if (startedAt > 0L) startedAt else System.currentTimeMillis()
         thinkingRcStartTimes[sessionId] = effectiveStart
         // Cancel pending glasses "Done" notification -- still working.
-        rcGlassesNotifRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
+        rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
         // rcDumpState must stay in lockstep with the ACTION_RC_THINKING broadcast below.
         rcDumpState[sessionId]?.let { existing ->
             rcDumpState[sessionId] = existing.copy(turning = true)
@@ -11026,7 +11022,7 @@ class ListenerService : LifecycleService(),
     // between tool calls (text -> tool -> text -> tool -> final), so clearing
     // turning immediately would flash "X/N Done" between segments.
     private val rcDoneClearRunnables = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
-    private val rcGlassesNotifRunnables = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
+    private val rcTurnFinishRunnables = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
     private val RC_DONE_DEBOUNCE_MS: Long = 5000L
     @Volatile private var lastIdleNotificationText: String = "Waiting for command"
 
