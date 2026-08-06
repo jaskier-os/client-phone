@@ -7882,6 +7882,9 @@ class ListenerService : LifecycleService(),
         // Populate todo cache for AI context injection
         orchestratorClient.sendTodoList()
         phoneBtHost.sendSystemStatus(true)
+        // The glasses dim every RC row while ws is false; the flag is not an rcDumpState mutation,
+        // so it has to be pushed from the WS lifecycle itself or it would never reach them.
+        pushRcState(force = true)
 
         // Auto-restart audio relay ONLY if it isn't already streaming. The audio
         // path (LAN-direct or cloud WebRTC) is independent of this cloud-control
@@ -7949,6 +7952,13 @@ class ListenerService : LifecycleService(),
         setIdleText("Disconnected - Waiting for command")
         broadcastState("IDLE", "Disconnected from orchestrator")
         phoneBtHost.sendSystemStatus(false)
+
+        // No terminating rc_message can arrive once the WS is down, so any session left turning
+        // would spin forever on the glasses. Clear the flags FIRST, then push.
+        for (sid in rcDumpState.keys) {
+            rcDumpState.computeIfPresent(sid) { _, e -> if (e.turning) e.copy(turning = false) else e }
+        }
+        pushRcState(force = true)
 
         // Drop chat-latency book-keeping for in-flight requests that will
         // never get an onResponse now -- otherwise the maps grow unbounded
@@ -9088,6 +9098,48 @@ class ListenerService : LifecycleService(),
             }
         }
         return fired
+    }
+
+    /** The last snapshot actually handed to the socket, or null when the glasses link is down. */
+    @Volatile private var lastPushedStateJson: String? = null
+
+    /**
+     * Builds the full RC session snapshot and pushes it to the glasses when it differs from the one
+     * last sent. There is deliberately no coalescing timer: the frame carries only ws and the
+     * per-session tuple, none of which change per streaming rc_message, so byte-equality already
+     * collapses a 10-20 Hz storm to roughly one frame per turn.
+     *
+     * [force] skips the comparison, and is used from the WS lifecycle and from glasses link-up
+     * where the push must be authoritative rather than deduped away.
+     */
+    private fun pushRcState(force: Boolean = false) {
+        val sessions = rcDumpState.entries.map { (id, e) ->
+            com.repository.listener.rc.RcSessionState(
+                id = id,
+                name = e.sessionName ?: e.workDir.substringAfterLast('/'),
+                folder = e.workDir.substringAfterLast('/'),
+                ended = e.status == "ended",
+                turning = e.turning,
+                debouncePending = rcGlassesNotifRunnables.containsKey(id),
+                unread = e.unread,
+                lastSeq = rcMirror.lastSeq(id),
+                lastActivityMs = rcLastActivityMs[id] ?: 0L
+            )
+        }
+        val json = com.repository.listener.rc.RcStateSnapshot.build(orchestratorConnected, sessions)
+        synchronized(rcStatePushLock) {
+            if (!force && json == lastPushedStateJson) return
+            if (phoneBtHost.sendRcStateIfConnected(json)) lastPushedStateJson = json
+        }
+    }
+
+    private val rcStatePushLock = Any()
+
+    /** sessionId -> last time anything happened on it, for the 8-most-recent truncation. */
+    private val rcLastActivityMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun touchRcSession(sessionId: String) {
+        rcLastActivityMs[sessionId] = System.currentTimeMillis()
     }
 
     /**
@@ -10595,6 +10647,10 @@ class ListenerService : LifecycleService(),
             LogCollector.w(TAG, "Translation state restore failed: ${e.message}")
         }
 
+        // Same rationale as the translation reconcile above: the glasses hold no RC state a push
+        // does not replace wholesale, so one authoritative snapshot per link-up heals everything.
+        pushRcState(force = true)
+
         // Sync phone time/timezone to glasses over the relay. The glasses-side
         // set_time handler applies the wall clock via root and re-applies on boot.
         serviceScope.launch {
@@ -10646,6 +10702,9 @@ class ListenerService : LifecycleService(),
 
     override fun onGlassesDisconnected() {
         LogCollector.i(TAG, "Glasses disconnected from BT")
+        // Without this the byte-identical dedup would permanently suppress the corrective resync
+        // the next link-up owes: the glasses come back holding nothing.
+        lastPushedStateJson = null
         // Clean up mouse HID bridge -- glasses can't send reports anymore
         phoneBtHost.onMouseReport = null
         phoneHidMouse?.destroy()

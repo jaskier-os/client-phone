@@ -1944,6 +1944,30 @@ class PhoneBtHost(private val context: Context) {
         }
     }
 
+    /**
+     * Send an RC frame, but only while the link is actually up.
+     *
+     * RC frames are NEVER queued: the outbound queue is drop-oldest, so a snapshot queued while
+     * disconnected drains after the fresh link-up push and would resurrect a stale spinner or lose
+     * an unread bar permanently. They are also never chunked -- the payloads are capped one frame.
+     *
+     * @return true when the frame was handed to the socket.
+     */
+    fun sendRcIfConnected(channel: String, vararg args: String): Boolean {
+        if (!rfcommConnected) return false
+        return try {
+            rfcommClient.send(channel, *args)
+            txByteCount.addAndGet(estimateCapsSize(*args))
+            true
+        } catch (e: Exception) {
+            log("Failed to send RC frame on $channel: ${e.message}")
+            false
+        }
+    }
+
+    fun sendRcStateIfConnected(json: String): Boolean =
+        sendRcIfConnected(BtProtocol.CH_RC_STATE_PUSH, json)
+
     fun sendChatListResponse(chatsJson: String) =
         sendChunkedJson(BtProtocol.CH_CHAT_LIST_RESPONSE, chatsJson, "Chat list")
 
