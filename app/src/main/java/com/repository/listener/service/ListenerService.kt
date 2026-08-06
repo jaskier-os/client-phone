@@ -9100,13 +9100,16 @@ class ListenerService : LifecycleService(),
      * UI renders everything it holds and passes the default.
      */
     fun markRcRead(sessionId: String, seenSeq: Long = Long.MAX_VALUE) {
-        if (!com.repository.listener.rc.RcReadPolicy.shouldClearUnread(
-                rcMirror.lastSeq(sessionId), seenSeq)) return
         var changed = false
         rcDumpState.compute(sessionId) { _, previous ->
             when {
                 previous == null -> null
                 !previous.unread -> previous
+                // Read the high-water mark INSIDE the compute: a turn committing between a
+                // separate read and this write would otherwise have its unread bar cleared,
+                // which is the exact hazard the seenSeq guard exists to close.
+                !com.repository.listener.rc.RcReadPolicy.shouldClearUnread(
+                    rcMirror.lastSeq(sessionId), seenSeq) -> previous
                 else -> { changed = true; previous.copy(unread = false) }
             }
         }

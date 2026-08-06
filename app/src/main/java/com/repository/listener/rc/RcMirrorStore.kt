@@ -110,6 +110,13 @@ class RcMirrorStore {
             all.subList(all.size - n, all.size).toList() to true
         }
 
+    /**
+     * Seq of the newest held row, or -1 when the session holds none. Rows are dropped oldest-first,
+     * so this is also the highest seq ever minted for a session that has not been cleared.
+     *
+     * Safe to call while holding an rcDumpState bin lock: this store never touches that map, so the
+     * lock order rcDumpState -> store cannot invert.
+     */
     fun lastSeq(sessionId: String): Long = synchronized(lock) {
         sessions[sessionId]?.rows?.lastOrNull()?.seq ?: -1L
     }
