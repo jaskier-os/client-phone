@@ -1281,8 +1281,12 @@ class ListenerService : LifecycleService(),
     @Volatile private var phoneWakeTimestamp = 0L
 
     // Glasses audio stream processing
-    private enum class GlassesAudioState { IDLE, LISTENING, CONFIRMING, SENDING, RESPONDING }
+    // GlassesAudioState now lives in TranscriptDelivery.kt (same package) so the
+    // transcript-delivery logic that drives it is JVM-testable.
     @Volatile private var glassesAudioState = GlassesAudioState.IDLE
+    // Model used by the last glasses orchestrator send, so a failed send can arm
+    // the reconnect retry with the same model it was built for.
+    @Volatile private var lastGlassesSendModel: String = ""
     // Glasses on-head state, relayed over CH_WEAR_STATE. Default true so a missing
     // signal (older glasses build, BT reconnect before first broadcast) preserves
     // prior behaviour (allow ducking).
@@ -9729,7 +9733,11 @@ class ListenerService : LifecycleService(),
         // A notification reply has no chatId; it is keyed by notifReplyId instead.
         // Both flows share capture/STT and the "final text -> sendGlassesUserText"
         // delivery below. Only one of the two identifiers will be set.
-        val isNotifReply = notifReplyId != null
+        // Snapshot the id this finalize belongs to: delivery may complete long
+        // after the session ends, by which time notifReplyId may hold a NEW
+        // reply's id. Everything downstream compares against this snapshot.
+        val notifIdForThisSession = notifReplyId
+        val isNotifReply = notifIdForThisSession != null
         if (!isNotifReply && telegramVoiceChatId == null) return
         stopTranscriberStream()
 
@@ -9741,14 +9749,10 @@ class ListenerService : LifecycleService(),
 
         if (!telegramVoiceSpeechDetected || savedChunks.isEmpty()) {
             LogCollector.i(TAG, "Telegram voice: no speech detected, skipping")
-            if (isNotifReply) {
-                // Still signal the glasses so the reply doesn't hang forever in
-                // SENDING / NOTIFICATION_REPLY. An empty user text is the glasses'
-                // cue to cancel (it treats blank as "nothing captured").
-                LogCollector.i(TAG, "[NREPLY] phone empty transcript -> signalling glasses to cancel notif reply")
-                phoneBtHost.sendGlassesUserText("tg_voice", "")
-                notifReplyId = null
-            }
+            // An explicit EMPTY FINAL, not silence: this is the blank-is-cancel
+            // contract, and it goes through the SAME delivery function as a real
+            // transcript so the local and remote paths cannot diverge.
+            deliverTelegramVoiceTranscript("", notifIdForThisSession)
             return
         }
 
@@ -9774,19 +9778,10 @@ class ListenerService : LifecycleService(),
                     }
                 }
 
-                if (text.isNotBlank()) {
-                    LogCollector.i(TAG, "Telegram voice final text: ${text.take(80)}")
-                    phoneBtHost.sendGlassesUserText("tg_voice", text)
-                } else {
-                    LogCollector.i(TAG, "Telegram voice: empty transcription result")
-                }
-                // Clear the notif-reply marker now that the final text is on its way
-                // to the glasses. The actual RemoteInput fire is driven later by the
-                // glasses' CH_NOTIF_REPLY_SEND (which carries its own notifId), so we
-                // do not need notifReplyId past this point. Leaving it set would wedge
-                // the next voice session if the glasses' send/cancel ack never arrives
-                // (e.g. BT drop), since onTelegramVoiceStart rejects while it is set.
-                if (isNotifReply) notifReplyId = null
+                // Delivery (including the blank-is-cancel case and clearing the
+                // notif-reply marker) is owned by deliverTelegramVoiceTranscript,
+                // which the local on-glasses STT path calls too.
+                deliverTelegramVoiceTranscript(text, notifIdForThisSession)
             } catch (e: Exception) {
                 LogCollector.e(TAG, "Telegram voice transcription error: ${e.message}")
             }
@@ -10260,65 +10255,131 @@ class ListenerService : LifecycleService(),
                         }
                     }
                 }
-                val text = stripWakeWords(rawText)
-                if (text.isNotBlank()) {
-                    LogCollector.i(TAG, "Glasses transcription: $text")
-                    if (streamText.isBlank()) {
-                        phoneBtHost.sendGlassesUserText("pending", text)
-                    }
-                    val model = AppConfig.getModel(this@ListenerService)
-                    val userSystemPrompt = AiContextBuilder.build(
-                        AppConfig.getUserSystemPrompt(this@ListenerService).ifBlank { null },
-                        notificationHistory, cachedTodos
-                    )
-                    // Auto-attach: use cached photo or fetch from glasses (event-driven)
-                    var recentPhoto = if (System.currentTimeMillis() - lastGlassesPhotoTimestamp < 60_000) lastGlassesPhotoBase64 else null
-                    if (recentPhoto == null) {
-                        LogCollector.i(TAG, "Requesting DCIM photo from glasses for auto-attach")
-                        val deferred = kotlinx.coroutines.CompletableDeferred<String?>()
-                        pendingPhotoDeferred = deferred
-                        phoneBtHost.sendCommand("fetch_dcim_photo", "voice_photo", "{}")
-                        recentPhoto = kotlinx.coroutines.withTimeoutOrNull(15_000L) { deferred.await() }
-                        pendingPhotoDeferred = null
-                    }
-                    if (recentPhoto != null) {
-                        lastGlassesPhotoBase64 = null
-                        lastGlassesPhotoTimestamp = 0
-                        LogCollector.i(TAG, "Auto-attaching glasses photo to voice request (${recentPhoto.length} chars)")
-                    } else {
-                        LogCollector.i(TAG, "No recent photo from glasses, sending without image")
-                    }
-                    val sent = orchestratorClient.sendRequest(text, imageBase64 = recentPhoto, model = model, deviceType = "glasses", userSystemPrompt = userSystemPrompt)
-                    if (sent) {
-                        val orchRequestId = orchestratorClient.lastRequestId
-                        if (orchRequestId != null) {
-                            glassesRequestIds.add(orchRequestId)
-                            phoneBtHost.sendGlassesUserText(orchRequestId, text)
-                            // Transition to RESPONDING if not cancelled during send
-                            if (glassesAudioState == GlassesAudioState.SENDING) {
-                                setGlassesState(GlassesAudioState.RESPONDING, "request sent")
-                            }
-                        }
-                    } else {
-                        // Send failed (WS dead at this moment). Arm a retry that
-                        // will fire when the orchestrator WS reconnects. We only
-                        // arm on actual send failure -- previously this was set
-                        // unconditionally before the send and a WS hiccup in the
-                        // pre-response window caused a duplicate request.
-                        pendingGlassesRetry = Pair(text, model)
-                        LogCollector.w(TAG, "Glasses send failed (WS down); armed retry on next reconnect")
-                    }
-                } else {
-                    LogCollector.i(TAG, "Glasses transcription empty after wake word filter (raw='$rawText')")
-                    setGlassesState(GlassesAudioState.IDLE, "empty transcription")
-                    phoneBtHost.sendDismissSession()
-                }
+                deliverGlassesTranscript(
+                    rawText,
+                    hadStreamPreview = streamText.isNotBlank(),
+                    source = TranscriptSource.REMOTE,
+                )
             } catch (e: Exception) {
                 LogCollector.e(TAG, "Glasses transcription error: ${e.message}")
                 setGlassesState(GlassesAudioState.IDLE, "transcription error")
                 phoneBtHost.sendDismissSession()
             }
         }
+    }
+
+    /**
+     * The text-consuming tail of finishTelegramVoiceRecording, shared by the
+     * remote transcriber and the on-glasses local STT path. Covers Telegram
+     * voice, notification reply and RC voice -- all three share the "tg_voice"
+     * requestId and are disambiguated by the glasses' focusState.
+     *
+     * BLANK IS A CANCEL, not "nothing happened". A blank final must still reach
+     * the glasses as an empty user text, or a notification reply hangs forever in
+     * SENDING / NOTIFICATION_REPLY. This is the single implementation of that
+     * contract: the "no speech detected" early return calls it with "" rather
+     * than open-coding the emission, so local and remote cannot diverge.
+     *
+     * notifReplyId is cleared on EVERY exit path. Leaving it set would wedge the
+     * next voice session, since onTelegramVoiceStart rejects while it is set (the
+     * RemoteInput fire itself is driven later by the glasses' CH_NOTIF_REPLY_SEND,
+     * which carries its own notifId, so it is not needed past this point).
+     */
+    private fun deliverTelegramVoiceTranscript(text: String, notifId: String?) =
+        transcriptDelivery.deliverTelegramVoiceTranscript(text, notifId)
+
+    /**
+     * The text-consuming tail of finishGlassesRecording, shared by the remote
+     * transcriber and the on-glasses local STT path.
+     *
+     * @param hadStreamPreview whether a live partial was already shown on the
+     *   glasses. LOCAL is always false (finals only), so it sends the "pending"
+     *   preview -- correct, since the glasses have displayed nothing yet.
+     * @param source LOCAL must drive the SENDING transition itself: in local mode
+     *   the phone never passes through CONFIRMING/SENDING, so without it the
+     *   RESPONDING guard is false and the glasses hang in LISTENING.
+     */
+    private suspend fun deliverGlassesTranscript(
+        rawText: String,
+        hadStreamPreview: Boolean,
+        source: TranscriptSource,
+    ) = transcriptDelivery.deliverGlassesTranscript(rawText, hadStreamPreview, source)
+
+    /**
+     * The single TranscriptDelivery instance. All glasses transcript delivery --
+     * remote and local, assistant and tg_voice -- goes through this, so the
+     * JVM-tested logic IS the shipped logic.
+     */
+    private val transcriptDelivery: TranscriptDelivery by lazy {
+        TranscriptDelivery(object : TranscriptDelivery.Port {
+            override fun sendGlassesUserText(requestId: String, text: String) =
+                phoneBtHost.sendGlassesUserText(requestId, text)
+
+            override fun clearNotifReplyIdIfStill(expected: String?) {
+                // Compare-and-clear: delivery can complete many seconds after the
+                // session ended (batch transcription, the 15 s photo fetch). By
+                // then a NEW notification reply may own the field, and clearing it
+                // unconditionally would wedge that new session.
+                if (notifReplyId == expected) notifReplyId = null
+            }
+
+            override fun currentGlassesState(): GlassesAudioState = glassesAudioState
+
+            override fun setGlassesState(s: GlassesAudioState, reason: String) =
+                this@ListenerService.setGlassesState(s, reason)
+
+            override suspend fun sendToOrchestrator(text: String): OrchestratorSend {
+                val model = AppConfig.getModel(this@ListenerService)
+                val userSystemPrompt = AiContextBuilder.build(
+                    AppConfig.getUserSystemPrompt(this@ListenerService).ifBlank { null },
+                    notificationHistory, cachedTodos
+                )
+                // Auto-attach: use cached photo or fetch from glasses (event-driven)
+                var recentPhoto = if (System.currentTimeMillis() - lastGlassesPhotoTimestamp < 60_000) lastGlassesPhotoBase64 else null
+                if (recentPhoto == null) {
+                    LogCollector.i(TAG, "Requesting DCIM photo from glasses for auto-attach")
+                    val deferred = kotlinx.coroutines.CompletableDeferred<String?>()
+                    pendingPhotoDeferred = deferred
+                    phoneBtHost.sendCommand("fetch_dcim_photo", "voice_photo", "{}")
+                    recentPhoto = kotlinx.coroutines.withTimeoutOrNull(15_000L) { deferred.await() }
+                    pendingPhotoDeferred = null
+                }
+                if (recentPhoto != null) {
+                    lastGlassesPhotoBase64 = null
+                    lastGlassesPhotoTimestamp = 0
+                    LogCollector.i(TAG, "Auto-attaching glasses photo to voice request (${recentPhoto.length} chars)")
+                } else {
+                    LogCollector.i(TAG, "No recent photo from glasses, sending without image")
+                }
+                // Remembered so a Failed result can arm the retry with the same model.
+                lastGlassesSendModel = model
+                val sent = orchestratorClient.sendRequest(
+                    text, imageBase64 = recentPhoto, model = model,
+                    deviceType = "glasses", userSystemPrompt = userSystemPrompt
+                )
+                if (!sent) return OrchestratorSend.Failed
+                val id = orchestratorClient.lastRequestId
+                    ?: return OrchestratorSend.SentWithoutId
+                return OrchestratorSend.Sent(id)
+            }
+
+            override fun registerRequestId(requestId: String) {
+                glassesRequestIds.add(requestId)
+            }
+
+            override fun armRetry(text: String) {
+                // Only armed on ACTUAL send failure: arming unconditionally before
+                // the send caused duplicate requests on a WS hiccup.
+                pendingGlassesRetry = Pair(text, lastGlassesSendModel)
+            }
+
+            override fun stripWakeWords(text: String): String =
+                this@ListenerService.stripWakeWords(text)
+
+            override fun dismissSession() = phoneBtHost.sendDismissSession()
+
+            override fun log(msg: String) = LogCollector.i(TAG, msg)
+        })
     }
 
     private fun stripWakeWords(text: String): String {
