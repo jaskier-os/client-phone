@@ -36,7 +36,7 @@ class RcBridgeTest {
             },
             sendUserResponse = { sid, rid, text -> userResponses.add(Triple(sid, rid, text)) },
             sendPermissionResponse = { sid, rid, approved, _, reason ->
-                permissionResponses.add(Triple(sid, "$rid:$approved", reason))
+                permissionResponses.add(Triple(sid, rid + ":" + approved, reason))
             },
             markRead = { sid, seen ->
                 reads.add(sid to seen)
@@ -90,7 +90,7 @@ class RcBridgeTest {
     @Test
     fun anAnswerRequestRoutesToThePermissionPathNotTheUserResponsePath() {
         val h = Harness()
-        h.prompts.register("req-3", "AskUserQuestion", listOf("Yes", "No"))
+        h.prompts.register("sess-1", "req-3", "AskUserQuestion", listOf("Yes", "No"))
         h.bridge.handleAnswerReq(listOf("sess-1", "req-3", "Yes"))
         assertEquals(listOf(Triple("sess-1", "req-3:true", "Yes")), h.permissionResponses)
         assertEquals(emptyList<Triple<String, String, String>>(), h.userResponses)

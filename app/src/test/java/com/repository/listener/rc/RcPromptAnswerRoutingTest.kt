@@ -20,7 +20,8 @@ class RcPromptAnswerRoutingTest {
         val prompts = RcPromptRegistry()
         val sent = mutableListOf<Pair<String, List<String>>>()
 
-        /** requestId, approved, mode, reason */
+        /** sessionId, requestId, approved, mode, reason. The sessionId is recorded, not discarded:
+         *  an answer delivered against the wrong session resolves a call the wearer never saw. */
         val permissionCalls = mutableListOf<List<String?>>()
 
         /** requestId, text */
@@ -34,8 +35,8 @@ class RcPromptAnswerRoutingTest {
             sendUserResponse = { _, requestId, text ->
                 userResponseCalls.add(listOf(requestId, text))
             },
-            sendPermissionResponse = { _, requestId, approved, mode, reason ->
-                permissionCalls.add(listOf(requestId, approved.toString(), mode, reason))
+            sendPermissionResponse = { sessionId, requestId, approved, mode, reason ->
+                permissionCalls.add(listOf(sessionId, requestId, approved.toString(), mode, reason))
             },
             markRead = { _, _ -> },
             requestTranscript = { },
@@ -58,7 +59,7 @@ class RcPromptAnswerRoutingTest {
     fun `a projected prompt carries the request id the answer has to quote`() {
         val h = Harness()
         h.openThread("s1")
-        h.prompts.register("req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
+        h.prompts.register("s1", "req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
         val row = h.store.appendPrompt("s1", "Allow Bash?", listOf(RcPrompts.APPROVE, RcPrompts.REJECT), "req-7")
         h.bridge.pushRows("s1", listOf(row))
 
@@ -80,10 +81,10 @@ class RcPromptAnswerRoutingTest {
     @Test
     fun `a permission answer goes to the permission call, never to the user-response call`() {
         val h = Harness()
-        h.prompts.register("req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
+        h.prompts.register("s1", "req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
         h.bridge.handleAnswerReq(listOf("s1", "req-7", RcPrompts.APPROVE))
 
-        assertEquals(listOf(listOf("req-7", "true", null, null)), h.permissionCalls)
+        assertEquals(listOf(listOf("s1", "req-7", "true", null, null)), h.permissionCalls)
         assertEquals("a permission routed as free text would never resolve",
             emptyList<List<String>>(), h.userResponseCalls)
     }
@@ -91,24 +92,24 @@ class RcPromptAnswerRoutingTest {
     @Test
     fun `a rejected permission reports the negative verdict`() {
         val h = Harness()
-        h.prompts.register("req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
+        h.prompts.register("s1", "req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
         h.bridge.handleAnswerReq(listOf("s1", "req-7", RcPrompts.REJECT))
-        assertEquals(listOf(listOf("req-7", "false", null, null)), h.permissionCalls)
+        assertEquals(listOf(listOf("s1", "req-7", "false", null, null)), h.permissionCalls)
     }
 
     @Test
     fun `an AskUserQuestion answer approves and carries the chosen label`() {
         val h = Harness()
-        h.prompts.register("req-9", "AskUserQuestion", listOf("Postgres", "SQLite"))
+        h.prompts.register("s1", "req-9", "AskUserQuestion", listOf("Postgres", "SQLite"))
         h.bridge.handleAnswerReq(listOf("s1", "req-9", "SQLite"))
-        assertEquals(listOf(listOf("req-9", "true", null, "SQLite")), h.permissionCalls)
+        assertEquals(listOf(listOf("s1", "req-9", "true", null, "SQLite")), h.permissionCalls)
         assertEquals(emptyList<List<String>>(), h.userResponseCalls)
     }
 
     @Test
     fun `a double tap submits exactly once`() {
         val h = Harness()
-        h.prompts.register("req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
+        h.prompts.register("s1", "req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
         h.bridge.handleAnswerReq(listOf("s1", "req-7", RcPrompts.APPROVE))
         h.bridge.handleAnswerReq(listOf("s1", "req-7", RcPrompts.APPROVE))
         assertEquals(1, h.permissionCalls.size)
@@ -117,10 +118,20 @@ class RcPromptAnswerRoutingTest {
     @Test
     fun `a prompt already resolved on the phone is not answerable from the glasses`() {
         val h = Harness()
-        h.prompts.register("req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
-        h.prompts.resolve("req-7")
+        h.prompts.register("s1", "req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
+        h.prompts.resolve("s1", "req-7")
         h.bridge.handleAnswerReq(listOf("s1", "req-7", RcPrompts.APPROVE))
         assertEquals(emptyList<List<String?>>(), h.permissionCalls)
+        assertEquals(emptyList<List<String>>(), h.userResponseCalls)
+    }
+
+    @Test
+    fun `an answer naming another session resolves nothing`() {
+        val h = Harness()
+        h.prompts.register("s1", "req-7", "Bash", listOf(RcPrompts.APPROVE, RcPrompts.REJECT))
+        h.bridge.handleAnswerReq(listOf("s2", "req-7", RcPrompts.APPROVE))
+        assertEquals("a request id is only meaningful inside its own session",
+            emptyList<List<String?>>(), h.permissionCalls)
         assertEquals(emptyList<List<String>>(), h.userResponseCalls)
     }
 
@@ -136,10 +147,10 @@ class RcPromptAnswerRoutingTest {
     @Test
     fun `a label that was never offered is refused but leaves the prompt answerable`() {
         val h = Harness()
-        h.prompts.register("req-7", "AskUserQuestion", listOf("Postgres"))
+        h.prompts.register("s1", "req-7", "AskUserQuestion", listOf("Postgres"))
         h.bridge.handleAnswerReq(listOf("s1", "req-7", "rm -rf /"))
         assertEquals(emptyList<List<String?>>(), h.permissionCalls)
         h.bridge.handleAnswerReq(listOf("s1", "req-7", "Postgres"))
-        assertEquals(listOf(listOf("req-7", "true", null, "Postgres")), h.permissionCalls)
+        assertEquals(listOf(listOf("s1", "req-7", "true", null, "Postgres")), h.permissionCalls)
     }
 }

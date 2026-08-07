@@ -997,7 +997,7 @@ class ListenerService : LifecycleService(),
                     // projection is append-only) so the glasses could still confirm one. Dropping
                     // the pending entry is what makes that confirm a no-op instead of a second,
                     // contradictory answer.
-                    rcPrompts.resolve(requestId)
+                    rcPrompts.resolve(sessionId, requestId)
                     serviceScope.launch(Dispatchers.IO) {
                         orchestratorClient.sendRcPermissionResponse(sessionId, requestId, approved, modeChange, reason)
                     }
@@ -8998,6 +8998,10 @@ class ListenerService : LifecycleService(),
         // Promptness only, NOT the memory bound: this hook never fires on a dropped WS, a PC-side
         // CLI kill or a restart. The store's LRU is what actually bounds it.
         rcMirror.clear(sessionId)
+        // An ended session's prompts can never be resolved. Keeping them pending would leave a
+        // stale hit for a request id a later session may reuse; the registry's own 16-entry bound
+        // remains the actual limit, exactly as the store's LRU is for rows.
+        rcPrompts.clearSession(sessionId)
         pushRcState(force = true)
         refreshRcNotification()
         LogCollector.i(TAG, "RC session ended: $sessionId")
@@ -9239,7 +9243,7 @@ class ListenerService : LifecycleService(),
         // means the row can never reach the glasses describing a choice the answer path would
         // refuse.
         val options = com.repository.listener.rc.RcPrompts.optionsFor(toolName, toolArgs)
-        rcPrompts.register(requestId, toolName, options)
+        rcPrompts.register(sessionId, requestId, toolName, options)
         val promptRow = rcMirror.appendPrompt(
             sessionId, description ?: toolName, options,
             requestId = if (options.isEmpty()) "" else requestId

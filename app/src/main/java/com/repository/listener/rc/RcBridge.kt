@@ -99,7 +99,7 @@ class RcBridge(
         val requestId = args.getOrNull(1).orEmpty()
         val text = args.getOrNull(2).orEmpty()
         if (sessionId.isEmpty() || requestId.isEmpty() || text.isEmpty()) return
-        when (val answer = prompts.route(requestId, text)) {
+        when (val answer = prompts.route(sessionId, requestId, text)) {
             is RcPromptAnswer.Permission ->
                 sendPermissionResponse(sessionId, requestId, answer.approved, null, answer.reason)
             null -> Unit

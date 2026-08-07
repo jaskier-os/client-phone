@@ -83,36 +83,52 @@ class RcPromptRegistry {
 
     private val lock = Any()
 
-    private val pending = object : LinkedHashMap<String, Pending>(8, 0.75f, false) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pending>?): Boolean =
-            size > MAX_PENDING
+    /**
+     * Keyed by session AND request id. The session is part of the key, not a passenger: the glasses
+     * name the session separately in the answer frame, so keying on the request id alone would let
+     * a frame naming session B resolve a prompt session A raised -- a tool call the wearer never saw
+     * being approved by a keypress meant for another thread.
+     */
+    private val pending = object : LinkedHashMap<Pair<String, String>, Pending>(8, 0.75f, false) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<Pair<String, String>, Pending>?
+        ): Boolean = size > MAX_PENDING
     }
 
     /** A prompt with no options is not registered: there is nothing that could be routed. */
-    fun register(requestId: String, toolName: String, options: List<String>) = synchronized(lock) {
-        if (requestId.isEmpty() || options.isEmpty()) return@synchronized
-        pending[requestId] = Pending(toolName, options)
-        Unit
-    }
+    fun register(sessionId: String, requestId: String, toolName: String, options: List<String>) =
+        synchronized(lock) {
+            if (sessionId.isEmpty() || requestId.isEmpty() || options.isEmpty()) return@synchronized
+            pending[sessionId to requestId] = Pending(toolName, options)
+            Unit
+        }
 
     /** The prompt was answered elsewhere (phone UI) or expired. Idempotent. */
-    fun resolve(requestId: String) = synchronized(lock) {
-        pending.remove(requestId)
+    fun resolve(sessionId: String, requestId: String) = synchronized(lock) {
+        pending.remove(sessionId to requestId)
         Unit
     }
 
-    fun clear() = synchronized(lock) { pending.clear() }
+    /**
+     * The session ended. Its prompts can never be resolved now, and holding them only leaves a
+     * stale hit for a request id the orchestrator may reuse.
+     */
+    fun clearSession(sessionId: String) = synchronized(lock) {
+        pending.keys.removeAll { it.first == sessionId }
+        Unit
+    }
 
     /**
      * Consumes the prompt and says how to deliver [option], or null when it must not be delivered.
      *
-     * An unoffered label does NOT consume the prompt: a corrupt frame must not cost the wearer the
-     * ability to answer.
+     * An unoffered label, or one naming the wrong session, does NOT consume the prompt: a stray
+     * frame must not cost the wearer the ability to answer.
      */
-    fun route(requestId: String, option: String): RcPromptAnswer? = synchronized(lock) {
-        val p = pending[requestId] ?: return null
+    fun route(sessionId: String, requestId: String, option: String): RcPromptAnswer? =
+        synchronized(lock) {
+        val p = pending[sessionId to requestId] ?: return null
         if (option !in p.options) return null
-        pending.remove(requestId)
+        pending.remove(sessionId to requestId)
         return when {
             p.toolName != RcPrompts.ASK_USER_QUESTION && option == RcPrompts.APPROVE ->
                 RcPromptAnswer.Permission(approved = true, reason = null)
