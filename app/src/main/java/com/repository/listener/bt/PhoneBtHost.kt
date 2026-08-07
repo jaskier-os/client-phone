@@ -507,6 +507,15 @@ class PhoneBtHost(private val context: Context) {
     var onNotifReplyStart: ((notifId: String) -> Unit)? = null
     var onNotifReplySend: ((notifId: String, text: String) -> Unit)? = null
     var onNotifReplyCancel: ((notifId: String) -> Unit)? = null
+
+    /** CH_STT_MODE: true when the glasses will recognise the coming session themselves. */
+    var onGlassesSttMode: ((local: Boolean) -> Unit)? = null
+
+    /**
+     * CH_LOCAL_TRANSCRIPT. [text] may legitimately be empty when [ok] is true --
+     * that is the wearer cancelling, not a missing value.
+     */
+    var onGlassesLocalTranscript: ((tag: String, ok: Boolean, text: String) -> Unit)? = null
     var onGlassesInwardAudioData: ((String) -> Unit)? = null  // base64 PCM from glasses inward mic (two-way translation)
     var onGlassesCallAudioData: ((String) -> Unit)? = null  // base64 Opus frames from glasses HFP call downlink (far party)
     var onGlassesCallState: ((Boolean) -> Unit)? = null  // glasses HFP SCO state (call-audio present)
@@ -1365,6 +1374,8 @@ class PhoneBtHost(private val context: Context) {
                             }
                         }
                         BtProtocol.CH_WAKE_EVENT -> handleWakeEventFromGlasses(args)
+                        BtProtocol.CH_STT_MODE -> handleSttModeFromGlasses(args)
+                        BtProtocol.CH_LOCAL_TRANSCRIPT -> handleLocalTranscriptFromGlasses(args)
                         "Dev" -> handleDevNotification(args)
                         else -> {
                             if (cmd.startsWith("listener_")) {
@@ -1501,6 +1512,49 @@ class PhoneBtHost(private val context: Context) {
             onSyncMessage?.invoke(msgType, sessionId, payload)
         } catch (e: Exception) {
             log("Failed to parse sync frame: ${e.message}")
+        }
+    }
+
+    /**
+     * The glasses announce, BEFORE the session opens, which recogniser will
+     * handle it. Anything unrecognised means remote: failing the other way would
+     * leave nobody transcribing at all.
+     */
+    private fun handleSttModeFromGlasses(args: RelayCaps) {
+        try {
+            val m = SttModeWire.decode(listOf(args.at(0).getString(), args.at(1).getString()))
+            if (m == null) {
+                log("WARN: malformed CH_STT_MODE from glasses; staying on remote")
+                return
+            }
+            log("glasses STT mode=${m.mode} tag=${m.sessionTag}")
+            onGlassesSttMode?.invoke(m.isLocal)
+        } catch (e: Exception) {
+            // onMessage runs on a Binder thread; an uncaught throw kills the service.
+            log("Failed to parse CH_STT_MODE: ${e.message}")
+        }
+    }
+
+    /**
+     * A final produced by the on-glasses recogniser.
+     *
+     * An EMPTY text with status ok is not "nothing arrived": it is the wearer
+     * cancelling, and the listener acts on it by clearing a pending notification
+     * reply. It is passed through as an empty string, never dropped.
+     */
+    private fun handleLocalTranscriptFromGlasses(args: RelayCaps) {
+        try {
+            val m = LocalTranscriptWire.decode(
+                listOf(args.at(0).getString(), args.at(1).getString(), args.at(2).getString())
+            )
+            if (m == null) {
+                log("WARN: malformed CH_LOCAL_TRANSCRIPT from glasses")
+                return
+            }
+            log("glasses local transcript tag=${m.tag} status=${m.status} chars=${m.text.length}")
+            onGlassesLocalTranscript?.invoke(m.tag, m.isOk, m.text)
+        } catch (e: Exception) {
+            log("Failed to parse CH_LOCAL_TRANSCRIPT: ${e.message}")
         }
     }
 

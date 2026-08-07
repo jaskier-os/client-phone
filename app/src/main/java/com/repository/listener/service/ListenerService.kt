@@ -40,6 +40,7 @@ import com.repository.listener.audio.PipelineTracer
 import com.repository.listener.audio.WakeWordDetector
 
 import com.repository.listener.bt.GlassesHealthMonitor
+import com.repository.listener.bt.LocalTranscriptWire
 import com.repository.listener.bt.PhoneBtHost
 import com.repository.listener.bt.PhoneHidMouseBridge
 import com.repository.listener.bt.decodeGlassesMouseReport
@@ -1287,6 +1288,13 @@ class ListenerService : LifecycleService(),
     // Model used by the last glasses orchestrator send, so a failed send can arm
     // the reconnect retry with the same model it was built for.
     @Volatile private var lastGlassesSendModel: String = ""
+    /**
+     * Who is recognising the current glasses session, set from CH_STT_MODE before
+     * the session opens. Defaults to remote so an older glasses build, or a
+     * reconnect that lands before the announcement, behaves exactly as today --
+     * failing the other way would leave nobody transcribing.
+     */
+    @Volatile private var glassesSttGate: GlassesSttGate = GlassesSttGate.default()
     // Glasses on-head state, relayed over CH_WEAR_STATE. Default true so a missing
     // signal (older glasses build, BT reconnect before first broadcast) preserves
     // prior behaviour (allow ducking).
@@ -3255,6 +3263,37 @@ class ListenerService : LifecycleService(),
                 LogCollector.i(TAG, "[NREPLY] phone Reply START: notifId=$notifId (transcriber stream up)")
             }
         }
+        // Which recogniser owns the coming session. Arrives BEFORE any audio, so
+        // startTranscriberStream and the VAD feed can decline for the whole
+        // session rather than deciding per chunk.
+        phoneBtHost.onGlassesSttMode = { local ->
+            glassesSttGate = GlassesSttGate(localMode = local)
+            LogCollector.i(TAG, "glasses STT gate: local=$local")
+        }
+
+        // A final from the on-glasses recogniser. It re-enters the SAME delivery
+        // tails the remote transcriber feeds, so requestIds, orchestrator
+        // submission and the cancel contract are identical on both paths.
+        phoneBtHost.onGlassesLocalTranscript = { tag, ok, text ->
+            if (!ok) {
+                // Local recognition could not do it. The PCM was buffered
+                // throughout precisely for this: transcribe it the old way rather
+                // than losing the utterance.
+                LogCollector.w(TAG, "glasses local STT failed for tag=$tag; falling back to remote")
+                fallbackToRemoteTranscription(tag)
+            } else when (tag) {
+                LocalTranscriptWire.TAG_TG_VOICE ->
+                    // Includes the empty-text case, which is the wearer
+                    // cancelling; deliverTelegramVoiceTranscript owns that contract.
+                    deliverTelegramVoiceTranscript(text, notifReplyId)
+                else -> serviceScope.launch {
+                    deliverGlassesTranscript(
+                        text, hadStreamPreview = false, source = TranscriptSource.LOCAL
+                    )
+                }
+            }
+        }
+
         phoneBtHost.onNotifReplyCancel = { notifId ->
             LogCollector.i(TAG, "Notif reply voice cancel: notifId=$notifId")
             clearTelegramVoiceNoSpeechWatchdog()
@@ -4301,9 +4340,17 @@ class ListenerService : LifecycleService(),
                 // spurious double-wake races with the authoritative glasses side.
             }
             GlassesAudioState.LISTENING -> {
+                // Buffered on BOTH paths. In local mode this buffer is the
+                // fallback: on a local failure it is what gets batch-transcribed,
+                // so gating it would turn a recoverable failure into lost speech.
                 synchronized(glassesAudioBuffer) {
                     glassesAudioBuffer.add(samples.copyOf())
                 }
+                // In local mode the glasses own both recognition AND endpointing.
+                // Feeding the phone's VAD here would give a second opinion about
+                // when the wearer stopped, and it would finalize a session the
+                // glasses still own.
+                if (glassesSttGate.localMode) return
                 // Feed to transcriber stream for server-side live transcription
                 transcriberStreamClient?.feedAudio(samples)
                 if (glassesAudioState != GlassesAudioState.LISTENING) return
@@ -4571,6 +4618,13 @@ class ListenerService : LifecycleService(),
     // --- Transcriber stream helpers ---
 
     private fun startTranscriberStream(isGlasses: Boolean, sourceLang: String? = null) {
+        // The glasses announced they are recognising this session themselves, so
+        // opening the stream would transcribe the same sentence twice and race
+        // two finals to deliver it.
+        if (isGlasses && glassesSttGate.localMode) {
+            LogCollector.i(TAG, "glasses STT is local; not opening a transcriber stream")
+            return
+        }
         val url = transcriberUrl ?: return
         val key = AppConfig.getApiKey(this)
         val sttProvider = AppConfig.getSttProvider(this)
@@ -9701,6 +9755,13 @@ class ListenerService : LifecycleService(),
     }
 
     private fun armTelegramVoiceNoSpeechWatchdog() {
+        // This watchdog fires when the PHONE's VAD has heard nothing. In local
+        // mode it hears nothing by design, so arming it would cancel every
+        // healthy on-glasses session after the timeout.
+        if (!glassesSttGate.shouldArmNoSpeechWatchdog()) {
+            LogCollector.i(TAG, "glasses STT is local; no-speech watchdog not armed")
+            return
+        }
         // New session: re-open the single-finalize gate so this session can be
         // finalized exactly once (the previous session already consumed its gate).
         telegramVoiceFinalizing.set(false)
@@ -9718,6 +9779,21 @@ class ListenerService : LifecycleService(),
     private fun clearTelegramVoiceNoSpeechWatchdog() {
         telegramVoiceNoSpeechWatchdog?.let { mainHandler.removeCallbacks(it) }
         telegramVoiceNoSpeechWatchdog = null
+    }
+
+    /**
+     * The on-glasses recogniser reported it could not transcribe this utterance
+     * (model absent, NPU busy, Binder timeout, capture killed). Re-run it the old
+     * way over the PCM the phone buffered throughout the session -- that buffer
+     * exists for exactly this, so a local failure costs latency, not the wearer's
+     * words.
+     *
+     * Both finishers already own the whole tail (batch transcription, delivery,
+     * the cancel contract), so this dispatches to them rather than duplicating it.
+     */
+    private fun fallbackToRemoteTranscription(tag: String) {
+        if (tag == LocalTranscriptWire.TAG_TG_VOICE) finishTelegramVoiceRecording()
+        else finishGlassesRecording()
     }
 
     private fun finishTelegramVoiceRecording() {
