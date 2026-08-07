@@ -4229,9 +4229,21 @@ class ListenerService : LifecycleService(),
                     .array()
                 azureNotifReplySession?.pushPcm(pcmBytes)
             } else {
-                synchronized(telegramVoiceAudioBuffer) {
-                    telegramVoiceAudioBuffer.add(samples.copyOf())
+                // Buffered on BOTH paths: in local mode this buffer is what the
+                // failure fallback batch-transcribes, so the gate answers true
+                // for local as well as remote. It is consulted rather than
+                // assumed so that a future change which stops buffering has to
+                // go through the gate -- and through the test that pins it.
+                if (glassesSttGate.shouldBufferPcm()) {
+                    synchronized(telegramVoiceAudioBuffer) {
+                        telegramVoiceAudioBuffer.add(samples.copyOf())
+                    }
                 }
+                // In local mode the glasses own endpointing as well as
+                // recognition. Running the phone's VAD too would finalize the
+                // session here AND let the glasses deliver their own final,
+                // sending the same utterance twice.
+                if (!glassesSttGate.shouldFeedPhoneVad()) return
                 transcriberStreamClient?.feedAudio(samples)
 
                 // VAD for end-of-speech detection
@@ -4342,15 +4354,17 @@ class ListenerService : LifecycleService(),
             GlassesAudioState.LISTENING -> {
                 // Buffered on BOTH paths. In local mode this buffer is the
                 // fallback: on a local failure it is what gets batch-transcribed,
-                // so gating it would turn a recoverable failure into lost speech.
-                synchronized(glassesAudioBuffer) {
-                    glassesAudioBuffer.add(samples.copyOf())
+                // so the gate answers true for local as well as remote.
+                if (glassesSttGate.shouldBufferPcm()) {
+                    synchronized(glassesAudioBuffer) {
+                        glassesAudioBuffer.add(samples.copyOf())
+                    }
                 }
                 // In local mode the glasses own both recognition AND endpointing.
                 // Feeding the phone's VAD here would give a second opinion about
                 // when the wearer stopped, and it would finalize a session the
                 // glasses still own.
-                if (glassesSttGate.localMode) return
+                if (!glassesSttGate.shouldFeedPhoneVad()) return
                 // Feed to transcriber stream for server-side live transcription
                 transcriberStreamClient?.feedAudio(samples)
                 if (glassesAudioState != GlassesAudioState.LISTENING) return
@@ -4621,7 +4635,7 @@ class ListenerService : LifecycleService(),
         // The glasses announced they are recognising this session themselves, so
         // opening the stream would transcribe the same sentence twice and race
         // two finals to deliver it.
-        if (isGlasses && glassesSttGate.localMode) {
+        if (isGlasses && !glassesSttGate.shouldOpenTranscriberStream()) {
             LogCollector.i(TAG, "glasses STT is local; not opening a transcriber stream")
             return
         }
@@ -4634,6 +4648,9 @@ class ListenerService : LifecycleService(),
             client.start(object : TranscriberStreamClient.Listener {
                 override fun onPartial(text: String) {
                     if (!isGlasses) return
+                    // Local mode is finals-only: a partial there would be a full
+                    // re-decode and the live preview would visibly jump.
+                    if (!glassesSttGate.shouldForwardPartials()) return
                     val forward = glassesAudioState == GlassesAudioState.LISTENING || telegramVoiceMode
                     LogCollector.i(TAG, "[PARTIAL] onPartial len=${text.length} forward=$forward tgVoice=$telegramVoiceMode state=$glassesAudioState text='${text.take(40)}'")
                     if (forward) {
@@ -9755,16 +9772,24 @@ class ListenerService : LifecycleService(),
     }
 
     private fun armTelegramVoiceNoSpeechWatchdog() {
-        // This watchdog fires when the PHONE's VAD has heard nothing. In local
-        // mode it hears nothing by design, so arming it would cancel every
+        // New session: re-open the single-finalize gate so this session can be
+        // finalized exactly once (the previous session already consumed its gate).
+        //
+        // This happens BEFORE the local-mode check on purpose. Returning early
+        // without re-opening the gate would leave it latched shut from the
+        // previous session, so the SECOND local failure onwards could never
+        // finalize: the utterance would be lost and notifReplyId never cleared,
+        // hanging the notification reply in SENDING.
+        telegramVoiceFinalizing.set(false)
+        clearTelegramVoiceNoSpeechWatchdog()
+
+        // The watchdog itself fires when the PHONE's VAD has heard nothing. In
+        // local mode it hears nothing by design, so arming it would cancel every
         // healthy on-glasses session after the timeout.
         if (!glassesSttGate.shouldArmNoSpeechWatchdog()) {
             LogCollector.i(TAG, "glasses STT is local; no-speech watchdog not armed")
             return
         }
-        // New session: re-open the single-finalize gate so this session can be
-        // finalized exactly once (the previous session already consumed its gate).
-        telegramVoiceFinalizing.set(false)
         clearTelegramVoiceNoSpeechWatchdog()
         val watchdog = Runnable {
             if (!telegramVoiceMode) return@Runnable
@@ -9792,8 +9817,45 @@ class ListenerService : LifecycleService(),
      * the cancel contract), so this dispatches to them rather than duplicating it.
      */
     private fun fallbackToRemoteTranscription(tag: String) {
-        if (tag == LocalTranscriptWire.TAG_TG_VOICE) finishTelegramVoiceRecording()
-        else finishGlassesRecording()
+        if (tag == LocalTranscriptWire.TAG_TG_VOICE) {
+            // finishTelegramVoiceRecording reads telegramVoiceAudioBuffer itself
+            // and owns the whole tail, including the blank-is-cancel contract.
+            finishTelegramVoiceRecording()
+            return
+        }
+
+        // The assistant path cannot just call finishGlassesRecording(): that
+        // finisher is the tail of the REMOTE flow and returns immediately unless
+        // the state is CONFIRMING, which local mode never enters (there is no
+        // phone-side VAD to detect end-of-speech and open the 2 s confirm
+        // window). It also transcribes pendingGlassesChunks, which only
+        // startGlassesConfirmDelay ever fills -- so on the local path it would
+        // find an empty buffer.
+        //
+        // Hand the buffered audio over and enter CONFIRMING explicitly, so the
+        // one existing implementation of batch transcription and delivery runs
+        // rather than a second copy of it.
+        if (glassesAudioState != GlassesAudioState.LISTENING) {
+            LogCollector.w(TAG, "local STT fallback ignored: state=$glassesAudioState")
+            return
+        }
+        synchronized(glassesAudioBuffer) {
+            pendingGlassesChunks = glassesAudioBuffer.toList()
+            glassesAudioBuffer.clear()
+        }
+        if (pendingGlassesChunks.isEmpty()) {
+            // Nothing was ever buffered, so there is nothing to recover. Return
+            // to IDLE rather than leaving the wearer in LISTENING forever.
+            LogCollector.w(TAG, "local STT fallback has no buffered audio; dismissing")
+            setGlassesState(GlassesAudioState.IDLE, "local stt fallback empty")
+            phoneBtHost.sendDismissSession()
+            return
+        }
+        // Local mode showed no live partials, so there is no stream text: the
+        // finisher will take its batch-transcription branch.
+        pendingGlassesStreamText = ""
+        setGlassesState(GlassesAudioState.CONFIRMING, "local stt fallback")
+        finishGlassesRecording()
     }
 
     private fun finishTelegramVoiceRecording() {

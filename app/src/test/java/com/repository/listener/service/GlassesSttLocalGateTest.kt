@@ -72,6 +72,29 @@ class GlassesSttLocalGateTest {
     }
 
     @Test
+    fun everyGateQuestionIsActuallyConsultedByTheService() {
+        // An audit found four of these five questions had NO production caller:
+        // the service read `localMode` directly, so the tests above were passing
+        // against an API nothing used. A test that cannot fail when shipped
+        // behaviour changes is worse than no test, because it reads as coverage.
+        val src = java.io.File(
+            "src/main/java/com/repository/listener/service/ListenerService.kt"
+        ).readText()
+        for (q in listOf(
+            "shouldOpenTranscriberStream",
+            "shouldFeedPhoneVad",
+            "shouldArmNoSpeechWatchdog",
+            "shouldBufferPcm",
+            "shouldForwardPartials",
+        )) {
+            assertTrue(
+                "ListenerService must consult $q(); otherwise its test proves nothing",
+                src.contains("$q()")
+            )
+        }
+    }
+
+    @Test
     fun theGateDefaultsToRemoteWhenTheGlassesNeverSaidAnything() {
         // An older glasses build, or a BT reconnect before the announcement,
         // must behave exactly as today rather than leaving nobody transcribing.
