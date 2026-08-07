@@ -16,10 +16,16 @@ import com.repository.listener.bt.BtProtocol
  */
 class RcBridge(
     private val store: RcMirrorStore,
+    /** Decides whether a prompt is still answerable and which call resolves it. */
+    private val prompts: RcPromptRegistry,
     /** Writes one frame, returning whether it actually reached the socket. */
     private val send: (channel: String, args: Array<String>) -> Boolean,
     private val sendUserMessage: (sessionId: String, text: String) -> Unit,
     private val sendUserResponse: (sessionId: String, requestId: String, text: String) -> Unit,
+    /** Resolves a blocking permission. A permission sent through sendUserResponse stays pending. */
+    private val sendPermissionResponse: (
+        sessionId: String, requestId: String, approved: Boolean, mode: String?, reason: String?
+    ) -> Unit,
     private val markRead: (sessionId: String, seenSeq: Long) -> Unit,
     private val requestTranscript: (sessionId: String) -> Unit,
     private val cachedTranscript: (sessionId: String) -> String?
@@ -79,13 +85,25 @@ class RcBridge(
         send(BtProtocol.CH_RC_SEND_RESP, arrayOf(sessionId, clientMsgId, status))
     }
 
-    /** args = [sessionId, requestId, optionText]. */
+    /**
+     * args = [sessionId, requestId, optionText].
+     *
+     * The registry, not the frame, decides what happens: it is the only place that knows which
+     * prompts are still pending and which orchestrator call resolves each. An answer it refuses --
+     * a repeat, a prompt the phone user already answered, a label never offered -- sends NOTHING.
+     * Falling back to [sendUserResponse] here would deliver a permission down the free-text path,
+     * leaving the tool call blocked forever.
+     */
     fun handleAnswerReq(args: List<String>) {
         val sessionId = args.getOrNull(0).orEmpty()
         val requestId = args.getOrNull(1).orEmpty()
         val text = args.getOrNull(2).orEmpty()
         if (sessionId.isEmpty() || requestId.isEmpty() || text.isEmpty()) return
-        sendUserResponse(sessionId, requestId, text)
+        when (val answer = prompts.route(requestId, text)) {
+            is RcPromptAnswer.Permission ->
+                sendPermissionResponse(sessionId, requestId, answer.approved, null, answer.reason)
+            null -> Unit
+        }
     }
 
     /**
@@ -138,6 +156,8 @@ class RcBridge(
                 r.options.forEachIndexed { j, o -> if (j > 0) sb.append(','); sb.append(quote(o)) }
                 sb.append(']')
             }
+            // Only a prompt has one; omitted otherwise so a non-prompt row can never be answered.
+            if (r.requestId.isNotEmpty()) sb.append(",\"i\":").append(quote(r.requestId))
             sb.append('}')
         }
         sb.append("],\"more\":").append(moreAbove)

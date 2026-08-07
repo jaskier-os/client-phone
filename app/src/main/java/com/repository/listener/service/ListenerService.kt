@@ -993,6 +993,11 @@ class ListenerService : LifecycleService(),
                     val modeChange = intent.getStringExtra("rc_mode_change")
                     val reason = intent.getStringExtra("rc_reason")
                     LogCollector.i(TAG, "RC permission response from UI: session=$sessionId approved=$approved${if (reason != null) " reason=$reason" else ""}")
+                    // Answered on the phone: the mirrored row still shows its options (the
+                    // projection is append-only) so the glasses could still confirm one. Dropping
+                    // the pending entry is what makes that confirm a no-op instead of a second,
+                    // contradictory answer.
+                    rcPrompts.resolve(requestId)
                     serviceScope.launch(Dispatchers.IO) {
                         orchestratorClient.sendRcPermissionResponse(sessionId, requestId, approved, modeChange, reason)
                     }
@@ -9228,12 +9233,18 @@ class ListenerService : LifecycleService(),
     override fun onRcPermissionRequest(sessionId: String, toolName: String, toolArgs: String, requestId: String, description: String?) {
         thinkingRcStartTimes.remove(sessionId)
         touchRcSession(sessionId)
-        // No options: the orchestrator's rc_permission_request carries none, and CH_RC_ANSWER_REQ
-        // routes to sendRcUserResponse (spec 1.6) rather than sendRcPermissionResponse -- so an
-        // option answered on the glasses would not resolve the pending permission. The prompt text
-        // still mirrors; the answer is given on the phone. Wiring this end-to-end needs an
-        // orchestrator protocol change and is out of scope here.
-        rcMirror.appendPrompt(sessionId, description ?: toolName, emptyList())
+        // The options are derived phone-side, not carried by the orchestrator: an AskUserQuestion
+        // enumerates them in toolArgs (the phone RC UI parses the same field for its buttons), and
+        // every other tool's choice is the approve/reject verdict. Registering BEFORE projecting
+        // means the row can never reach the glasses describing a choice the answer path would
+        // refuse.
+        val options = com.repository.listener.rc.RcPrompts.optionsFor(toolName, toolArgs)
+        rcPrompts.register(requestId, toolName, options)
+        val promptRow = rcMirror.appendPrompt(
+            sessionId, description ?: toolName, options,
+            requestId = if (options.isEmpty()) "" else requestId
+        )
+        rcBridge.pushRows(sessionId, listOf(promptRow))
         pushRcState(force = true)
         val data = JSONObject().apply {
             put("toolName", toolName)
@@ -11013,9 +11024,17 @@ class ListenerService : LifecycleService(),
      */
     private val rcMirror = com.repository.listener.rc.RcMirrorStore()
 
+    /**
+     * Which mirrored prompts the glasses may still answer. Separate from the row projection because
+     * that projection is append-only: a delivered prompt row cannot be mutated to withdraw its
+     * options, so "already resolved" is decided here, on the answer path.
+     */
+    private val rcPrompts = com.repository.listener.rc.RcPromptRegistry()
+
     /** Owns the six RC mirror channels so neither PhoneBtHost nor this class grows the logic. */
     private val rcBridge = com.repository.listener.rc.RcBridge(
         store = rcMirror,
+        prompts = rcPrompts,
         send = { channel, args -> phoneBtHost.sendRcIfConnected(channel, *args) },
         sendUserMessage = { sessionId, text ->
             orchestratorClient.sendRcUserMessage(sessionId, text)
@@ -11023,6 +11042,12 @@ class ListenerService : LifecycleService(),
         },
         sendUserResponse = { sessionId, requestId, text ->
             orchestratorClient.sendRcUserResponse(sessionId, requestId, text)
+        },
+        sendPermissionResponse = { sessionId, requestId, approved, mode, reason ->
+            markRcTurning(sessionId, true)
+            serviceScope.launch(Dispatchers.IO) {
+                orchestratorClient.sendRcPermissionResponse(sessionId, requestId, approved, mode, reason)
+            }
         },
         markRead = { sessionId, seenSeq -> markRcRead(sessionId, seenSeq) },
         requestTranscript = { sessionId -> orchestratorClient.requestRcTranscript(sessionId) },

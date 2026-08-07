@@ -133,18 +133,35 @@ class RcProjectionTest {
         assertEquals(firstLastSeq, store.lastSeq("s1"))
     }
 
+    /**
+     * A permission entry has no `options` key of its own -- the orchestrator does not emit one --
+     * so the seeded row derives the approve/reject verdict exactly as the live path does.
+     */
     @Test
-    fun aPromptEntryIsSeededWithItsOptions() {
+    fun aPromptEntryIsSeededWithTheVerdictOptions() {
         val store = RcMirrorStore()
         store.seedFromTranscript(
             "s1",
-            """[{"type":"rc_permission_request","data":{"toolName":"Bash","description":"Allow Bash?","options":["Yes","No"]}}]"""
+            """[{"type":"rc_permission_request","data":{"toolName":"Bash","description":"Allow Bash?","requestId":"req-4"}}]"""
         )
         val rows = store.tail("s1", n = 100).first
         assertEquals(1, rows.size)
         assertEquals("prompt", rows[0].role)
         assertEquals("Allow Bash?", rows[0].text)
-        assertEquals(listOf("Yes", "No"), rows[0].options)
+        assertEquals(listOf(RcPrompts.APPROVE, RcPrompts.REJECT), rows[0].options)
+        assertEquals("req-4", rows[0].requestId)
+    }
+
+    /** A seeded AskUserQuestion offers the same labels the phone parses for its own buttons. */
+    @Test
+    fun aSeededQuestionOffersTheLabelsFromItsToolArgs() {
+        val store = RcMirrorStore()
+        val args = """{\"questions\":[{\"question\":\"q\",\"options\":[{\"label\":\"Postgres\"},{\"label\":\"SQLite\"}]}]}"""
+        store.seedFromTranscript(
+            "s1",
+            """[{"type":"rc_permission_request","data":{"toolName":"AskUserQuestion","description":"Which db?","toolArgs":"$args","requestId":"req-5"}}]"""
+        )
+        assertEquals(listOf("Postgres", "SQLite"), store.tail("s1", n = 100).first[0].options)
     }
 
     @Test

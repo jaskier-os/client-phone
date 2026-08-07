@@ -24,13 +24,20 @@ class RcBridgeTest {
         val openDuringMarkRead = mutableListOf<String?>()
         private var bridgeRef: RcBridge? = null
 
+        val prompts = RcPromptRegistry()
+        val permissionResponses = mutableListOf<Triple<String, String, String?>>()
+
         val bridge: RcBridge = RcBridge(
             store = store,
+            prompts = prompts,
             send = { channel, args -> sent.add(channel to args.toList()); linkUp },
             sendUserMessage = { sid, text ->
                 userMessages.add(sid to text); sendUserMessageImpl(sid, text)
             },
             sendUserResponse = { sid, rid, text -> userResponses.add(Triple(sid, rid, text)) },
+            sendPermissionResponse = { sid, rid, approved, _, reason ->
+                permissionResponses.add(Triple(sid, "$rid:$approved", reason))
+            },
             markRead = { sid, seen ->
                 reads.add(sid to seen)
                 if (observeOpenDuringMarkRead) openDuringMarkRead.add(bridgeRef?.openSessionId)
@@ -75,11 +82,18 @@ class RcBridgeTest {
         assertEquals(emptyList<Pair<String, String>>(), h.userMessages)
     }
 
+    /**
+     * A mirrored prompt is ALWAYS a permission request -- the only other blocking prompt,
+     * rc_user_input, is free text and is never given options -- so its answer must resolve through
+     * the permission call. Routing it to sendRcUserResponse would leave the tool call pending.
+     */
     @Test
-    fun anAnswerRequestRoutesToTheUserResponsePath() {
+    fun anAnswerRequestRoutesToThePermissionPathNotTheUserResponsePath() {
         val h = Harness()
+        h.prompts.register("req-3", "AskUserQuestion", listOf("Yes", "No"))
         h.bridge.handleAnswerReq(listOf("sess-1", "req-3", "Yes"))
-        assertEquals(listOf(Triple("sess-1", "req-3", "Yes")), h.userResponses)
+        assertEquals(listOf(Triple("sess-1", "req-3:true", "Yes")), h.permissionResponses)
+        assertEquals(emptyList<Triple<String, String, String>>(), h.userResponses)
     }
 
     @Test
@@ -317,6 +331,7 @@ class RcBridgeTest {
         h.bridge.handleAnswerReq(listOf("", "req-3", "Yes"))
         h.bridge.handleAnswerReq(emptyList())
         assertEquals(emptyList<Triple<String, String, String>>(), h.userResponses)
+        assertEquals(emptyList<Triple<String, String, String?>>(), h.permissionResponses)
     }
 
     @Test

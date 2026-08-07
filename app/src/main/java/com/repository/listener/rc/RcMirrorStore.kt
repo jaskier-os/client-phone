@@ -11,7 +11,13 @@ data class RcRow(
     val role: String,                        // user | assistant | tools | prompt
     val text: String,                        // <= ROW_CHARS, markdown-stripped
     val toolCount: Int = 0,
-    val options: List<String> = emptyList()  // non-empty only for role == "prompt"
+    val options: List<String> = emptyList(), // non-empty only for role == "prompt"
+    /**
+     * The orchestrator request id an answer must quote. Non-empty only for an ANSWERABLE prompt:
+     * without it the glasses have nothing to route a choice to, so a prompt carrying options but no
+     * id is rendered as text and refused at confirm time rather than sent to the wrong path.
+     */
+    val requestId: String = ""
 )
 
 /**
@@ -70,12 +76,16 @@ class RcMirrorStore {
         add(s, "user", strip(text))
     }
 
-    fun appendPrompt(sessionId: String, text: String, options: List<String>): RcRow =
-        synchronized(lock) {
-            val s = session(sessionId)
-            s.lastCommittedAssistant = null
-            add(s, "prompt", strip(text), options = options.toList())
-        }
+    fun appendPrompt(
+        sessionId: String,
+        text: String,
+        options: List<String>,
+        requestId: String = ""
+    ): RcRow = synchronized(lock) {
+        val s = session(sessionId)
+        s.lastCommittedAssistant = null
+        add(s, "prompt", strip(text), options = options.toList(), requestId = requestId)
+    }
 
     /**
      * Flushes the pending tool row and the last cumulative assistant text as at most two rows, the
@@ -176,7 +186,18 @@ class RcMirrorStore {
                         val label = if (description.isNotEmpty()) description
                         else data.optString("toolName", "")
                         if (label.isNotEmpty()) {
-                            addSeeded(s, "prompt", strip(label), options = optionsOf(data))
+                            // Options are derived exactly as on the live path. Whether the seeded
+                            // prompt is still ANSWERABLE is not decided here: only a request id the
+                            // RcPromptRegistry still holds pending can be routed, so a historical
+                            // prompt re-renders its choice as inert text.
+                            addSeeded(
+                                s, "prompt", strip(label),
+                                options = RcPrompts.optionsFor(
+                                    data.optString("toolName", ""),
+                                    data.optString("toolArgs", "")
+                                ),
+                                requestId = data.optString("requestId", "")
+                            )
                         }
                     }
                 }
@@ -192,14 +213,15 @@ class RcMirrorStore {
         s: Session,
         role: String,
         text: String,
-        options: List<String> = emptyList()
+        options: List<String> = emptyList(),
+        requestId: String = ""
     ) {
         // Consecutive identical assistant rows are collapsed, as the phone RC UI does.
         if (role == "assistant") {
             val prev = s.rows.lastOrNull()
             if (prev != null && prev.role == "assistant" && prev.text == text) return
         }
-        add(s, role, text, options = options)
+        add(s, role, text, options = options, requestId = requestId)
         s.lastCommittedAssistant = if (role == "assistant") text else null
     }
 
@@ -214,11 +236,6 @@ class RcMirrorStore {
         return false
     }
 
-    private fun optionsOf(data: org.json.JSONObject): List<String> {
-        val raw = data.optJSONArray("options") ?: return emptyList()
-        return (0 until raw.length()).mapNotNull { raw.optString(it, "").ifEmpty { null } }
-    }
-
     /** Session ids currently held, least-recently-accessed first. */
     fun sessionIds(): List<String> = synchronized(lock) { sessions.keys.toList() }
 
@@ -230,9 +247,10 @@ class RcMirrorStore {
         role: String,
         text: String,
         toolCount: Int = 0,
-        options: List<String> = emptyList()
+        options: List<String> = emptyList(),
+        requestId: String = ""
     ): RcRow {
-        val row = RcRow(s.nextSeq++, role, text, toolCount, options)
+        val row = RcRow(s.nextSeq++, role, text, toolCount, options, requestId)
         s.rows.addLast(row)
         while (s.rows.size > MAX_ROWS) {
             s.rows.removeFirst()
