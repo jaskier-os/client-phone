@@ -10993,6 +10993,11 @@ class ListenerService : LifecycleService(),
 
     override fun onGlassesDisconnected() {
         LogCollector.i(TAG, "Glasses disconnected from BT")
+        // Back to remote. The gate is only ever set by an announcement FROM the
+        // glasses, so leaving it latched on "local" after they vanish means the
+        // phone refuses to open its transcriber, feed its VAD or arm its watchdog
+        // for the next session -- and nobody transcribes at all.
+        glassesSttGate = GlassesSttGate.default()
         // Without this the byte-identical dedup would permanently suppress the corrective resync
         // the next link-up owes: the glasses come back holding nothing. Under the push lock so it
         // cannot be overwritten by a push already past its own send.
