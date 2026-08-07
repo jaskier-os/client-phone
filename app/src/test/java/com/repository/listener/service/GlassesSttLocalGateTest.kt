@@ -95,6 +95,31 @@ class GlassesSttLocalGateTest {
     }
 
     @Test
+    fun everyWatchdogArmingSiteIsGated() {
+        // Presence of the call somewhere in the file is not enough. The Telegram
+        // path consulted the gate while the assistant path did not, so the check
+        // above passed and the phone still dismissed the wearer's session after
+        // 7 s of "no VAD activity" -- activity that, in local mode, never comes.
+        // Assert per SITE: every arming of a no-speech watchdog must sit inside a
+        // shouldArmNoSpeechWatchdog() branch.
+        val src = java.io.File(
+            "src/main/java/com/repository/listener/service/ListenerService.kt"
+        ).readText()
+        val lines = src.lines()
+        val armSites = lines.withIndex().filter { (_, l) ->
+            l.contains("postDelayed(") && l.contains("NO_SPEECH_TIMEOUT_MS")
+        }
+        assertTrue("expected at least one no-speech watchdog arming site", armSites.isNotEmpty())
+        for ((idx, line) in armSites) {
+            val window = lines.subList(maxOf(0, idx - 25), idx).joinToString("\n")
+            assertTrue(
+                "watchdog armed at line ${idx + 1} without consulting the gate: ${line.trim()}",
+                window.contains("shouldArmNoSpeechWatchdog()")
+            )
+        }
+    }
+
+    @Test
     fun theGateDefaultsToRemoteWhenTheGlassesNeverSaidAnything() {
         // An older glasses build, or a BT reconnect before the announcement,
         // must behave exactly as today rather than leaving nobody transcribing.

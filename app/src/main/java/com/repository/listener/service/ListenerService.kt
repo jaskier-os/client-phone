@@ -1395,16 +1395,23 @@ class ListenerService : LifecycleService(),
             GlassesAudioState.LISTENING -> {
                 startTranscriberStream(true)
                 startPromptSpeakerVerification(true)
-                // Independent watchdog: dismiss if no speech detected, even if BT audio stalls
-                val watchdog = Runnable {
-                    if (glassesAudioState == GlassesAudioState.LISTENING && !glassesSpeechDetected) {
-                        LogCollector.i(TAG, "Glasses no-speech watchdog: no VAD activity in ${AppConfig.NO_SPEECH_TIMEOUT_MS}ms, dismissing")
-                        setGlassesState(GlassesAudioState.IDLE, "no speech watchdog")
-                        phoneBtHost.sendDismissSession()
+                // The watchdog fires on the absence of PHONE VAD activity. When the glasses
+                // recognise the speech themselves the phone is never fed audio, so that
+                // absence is the normal case, not a silent wearer -- arming it here dismissed
+                // the session mid-utterance and the wearer's words were thrown away.
+                if (glassesSttGate.shouldArmNoSpeechWatchdog()) {
+                    val watchdog = Runnable {
+                        if (glassesAudioState == GlassesAudioState.LISTENING && !glassesSpeechDetected) {
+                            LogCollector.i(TAG, "Glasses no-speech watchdog: no VAD activity in ${AppConfig.NO_SPEECH_TIMEOUT_MS}ms, dismissing")
+                            setGlassesState(GlassesAudioState.IDLE, "no speech watchdog")
+                            phoneBtHost.sendDismissSession()
+                        }
                     }
+                    glassesNoSpeechWatchdog = watchdog
+                    mainHandler.postDelayed(watchdog, AppConfig.NO_SPEECH_TIMEOUT_MS)
+                } else {
+                    LogCollector.i(TAG, "Glasses no-speech watchdog not armed: glasses own the endpointing")
                 }
-                glassesNoSpeechWatchdog = watchdog
-                mainHandler.postDelayed(watchdog, AppConfig.NO_SPEECH_TIMEOUT_MS)
             }
             GlassesAudioState.RESPONDING -> {
                 // (no response timeout)
