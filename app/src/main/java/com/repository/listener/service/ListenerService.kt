@@ -10937,6 +10937,17 @@ class ListenerService : LifecycleService(),
             LogCollector.w(TAG, "Nav re-sync on glasses connect failed: ${e.message}")
         }
 
+        // The glasses hold no RC state of their own, and pushRcState only fires on RC
+        // EVENTS. A session opened before the link came up therefore never reached the
+        // glasses: nothing had changed since, so nothing was ever sent, and the chats
+        // list stayed empty. Push the whole snapshot on connect, forced past the dedup
+        // cache, the same way the translation config below is reasserted.
+        try {
+            pushRcState(force = true)
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "RC state push on BT connect failed: ${e.message}")
+        }
+
         // Always push current translation config so glasses display the correct language
         // pair even when translation is not active. Then restore active session if needed.
         try {
