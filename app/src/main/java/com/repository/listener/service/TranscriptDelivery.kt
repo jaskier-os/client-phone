@@ -142,12 +142,17 @@ class TranscriptDelivery(private val port: Port) {
             // local model transcribes it too, and an empty request must not reach
             // the orchestrator.
             port.log("Glasses transcription empty after wake word filter (raw='$rawText')")
+            port.log("[STT] delivery path=$source DISMISSED: blank after wake-word strip (raw chars=${rawText.length})")
             port.setGlassesState(GlassesAudioState.IDLE, "empty transcription")
             port.dismissSession()
             return
         }
 
         port.log("Glasses transcription ($source): $text")
+        // Which delivery path this text took. The local path is structurally
+        // different (it never passes through CONFIRMING/SENDING) and that
+        // difference is what once hung the glasses in LISTENING, so name it.
+        port.log("[STT] delivery path=$source chars=${text.length} hadPreview=$hadStreamPreview -> assistant")
         if (!hadStreamPreview) port.sendGlassesUserText(TAG_PENDING, text)
 
         // The remote path already entered SENDING in finishGlassesRecording. The
@@ -161,6 +166,7 @@ class TranscriptDelivery(private val port: Port) {
         when (val result = port.sendToOrchestrator(text)) {
             is OrchestratorSend.Sent -> {
                 port.registerRequestId(result.requestId)
+                port.log("[STT] sent to orchestrator requestId=${result.requestId} path=$source")
                 port.sendGlassesUserText(result.requestId, text)
                 // Only transition if the session was not cancelled during the
                 // send. Evaluated against the same state machine on both paths.

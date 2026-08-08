@@ -1528,10 +1528,15 @@ class PhoneBtHost(private val context: Context) {
                 return
             }
             log("glasses STT mode=${m.mode} tag=${m.sessionTag}")
+            // Tagged so the phone's half of the flow greps out of the same
+            // "[STT]" filter as the glasses' half.
+            log("[STT] RECV CH_STT_MODE mode=${m.mode} tag=${m.sessionTag} local=${m.isLocal}")
             onGlassesSttMode?.invoke(m.isLocal)
+            log("[STT] gate applied localMode=${m.isLocal}")
         } catch (e: Exception) {
             // onMessage runs on a Binder thread; an uncaught throw kills the service.
             log("Failed to parse CH_STT_MODE: ${e.message}")
+            log("[STT] WARN failed to parse CH_STT_MODE: ${e.message}")
         }
     }
 
@@ -1552,9 +1557,19 @@ class PhoneBtHost(private val context: Context) {
                 return
             }
             log("glasses local transcript tag=${m.tag} status=${m.status} chars=${m.text.length}")
+            // ok+empty and fail are different outcomes that a chars=0 line alone
+            // cannot separate: the first is the wearer cancelling, the second is
+            // the phone being told to batch-transcribe its own buffer.
+            val kind = when {
+                !m.isOk -> "FAIL -> phone batch-transcribes its buffered PCM"
+                m.text.isEmpty() -> "OK EMPTY (intentional cancel signal)"
+                else -> "OK chars=${m.text.length}"
+            }
+            log("[STT] RECV CH_LOCAL_TRANSCRIPT tag=${m.tag} $kind")
             onGlassesLocalTranscript?.invoke(m.tag, m.isOk, m.text)
         } catch (e: Exception) {
             log("Failed to parse CH_LOCAL_TRANSCRIPT: ${e.message}")
+            log("[STT] WARN failed to parse CH_LOCAL_TRANSCRIPT: ${e.message}")
         }
     }
 

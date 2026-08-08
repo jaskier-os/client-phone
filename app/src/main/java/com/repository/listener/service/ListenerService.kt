@@ -3276,6 +3276,17 @@ class ListenerService : LifecycleService(),
         phoneBtHost.onGlassesSttMode = { local ->
             glassesSttGate = GlassesSttGate(localMode = local)
             LogCollector.i(TAG, "glasses STT gate: local=$local")
+            // The five consequences spelled out. They are NOT all the same value
+            // (pcmBuffer stays true in local mode, and that buffer is the entire
+            // failure fallback), so a bare local=true does not tell you what the
+            // phone will actually do next.
+            val g = glassesSttGate
+            LogCollector.i(
+                TAG,
+                "[STT] gate local=$local openStream=${g.shouldOpenTranscriberStream()} " +
+                    "feedVad=${g.shouldFeedPhoneVad()} armWatchdog=${g.shouldArmNoSpeechWatchdog()} " +
+                    "bufferPcm=${g.shouldBufferPcm()} forwardPartials=${g.shouldForwardPartials()}"
+            )
         }
 
         // A final from the on-glasses recogniser. It re-enters the SAME delivery
@@ -3287,6 +3298,7 @@ class ListenerService : LifecycleService(),
                 // throughout precisely for this: transcribe it the old way rather
                 // than losing the utterance.
                 LogCollector.w(TAG, "glasses local STT failed for tag=$tag; falling back to remote")
+                LogCollector.i(TAG, "[STT] FALLBACK TO REMOTE tag=$tag: glasses reported fail, batch-transcribing buffered PCM")
                 fallbackToRemoteTranscription(tag)
             } else when (tag) {
                 LocalTranscriptWire.TAG_TG_VOICE ->
