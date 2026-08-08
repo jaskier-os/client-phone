@@ -205,6 +205,30 @@ class RcLiveSessionMergeTest {
         assertTrue(r.revived.isEmpty())
     }
 
+    @Test
+    fun anEndedDiscoveredSessionIsRevivedToo() {
+        // A discovered session that the WS marked ended, then the list reports alive again, is
+        // open. Leaving it "ended" would render a permanently dim, non-enterable row.
+        val r = RcLiveSessionMerge.merge(mapOf(discovered("s1", status = "ended")), listOf(live("s1")))
+        assertEquals("active", r.entries.getValue("s1").status)
+    }
+
+    @Test
+    fun aRevivedDiscoveredSessionIsReportedAsRevivedNotAsAPlainEdit() {
+        // The caller logs these separately and a revival is the interesting one to see in logcat.
+        val r = RcLiveSessionMerge.merge(mapOf(discovered("s1", status = "ended")), listOf(live("s1")))
+        assertEquals(listOf("s1"), r.revived)
+    }
+
+    @Test
+    fun revivingAWebsocketOwnedSessionTouchesNothingButTheStatus() {
+        // The single most dangerous violation of the invariant: revival is the one place the list
+        // is allowed to write to a WS-owned entry, so it must write to exactly one field.
+        val prior = RcDumpEntry("/truth", "ended", turning = true, unread = true, sessionName = "ws name")
+        val r = RcLiveSessionMerge.merge(mapOf("s1" to prior), listOf(live("s1", workDir = "/stale", title = "rest title")))
+        assertEquals(prior.copy(status = "active"), r.entries.getValue("s1"))
+    }
+
     // --- stability ---
 
     @Test
@@ -233,9 +257,20 @@ class RcLiveSessionMergeTest {
     }
 
     @Test
-    fun aDuplicateIdInTheListDoesNotProduceTwoEntries() {
+    fun aDuplicateIdInTheListCollapsesToTheLastOccurrence() {
+        // One entry, and deterministically WHICH one -- otherwise the snapshot's byte-equality
+        // dedup could flip between two workDirs on alternating polls and push a frame every time.
         val r = RcLiveSessionMerge.merge(emptyMap(), listOf(live("s1", workDir = "/a"), live("s1", workDir = "/b")))
         assertEquals(1, r.entries.size)
+        assertEquals("/b", r.entries.getValue("s1").workDir)
+    }
+
+    @Test
+    fun aBlankTitleDoesNotBlankAnExistingDiscoveredName() {
+        // Same trim rule as on creation, on the update path.
+        val existing = mapOf(discovered("s1", sessionName = "kept"))
+        val r = RcLiveSessionMerge.merge(existing, listOf(live("s1", title = "   ")))
+        assertEquals("kept", r.entries.getValue("s1").sessionName)
     }
 
     @Test

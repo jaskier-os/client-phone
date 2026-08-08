@@ -94,7 +94,10 @@ object RcLiveSessionMerge {
                 )
                 if (next != prior) {
                     out[id] = next
-                    if (prior.status != "active") revived.add(id) else edited = true
+                    // Reported separately, because one list response can both revive and rename:
+                    // a revival is the interesting event in logcat, an edit is noise.
+                    if (prior.status != "active") revived.add(id)
+                    if (next.copy(status = prior.status) != prior) edited = true
                 }
                 continue
             }

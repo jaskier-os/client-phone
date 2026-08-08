@@ -9299,10 +9299,22 @@ class ListenerService : LifecycleService(),
      */
     private val rcLiveListPollMs = 120_000L
 
-    /** Serializes reconcile writes; the map is concurrent but the merge is read-modify-write. */
+    /** Serializes reconcile writes against each other; WS writers race them via CAS instead. */
     private val rcLiveMergeLock = Any()
 
-    @Volatile private var rcLiveListInFlight = false
+    private val rcLiveListInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * One client for every reconcile. A per-call instance would build a fresh OkHttp Dispatcher
+     * executor and connection pool on each poll and each session end, and drop the keep-alive.
+     */
+    private val rcLiveListClient by lazy {
+        com.repository.listener.network.RemoteSessionClient(
+            AppConfig.getOrchestratorUrl(this),
+            AppConfig.getApiKey(this),
+            AppConfig.getDeviceId(this)
+        )
+    }
 
     private val rcLiveListPoll = object : Runnable {
         override fun run() {
@@ -9338,50 +9350,78 @@ class ListenerService : LifecycleService(),
         if (serviceDestroyed) return
         // One request at a time. A slow list plus a burst of RC events would otherwise stack
         // requests whose replies land out of order, and the older reply would win the merge.
-        if (rcLiveListInFlight) {
+        // CAS, not check-then-set: this is called from the main looper AND from the OkHttp
+        // WebSocket reader thread (onRcSessionEnd), which are genuinely concurrent.
+        if (!rcLiveListInFlight.compareAndSet(false, true)) {
             LogCollector.i(TAG, "[RCLIST] skip ($reason): request already in flight")
             return
         }
-        rcLiveListInFlight = true
-        val client = com.repository.listener.network.RemoteSessionClient(
-            AppConfig.getOrchestratorUrl(this),
-            AppConfig.getApiKey(this),
-            AppConfig.getDeviceId(this)
-        )
-        client.listSessions { result ->
-            rcLiveListInFlight = false
-            if (serviceDestroyed) return@listSessions
-            result.onFailure { err ->
-                // A failed list must change nothing: treating "cannot reach the orchestrator" as
-                // "no sessions exist" would wipe every discovered row off the glasses.
-                LogCollector.w(TAG, "[RCLIST] list failed ($reason): ${err.message}")
+        // Cleared on EVERY exit path. A synchronous throw out of enqueue() would otherwise latch
+        // the flag true and kill reconciliation for the life of the process.
+        try {
+            rcLiveListClient.listSessions { result ->
+                rcLiveListInFlight.set(false)
+                if (serviceDestroyed) return@listSessions
+                result.onFailure { err ->
+                    // A failed list must change nothing: treating "cannot reach the orchestrator"
+                    // as "no sessions exist" would wipe every discovered row off the glasses.
+                    LogCollector.w(TAG, "[RCLIST] list failed ($reason): ${err.message}")
+                }
+                result.onSuccess { listed ->
+                    applyLiveRcSessions(reason, listed.map {
+                        RcLiveSession(it.sessionId, it.workDir, it.alive, it.title)
+                    })
+                }
             }
-            result.onSuccess { listed ->
-                applyLiveRcSessions(reason, listed.map {
-                    RcLiveSession(it.sessionId, it.workDir, it.alive, it.title)
-                })
-            }
+        } catch (e: Exception) {
+            rcLiveListInFlight.set(false)
+            LogCollector.w(TAG, "[RCLIST] list dispatch failed ($reason): ${e.message}")
         }
     }
 
-    /** The merge half of [reconcileLiveRcSessions], split out so it is drivable from tests. */
+    /**
+     * Applies a merge result to [rcDumpState].
+     *
+     * Written back entry by entry with compare-and-set, NOT wholesale. The RC WebSocket callbacks
+     * run on the OkHttp reader thread while this runs on the main looper, so between the merge
+     * reading the map and this writing it back, a WS event can have set turning or unread. A bulk
+     * `putAll` of the merge's view would revert it -- silently losing a spinner or an unread dot
+     * that nothing would ever set again. Losing the poll's much poorer view instead is free: the
+     * next reconcile recomputes it.
+     */
     private fun applyLiveRcSessions(reason: String, listed: List<RcLiveSession>) {
         val changed = synchronized(rcLiveMergeLock) {
-            val result = RcLiveSessionMerge.merge(HashMap(rcDumpState), listed)
+            val before = HashMap(rcDumpState)
+            val result = RcLiveSessionMerge.merge(before, listed)
             if (!result.changed) return@synchronized false
+            var applied = 0
+            for ((id, next) in result.entries) {
+                val prior = before[id]
+                if (prior == next) continue
+                val ok = if (prior == null) {
+                    // absent -> present. Loses to a WS onRcSessionStart that got there first,
+                    // which is the correct winner: its entry is richer and WS-owned.
+                    rcDumpState.putIfAbsent(id, next) == null
+                } else {
+                    rcDumpState.replace(id, prior, next)
+                }
+                if (ok) applied++
+            }
             // Newly discovered sessions have no activity timestamp, and 0 sorts them last -- so a
             // session the user just opened in the UI would be the first one dropped by the
-            // 8-session cap. Stamp them now; the WS path stamps its own via touchRcSession.
-            result.added.forEach { touchRcSession(it) }
-            result.removed.forEach {
-                rcLastActivityMs.remove(it)
-                rcDumpState.remove(it)
+            // 8-session cap. Stamp them now, WITHOUT promoting: the list still owns them.
+            result.added.forEach { stampDiscoveredRcSession(it) }
+            for (id in result.removed) {
+                // Conditional: a WS event may have promoted this entry out of REST ownership
+                // after the merge decided to delete it, and a promoted entry is not ours to drop.
+                val prior = before[id] ?: continue
+                if (rcDumpState.remove(id, prior)) rcLastActivityMs.remove(id)
             }
-            result.entries.forEach { (id, e) -> rcDumpState[id] = e }
             LogCollector.i(
                 TAG,
                 "[RCLIST] merged ($reason): listed=${listed.size} added=${result.added} " +
-                    "removed=${result.removed} revived=${result.revived} total=${rcDumpState.size}"
+                    "removed=${result.removed} revived=${result.revived} applied=$applied " +
+                    "total=${rcDumpState.size}"
             )
             true
         }
@@ -9398,7 +9438,24 @@ class ListenerService : LifecycleService(),
     private val rcSeenToolCallIds: MutableSet<String> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
 
+    /**
+     * Marks a WebSocket event on a session: stamps its activity time AND takes ownership of the
+     * entry away from the REST list.
+     *
+     * The promotion is the point. Once WS is speaking for a session the entry holds state the
+     * list cannot see (turning, unread, a real assistant-text name), so the list must stop being
+     * allowed to rewrite it or to delete it when it stops reporting it. Called from every RC WS
+     * callback; the REST reconcile deliberately uses [stampDiscoveredRcSession] instead.
+     */
     private fun touchRcSession(sessionId: String) {
+        rcLastActivityMs[sessionId] = System.currentTimeMillis()
+        rcDumpState.computeIfPresent(sessionId) { _, e ->
+            if (e.discovered) e.copy(discovered = false) else e
+        }
+    }
+
+    /** Activity stamp only, for a session the REST list just discovered and still owns. */
+    private fun stampDiscoveredRcSession(sessionId: String) {
         rcLastActivityMs[sessionId] = System.currentTimeMillis()
     }
 
