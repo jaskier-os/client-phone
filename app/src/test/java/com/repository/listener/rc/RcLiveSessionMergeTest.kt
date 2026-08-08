@@ -121,6 +121,24 @@ class RcLiveSessionMergeTest {
         assertEquals("a promoted entry is no longer the REST list's to remove", setOf("s1"), r.entries.keys)
     }
 
+    @Test
+    fun endOwnershipIsWhatMakesAnEndedRowLinger() {
+        // onRcSessionEnd promotes before marking ended. Without the promotion the very next list
+        // -- which no longer reports the session -- would delete the row the end event just
+        // created, and the "ended sessions linger in the All view" behaviour would silently die.
+        val endedButStillRestOwned = mapOf(discovered("s1", status = "ended"))
+        assertTrue(
+            "unpromoted: the list deletes it",
+            RcLiveSessionMerge.merge(endedButStillRestOwned, emptyList()).entries.isEmpty()
+        )
+        val endedAndPromoted = mapOf("s1" to discovered("s1", status = "ended").second.copy(discovered = false))
+        assertEquals(
+            "promoted: the list leaves it alone",
+            setOf("s1"),
+            RcLiveSessionMerge.merge(endedAndPromoted, emptyList()).entries.keys
+        )
+    }
+
     // --- REST owns what REST created ---
 
     @Test

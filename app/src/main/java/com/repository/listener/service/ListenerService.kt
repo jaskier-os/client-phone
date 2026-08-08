@@ -19,6 +19,9 @@ import android.location.LocationManager
 import android.media.MediaPlayer
 import com.repository.listener.alarm.AlarmItem
 import com.repository.listener.alarm.AlarmStore
+import com.repository.listener.rc.RcDumpEntry
+import com.repository.listener.rc.RcLiveSession
+import com.repository.listener.rc.RcLiveSessionMerge
 import com.repository.listener.ui.folderNameFromWorkDir
 import android.os.Build
 import android.os.Handler
@@ -310,20 +313,19 @@ class ListenerService : LifecycleService(),
         val thinkingRcStartTimes: java.util.concurrent.ConcurrentHashMap<String, Long> = java.util.concurrent.ConcurrentHashMap()
 
         /**
-         * Service-level mirror of RC session state used by the chatlist_dump ADB
-         * test hook. Keyed by sessionId. Updated directly by the RC broadcast
-         * dispatchers (onRcSessionStart/End/Message/Thinking) so dumps work even
-         * when the ChatsListFragment is not currently resumed.
+         * Service-level mirror of RC session state. Keyed by sessionId. Feeds both the
+         * chatlist_dump ADB test hook and the CH_RC_STATE_PUSH snapshot the glasses render, so
+         * dumps and pushes work even when no fragment is resumed.
          *
-         * Each entry: [workDir, status, turning].
+         * Two writers, and their provenance is tracked per entry (see RcDumpEntry.discovered):
+         *  - orchestrator WebSocket events (onRcSessionStart/End/Message/Thinking): rich, but only
+         *    for sessions that WS actually announced, and silent while the socket is down;
+         *  - the orchestrator REST session list, reconciled by [reconcileLiveRcSessions]: the only
+         *    source that sees a session started from this app's own RC UI, but it knows nothing
+         *    about turning, unread or lastSeq.
+         *
+         * The entry type lives in the rc package so the merge is plain-JVM testable.
          */
-        data class RcDumpEntry(
-            val workDir: String,
-            val status: String,
-            val turning: Boolean,
-            val unread: Boolean = false,
-            val sessionName: String? = null
-        )
         val rcDumpState: MutableMap<String, RcDumpEntry> = java.util.concurrent.ConcurrentHashMap()
 
         /**
@@ -7354,8 +7356,10 @@ class ListenerService : LifecycleService(),
                         thinkingRcStartTimes.remove(sessionId)
                         // Keep the entry so the ended session lingers in All view;
                         // "Only open" filter excludes status!="active".
+                        // discovered=false for the same reason as the live onRcSessionEnd path:
+                        // a REST-owned entry would be deleted by the next reconcile.
                         rcDumpState[sessionId]?.let { existing ->
-                            rcDumpState[sessionId] = existing.copy(status = "ended", turning = false)
+                            rcDumpState[sessionId] = existing.copy(status = "ended", turning = false, discovered = false)
                         }
                         cancelRcDoneClear(sessionId)
                         rcSessionTurning.remove(sessionId)
@@ -9082,8 +9086,10 @@ class ListenerService : LifecycleService(),
         // rcDumpState must stay in lockstep with the ACTION_RC_SESSION_END broadcast below.
         // Retain the entry as status="ended" so it lingers in the All view;
         // "Only open" filter excludes ended sessions automatically.
+        // discovered=false is what makes it linger: an entry the REST list still owns would be
+        // deleted by the very next reconcile, since an ended session stops being listed.
         rcDumpState[sessionId]?.let { existing ->
-            rcDumpState[sessionId] = existing.copy(status = "ended", turning = false)
+            rcDumpState[sessionId] = existing.copy(status = "ended", turning = false, discovered = false)
         }
         cancelRcDoneClear(sessionId)
         rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
@@ -9097,6 +9103,9 @@ class ListenerService : LifecycleService(),
         // remains the actual limit, exactly as the store's LRU is for rows.
         rcPrompts.clearSession(sessionId)
         pushRcState(force = true)
+        // One session ending often means others changed too (a CLI restart ends and restarts
+        // several). Re-read the authoritative list rather than waiting up to a poll interval.
+        reconcileLiveRcSessions("rc_session_end")
         refreshRcNotification()
         LogCollector.i(TAG, "RC session ended: $sessionId")
         sendBroadcast(Intent(ACTION_RC_SESSION_END).apply {
@@ -9266,10 +9275,118 @@ class ListenerService : LifecycleService(),
         // and that now runs on its own sender thread. Keeping this synchronous also keeps state
         // frames ordered against the row frames RcBridge writes.
         // Cached only on a confirmed write: a dropped frame must not be deduped away next time.
-        lastPushedStateJson = if (phoneBtHost.sendRcStateIfConnected(json)) json else null
+        val sent = phoneBtHost.sendRcStateIfConnected(json)
+        lastPushedStateJson = if (sent) json else null
+        // The snapshot body itself, so a glasses list that renders wrong can be diagnosed from
+        // logcat alone without guessing what the phone believed. Bounded by MAX_FRAME_CHARS.
+        LogCollector.i(TAG, "[RCPUSH] sent=$sent force=$force n=${sessions.size} json=$json")
     }
 
     private val rcStatePushLock = Any()
+
+    // --- Live session reconciliation (orchestrator REST list) ---
+
+    /**
+     * How often the live session list is polled while the glasses are connected.
+     *
+     * This is a battery-constrained phone, so the poll is deliberately slow AND conditional: it
+     * only runs while the glasses link is up (nothing renders the snapshot otherwise), and it is
+     * armed/disarmed by the BT lifecycle rather than running for the life of the service. Every
+     * moment that actually matters -- glasses link-up, and each RC WebSocket event -- reconciles
+     * immediately, so the poll exists purely to catch a session started in the phone's own RC UI
+     * while the glasses were already connected. Two minutes is the latency ceiling for that one
+     * case; one HTTPS GET per two minutes is negligible next to the RFCOMM link it accompanies.
+     */
+    private val rcLiveListPollMs = 120_000L
+
+    /** Serializes reconcile writes; the map is concurrent but the merge is read-modify-write. */
+    private val rcLiveMergeLock = Any()
+
+    @Volatile private var rcLiveListInFlight = false
+
+    private val rcLiveListPoll = object : Runnable {
+        override fun run() {
+            if (serviceDestroyed) return
+            reconcileLiveRcSessions("poll")
+            mainHandler.postDelayed(this, rcLiveListPollMs)
+        }
+    }
+
+    /** Arms the poll. Idempotent: a second call does not stack a second chain of runnables. */
+    private fun startRcLiveListPolling() {
+        mainHandler.removeCallbacks(rcLiveListPoll)
+        mainHandler.postDelayed(rcLiveListPoll, rcLiveListPollMs)
+        LogCollector.i(TAG, "[RCLIST] poll armed every ${rcLiveListPollMs}ms")
+    }
+
+    private fun stopRcLiveListPolling() {
+        mainHandler.removeCallbacks(rcLiveListPoll)
+        LogCollector.i(TAG, "[RCLIST] poll disarmed")
+    }
+
+    /**
+     * Pulls the authoritative live session list and merges it into [rcDumpState].
+     *
+     * This is what makes a session opened in the phone's own RC UI reach the glasses at all: that
+     * UI talks to the orchestrator REST API directly and never touches this service, so nothing
+     * else would ever put the session in the map. The list is also independent of this service's
+     * orchestrator WebSocket, so it works while that socket is down -- which is the common case.
+     *
+     * Only ever pushes when the merge actually changed something; an unchanged list is silent.
+     */
+    private fun reconcileLiveRcSessions(reason: String) {
+        if (serviceDestroyed) return
+        // One request at a time. A slow list plus a burst of RC events would otherwise stack
+        // requests whose replies land out of order, and the older reply would win the merge.
+        if (rcLiveListInFlight) {
+            LogCollector.i(TAG, "[RCLIST] skip ($reason): request already in flight")
+            return
+        }
+        rcLiveListInFlight = true
+        val client = com.repository.listener.network.RemoteSessionClient(
+            AppConfig.getOrchestratorUrl(this),
+            AppConfig.getApiKey(this),
+            AppConfig.getDeviceId(this)
+        )
+        client.listSessions { result ->
+            rcLiveListInFlight = false
+            if (serviceDestroyed) return@listSessions
+            result.onFailure { err ->
+                // A failed list must change nothing: treating "cannot reach the orchestrator" as
+                // "no sessions exist" would wipe every discovered row off the glasses.
+                LogCollector.w(TAG, "[RCLIST] list failed ($reason): ${err.message}")
+            }
+            result.onSuccess { listed ->
+                applyLiveRcSessions(reason, listed.map {
+                    RcLiveSession(it.sessionId, it.workDir, it.alive, it.title)
+                })
+            }
+        }
+    }
+
+    /** The merge half of [reconcileLiveRcSessions], split out so it is drivable from tests. */
+    private fun applyLiveRcSessions(reason: String, listed: List<RcLiveSession>) {
+        val changed = synchronized(rcLiveMergeLock) {
+            val result = RcLiveSessionMerge.merge(HashMap(rcDumpState), listed)
+            if (!result.changed) return@synchronized false
+            // Newly discovered sessions have no activity timestamp, and 0 sorts them last -- so a
+            // session the user just opened in the UI would be the first one dropped by the
+            // 8-session cap. Stamp them now; the WS path stamps its own via touchRcSession.
+            result.added.forEach { touchRcSession(it) }
+            result.removed.forEach {
+                rcLastActivityMs.remove(it)
+                rcDumpState.remove(it)
+            }
+            result.entries.forEach { (id, e) -> rcDumpState[id] = e }
+            LogCollector.i(
+                TAG,
+                "[RCLIST] merged ($reason): listed=${listed.size} added=${result.added} " +
+                    "removed=${result.removed} revived=${result.revived} total=${rcDumpState.size}"
+            )
+            true
+        }
+        if (changed) pushRcState(force = true)
+    }
 
     /** sessionId -> last time anything happened on it, for the 8-most-recent truncation. */
     private val rcLastActivityMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
@@ -10972,6 +11089,13 @@ class ListenerService : LifecycleService(),
         // does not replace wholesale, so one authoritative snapshot per link-up heals everything.
         pushRcState(force = true)
 
+        // ...but the snapshot above can only describe sessions this SERVICE knows about, and the
+        // phone's own RC UI starts sessions without ever telling the service. Pull the
+        // authoritative list so the very first snapshot the glasses see is complete, and arm the
+        // slow poll for sessions opened later while the link stays up.
+        reconcileLiveRcSessions("glasses_connect")
+        startRcLiveListPolling()
+
         // Sync phone time/timezone to glasses over the relay. The glasses-side
         // set_time handler applies the wall clock via root and re-applies on boot.
         serviceScope.launch {
@@ -11028,6 +11152,8 @@ class ListenerService : LifecycleService(),
         // phone refuses to open its transcriber, feed its VAD or arm its watchdog
         // for the next session -- and nobody transcribes at all.
         glassesSttGate = GlassesSttGate.default()
+        // Nothing renders the snapshot with the link down, so the poll is pure battery cost.
+        stopRcLiveListPolling()
         // Without this the byte-identical dedup would permanently suppress the corrective resync
         // the next link-up owes: the glasses come back holding nothing. Under the push lock so it
         // cannot be overwritten by a push already past its own send.
@@ -11779,6 +11905,9 @@ class ListenerService : LifecycleService(),
         rcDoneClearRunnables.values.forEach { mainHandler.removeCallbacks(it) }
         rcDoneClearRunnables.clear()
         rcSessionTurning.clear()
+        // Self-rescheduling: without this the chain outlives the service and reconciles into a
+        // dead instance's map forever.
+        stopRcLiveListPolling()
         phoneBtHostInstance = null
         sideloadHttpServerInstance = null
         if (::sideloadHttpServer.isInitialized) { try { sideloadHttpServer.stop() } catch (_: Exception) {} }
