@@ -108,10 +108,16 @@ class BoundaryValueTest {
     }
 
     @Test
-    fun statusFrameRejectsEmptyAndOversized() {
-        // 5 bytes is the legal correlated form (1 bitfield + 4 reply seq); only an
-        // empty payload is structurally invalid.
-        for (n in listOf(0)) {
+    fun statusFrameRejectsAnythingNarrowerThanTheBitfield() {
+        // 2 bytes is the bare bitfield and 6 is the legal correlated form (2 bitfield +
+        // 4 reply seq). Anything narrower than the bitfield is rejected outright rather
+        // than zero-extended: a truncated frame must never be READ as "no problems
+        // reported", because that is the one verdict the watch acts on by doing nothing.
+        //
+        // 1 is in the list deliberately. It is the PREVIOUS wire width, so this is also
+        // the assertion that widening is a real, detectable break rather than a silent
+        // reinterpretation -- which is why the phone must be deployed before the watch.
+        for (n in listOf(0, 1)) {
             try {
                 RemoteInputProtocol.StatusFlags.decode(ByteArray(n))
                 throw AssertionError("expected rejection for a $n-byte status frame")
@@ -119,6 +125,9 @@ class BoundaryValueTest {
                 // correct
             }
         }
+        // And the legal widths decode.
+        assertEquals(0, RemoteInputProtocol.StatusFlags.decode(ByteArray(2)))
+        assertEquals(0, RemoteInputProtocol.StatusFlags.decode(ByteArray(6)))
     }
 
     @Test

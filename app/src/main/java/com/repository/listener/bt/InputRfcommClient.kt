@@ -94,6 +94,24 @@ class InputRfcommClient(private val context: Context) :
     var onRouterStatus: ((Boolean, Boolean, Long) -> Unit)? = null
 
     /**
+     * Glasses -> phone hold threshold, in ms. Zero means the glasses did not report one.
+     *
+     * Separate from [onRouterStatus] because it is a CAPABILITY of the receiver rather
+     * than a transport statistic: it changes only when the glasses change what a hold
+     * means, and it is relayed to the watch untouched.
+     */
+    var onHoldThreshold: ((Int) -> Unit)? = null
+
+    /**
+     * Glasses -> phone OPAQUE device-state bits, relayed to the watch untouched.
+     *
+     * The phone deliberately assigns no meaning to any bit. This is the mechanism that
+     * keeps a new glasses-side indicator from becoming a phone change: the two ends agree
+     * on the bits, the relay only agrees on the field.
+     */
+    var onDeviceState: ((Int) -> Unit)? = null
+
+    /**
      * Glasses -> phone refusal report: (reasonName, refusedTotal).
      *
      * `reasonName` is null when the glasses report no recent refusal, or when they are
@@ -284,12 +302,24 @@ class InputRfcommClient(private val context: Context) :
                     // than as an error -- an older glasses build has to stay usable.
                     val reason = args.getOrNull(3)?.takeIf { it.isNotEmpty() }
                     val refusedTotal = args.getOrNull(4)?.toLongOrNull() ?: 0L
+                    // Also appended. Zero/absent means "not reported": the phone relays
+                    // it verbatim and the WATCH applies its own fallback. A relay that
+                    // substituted a guess here would make the watch believe it had
+                    // learned the receiver's threshold when it had not.
+                    val holdMs = args.getOrNull(5)?.toIntOrNull() ?: 0
+                    // OPAQUE. The phone does not know, and must never learn, what any of
+                    // these bits mean -- it copies them from the glasses to the watch so
+                    // a new indicator costs a glasses change and a watch change only.
+                    val deviceState = args.getOrNull(6)?.toIntOrNull() ?: 0
                     log(
                         "input rx status sessionOpen=$sessionOpen sink=$sinkAttached " +
-                            "dropped=$dropped refused=$refusedTotal reason=${reason ?: "-"}"
+                            "dropped=$dropped refused=$refusedTotal reason=${reason ?: "-"} " +
+                            "holdMs=$holdMs deviceState=$deviceState"
                     )
                     onRouterStatus?.invoke(sessionOpen, sinkAttached, dropped)
                     onRefusal?.invoke(reason, refusedTotal)
+                    onHoldThreshold?.invoke(holdMs)
+                    onDeviceState?.invoke(deviceState)
                 }
                 // Anything else on this socket is not ours. Ignored rather than
                 // logged per frame: a peer controls the rate and the log is on flash.

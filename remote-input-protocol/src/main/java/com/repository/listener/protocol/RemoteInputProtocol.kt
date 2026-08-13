@@ -136,6 +136,22 @@ object RemoteInputProtocol {
     const val SESSION_EXPIRY_MS = 20_000L
 
     /**
+     * Minimum spacing between two session re-announcements on the source.
+     *
+     * Re-announcing means minting a NEW session id, and minting is a synchronous
+     * SharedPreferences commit plus a permanent step of a monotonic counter. The
+     * limit is what stops the unauthenticated status channel from being an sid-churn
+     * amplifier: a forger who can raise [StatusFlags.GLASSES_SESSION_LOST] on every
+     * frame still gets at most one mint per this interval.
+     *
+     * MUST stay below [SESSION_EXPIRY_MS]. A reopen cadence slower than the rate at
+     * which a session can die would leave the source dead for whole expiry cycles,
+     * which is the same shape of bug as a keepalive slower than the timeout it
+     * defeats -- see [assertTimingCoherent], which checks it.
+     */
+    const val REOPEN_MIN_INTERVAL_MS = 5_000L
+
+    /**
      * Fails loudly if a keepalive cadence is set above a timeout it must beat.
      *
      * A comment asking the next editor to remember this has already failed twice, so
@@ -150,6 +166,21 @@ object RemoteInputProtocol {
         require(PING_INTERVAL_MS < SESSION_EXPIRY_MS) {
             "PING_INTERVAL_MS ($PING_INTERVAL_MS) must be below " +
                 "SESSION_EXPIRY_MS ($SESSION_EXPIRY_MS)"
+        }
+        // The recovery path must be able to run at least once per session lifetime.
+        //
+        // This is the same bug class as the two above, in the one place it actually
+        // bit hardest: the source's OTHER recovery trigger -- re-announcing after
+        // SESSION_EXPIRY_MS of silence -- is UNREACHABLE by construction, because the
+        // keepalive above deliberately stamps a frame more often than that. So the
+        // status-driven reopen is not a second-chance path, it is the ONLY one, and a
+        // rate limit at or above the expiry would silently restore the deadlock it
+        // exists to break.
+        require(REOPEN_MIN_INTERVAL_MS < SESSION_EXPIRY_MS) {
+            "REOPEN_MIN_INTERVAL_MS ($REOPEN_MIN_INTERVAL_MS) must be below " +
+                "SESSION_EXPIRY_MS ($SESSION_EXPIRY_MS): the keepalive makes the " +
+                "silence-driven reopen unreachable, so a reopen limit slower than the " +
+                "expiry leaves the source deadlocked for whole expiry cycles"
         }
     }
 
@@ -237,9 +268,53 @@ object RemoteInputProtocol {
          * has for "go back" -- on the watch, a locally recognised double tap.
          */
         BACK(3),
+
+        /**
+         * Press and hold. A semantic action like every other value here: the user asked
+         * to hold, and the receiver decides what a hold means on the surface in focus.
+         * On the glasses that is whatever the physical touchpad hold does.
+         *
+         * Code 7, after PING(6). Codes are wire values and are append-only, so this
+         * takes the next free number rather than slotting in beside the other actions.
+         *
+         * The hold DURATION is deliberately NOT on the wire. The receiver owns the
+         * threshold and publishes it on the status back channel
+         * ([StatusFlags.holdMs]); a source that signed its own duration would let the
+         * two ends disagree about what a hold is while each believed it was right,
+         * which is the constant-drift bug this file has already collected four of.
+         */
+        HOLD(7),
+
+        /** Capture a still photo. What that means is entirely the receiver's business. */
+        PHOTO(8),
+
+        /** Start recording, or stop the recording already running. Receiver decides which. */
+        VIDEO(9),
+
         OPEN(4),
         CLOSE(5),
-        PING(6);
+        PING(6),
+
+        /**
+         * An action this build does not know about.
+         *
+         * THIS IS WHAT MAKES THE RELAY PERMANENTLY AGNOSTIC. The phone sits between the
+         * watch and the glasses and needs to know exactly two things about a frame: its
+         * (sid, seq), for ordering, and whether it is a user action or session lifecycle,
+         * for the audio-relay teardown. It has never needed to know what an action MEANS.
+         *
+         * Before this existed, `decodeEvent` threw on an unrecognised opcode, so every new
+         * action in the vocabulary was a hard dependency on the phone being rebuilt and
+         * redeployed in lockstep -- and until it was, the frames were not merely ignored,
+         * they were rejected as malformed. An opaque action instead rides straight through
+         * a relay that has never heard of it.
+         *
+         * The real opcode is preserved in [RemoteInputEvent.typeCode] and is what the MAC
+         * covers, so a frame that passes through an older phone reaches the glasses with a
+         * byte-identical tag. This value is a LOCAL marker, never a wire code -- see
+         * [WIRE_CODE_NONE].
+         */
+        OPAQUE_ACTION(WIRE_CODE_NONE);
 
         /** SCROLL is the only type carrying a non-zero steps payload. */
         val carriesSteps: Boolean get() = this == SCROLL
@@ -262,12 +337,32 @@ object RemoteInputProtocol {
         val isUserAction: Boolean get() = !isLifecycle
 
         companion object {
-            private val BY_CODE = entries.associateBy { it.code }
+            private val BY_CODE = entries.filter { it.code != WIRE_CODE_NONE }.associateBy { it.code }
 
             /** Null for any code outside the enum -- a forged type must not throw. */
             fun fromCode(code: Int): EventType? = BY_CODE[code]
         }
     }
+
+    /**
+     * The `code` of an [EventType] that is a local marker rather than a wire value.
+     *
+     * Negative, so it can never collide with a real opcode (which are unsigned bytes on
+     * the wire), and excluded from the code lookup so it is unreachable by decoding.
+     */
+    const val WIRE_CODE_NONE = -1
+
+    /**
+     * Opcodes a relay forwards without understanding.
+     *
+     * A frame is structurally valid if it parses, carries a plausible steps payload and
+     * verifies its tag -- none of which requires knowing what the action does. Anything
+     * in this range is accepted and relayed as [EventType.OPAQUE_ACTION]. The range is
+     * bounded rather than open so a garbage byte is still rejected: an opcode must at
+     * least be a plausible future member of the vocabulary.
+     */
+    const val MIN_OPAQUE_CODE = 10
+    const val MAX_OPAQUE_CODE = 63
 
     /**
      * One authenticated input event.
@@ -285,6 +380,17 @@ object RemoteInputProtocol {
         val type: EventType,
         val steps: Int,
         val wms: Int,
+        /**
+         * The opcode exactly as it appeared on the wire.
+         *
+         * Normally redundant with `type.code`, and defaulted from it. It matters only for
+         * [EventType.OPAQUE_ACTION], where this build has no name for the action: the MAC
+         * covers the NUMERIC code, so a relay that re-derived the code from its own enum
+         * would compute a tag over a different string and the receiver would reject every
+         * forwarded frame. Carrying the original byte is what lets an unaware relay pass a
+         * signed frame through untouched.
+         */
+        val typeCode: Int = type.code,
     ) {
         /** Unsigned renderings, used by both the canonical string and Encoding B. */
         val sidUnsigned: String get() = sid.toUInt().toString()
@@ -344,7 +450,9 @@ object RemoteInputProtocol {
             append(event.src); append(CANONICAL_SEPARATOR)
             append(event.sidUnsigned); append(CANONICAL_SEPARATOR)
             append(event.seqUnsigned); append(CANONICAL_SEPARATOR)
-            append(event.type.code); append(CANONICAL_SEPARATOR)
+            // The WIRE code, not the enum's. For an opaque action these differ, and using
+            // the enum's would sign a string the receiver never sees.
+            append(event.typeCode); append(CANONICAL_SEPARATOR)
             append(event.steps); append(CANONICAL_SEPARATOR)
             append(event.wmsUnsigned)
         }
@@ -392,7 +500,7 @@ object RemoteInputProtocol {
         require(tag.size == TAG_BYTES) { "tag must be $TAG_BYTES bytes, got ${tag.size}" }
         validate(event)?.let { throw IllegalArgumentException("refusing to encode: $it") }
         return ByteBuffer.allocate(EVENT_PAYLOAD_BYTES).order(ByteOrder.BIG_ENDIAN).apply {
-            put(event.type.code.toByte())
+            put(event.typeCode.toByte())
             put(event.steps.toByte())
             putInt(event.seq)
             putInt(event.sid)
@@ -435,8 +543,17 @@ object RemoteInputProtocol {
         val reserved = buf.int
         if (reserved != 0) throw MalformedFrameException("reserved bytes not zero")
 
+        // An unknown opcode inside the opaque range is FORWARDED, not rejected. This one
+        // line is the difference between a relay that must be rebuilt for every new
+        // action and one that never needs touching again -- it used to throw here, which
+        // meant a new action was not merely unrecognised by an older phone but actively
+        // dropped as malformed.
         val type = EventType.fromCode(typeCode)
-            ?: throw MalformedFrameException("unknown type code $typeCode")
+            ?: if (typeCode in MIN_OPAQUE_CODE..MAX_OPAQUE_CODE) {
+                EventType.OPAQUE_ACTION
+            } else {
+                throw MalformedFrameException("unknown type code $typeCode")
+            }
 
         val event = RemoteInputEvent(
             version = PROTOCOL_VERSION,
@@ -446,6 +563,7 @@ object RemoteInputProtocol {
             type = type,
             steps = steps,
             wms = wms,
+            typeCode = typeCode,
         )
         validate(event)?.let { throw MalformedFrameException(it) }
         return DecodedEvent(event, tag)
@@ -468,7 +586,15 @@ object RemoteInputProtocol {
             event.src,
             event.sidUnsigned,
             event.seqUnsigned,
-            event.type.name,
+            // The readable name where this build has one, else the raw numeric code. An
+            // opaque action has no name here BY DEFINITION -- the relay has never heard of
+            // it -- and inventing one would be a lie the receiver then has to parse. The
+            // glasses accept either rendering.
+            if (event.type == EventType.OPAQUE_ACTION) {
+                event.typeCode.toString()
+            } else {
+                event.type.name
+            },
             event.steps.toString(),
             event.wmsUnsigned,
             tagHex,
@@ -494,8 +620,21 @@ object RemoteInputProtocol {
             ?: throw MalformedFrameException("bad sid arg")
         val seq = args[3].toUIntOrNull()?.toInt()
             ?: throw MalformedFrameException("bad seq arg")
-        val type = EventType.entries.firstOrNull { it.name == args[4] }
+        // Accept a NAME or a numeric code. The numeric form is how a relay renders an
+        // action it has no name for, so rejecting it would put the coupling this whole
+        // mechanism removes straight back on the RFCOMM leg.
+        val named = EventType.entries.firstOrNull { it.name == args[4] }
+        val numeric = args[4].toIntOrNull()
+        val typeCode = named?.code
+            ?: numeric
             ?: throw MalformedFrameException("unknown type ${args[4]}")
+        val type = named
+            ?: EventType.fromCode(typeCode)
+            ?: if (typeCode in MIN_OPAQUE_CODE..MAX_OPAQUE_CODE) {
+                EventType.OPAQUE_ACTION
+            } else {
+                throw MalformedFrameException("unknown type code $typeCode")
+            }
         val steps = args[5].toIntOrNull()
             ?: throw MalformedFrameException("bad steps arg")
         val wms = args[6].toUIntOrNull()?.toInt()
@@ -504,7 +643,7 @@ object RemoteInputProtocol {
         if (parseHexOrNull(tagHex, TAG_BYTES) == null) {
             throw MalformedFrameException("bad tag arg")
         }
-        val event = RemoteInputEvent(version, src, sid, seq, type, steps, wms)
+        val event = RemoteInputEvent(version, src, sid, seq, type, steps, wms, typeCode)
         validate(event)?.let { throw MalformedFrameException(it) }
         return event to tagHex
     }
@@ -587,6 +726,132 @@ object RemoteInputProtocol {
         const val REASON_SHIFT = 6
         const val REASON_MASK = 0x3 shl REASON_SHIFT
 
+        /**
+         * The glasses hold NO open session for this source, so nothing it sends can be
+         * accepted until it re-announces itself.
+         *
+         * Placed ABOVE [REASON_MASK] because bits 0..7 were completely full -- flags at
+         * 0..5, reason at 6..7 -- which is what forces [FRAME_BYTES] to two. Every
+         * pre-existing bit keeps its position.
+         *
+         * ## What this bit is, and what it deliberately is not
+         *
+         * It is an ACTUATOR, not a display state: the only thing the watch does with it
+         * is mint a new session id and send a fresh OPEN. There is no [LinkState] for
+         * it, because it resolves within one round trip and a state for it would do
+         * nothing but flicker.
+         *
+         * ## Why it exists
+         *
+         * The glasses keep the live session in memory only, while the replay defence
+         * (the highest session id ever accepted) is persisted. After a glasses restart
+         * the persisted id is therefore present while the live session is gone, and the
+         * receiver correctly rejects every frame for a session it holds no OPEN for --
+         * it must never adopt one implicitly, or a captured burst could establish its
+         * own baseline. The source has no other way to learn this: its own keepalive
+         * keeps succeeding, so its silence-based re-announce trigger can never fire.
+         * This bit is the receiver telling it.
+         *
+         * ## Security
+         *
+         * This channel is UNAUTHENTICATED -- the tag key lives on the watch and the
+         * glasses, never on the phone. So state the worst case plainly: anyone able to
+         * write here can raise this bit and force the watch to churn session ids. That
+         * is a battery and counter-burn nuisance, bounded by
+         * [RemoteInputProtocol.REOPEN_MIN_INTERVAL_MS] and by the id being a wrap-safe
+         * uint32.
+         *
+         * It grants ZERO replay capability, and that is a property of what the bit can
+         * express rather than of who can send it. Its only possible effect is to make
+         * the watch produce a NEW, HIGHER session id and sign a fresh OPEN with the key
+         * the attacker does not have. It cannot admit a frame, cannot lower an id,
+         * cannot rewind a sequence floor, and cannot cause any previously captured
+         * frame to become acceptable -- a new session strictly invalidates old ones.
+         */
+        const val GLASSES_SESSION_LOST = 1 shl 8
+
+        /**
+         * Frame width in bytes, big-endian.
+         *
+         * Two because bits 0..7 are exhausted, not by preference. Producers and
+         * consumers of a 1-byte frame and a 2-byte frame cannot interoperate, so the
+         * phone must be deployed before the watch; in between the watch reports
+         * UNREACHABLE and self-heals once both sides match.
+         */
+        const val FRAME_BYTES = 2
+
+        /**
+         * The receiver's hold threshold, in ms, carried right after the flags.
+         *
+         * The RECEIVER owns this number and the source obeys it, so a hold feels the
+         * same on the watch as on the glasses' own touchpad. Shipping it instead of
+         * duplicating a constant is the point: the glasses touchpad daemon's value can
+         * change, and a frozen copy on the watch would then silently disagree.
+         *
+         * Zero means "not reported" -- an older receiver, or one that has not learned
+         * its own threshold yet. Sources must fall back to [DEFAULT_HOLD_MS] rather
+         * than treating zero as an instant hold.
+         */
+        const val HOLD_MS_BYTES = 2
+
+        /**
+         * RECEIVER-DEFINED state bits, relayed verbatim.
+         *
+         * The counterpart to [EventType.OPAQUE_ACTION], and it exists for the same
+         * reason: the receiver is the only device that knows its own state, and the relay
+         * between them must never need to be taught what that state means. The glasses
+         * assign the bits, the watch reads them, and the phone copies the field across
+         * without interpreting a single one -- so a future indicator costs a glasses
+         * change and a watch change, and nothing in between.
+         *
+         * Bit meanings therefore live with the DEVICES, not here; this file only
+         * guarantees the field's width and position.
+         */
+        const val DEVICE_STATE_BYTES = 2
+
+        /** Bit 0 of the device state: a video recording is in progress. */
+        const val DEVICE_STATE_RECORDING = 1 shl 0
+
+        /**
+         * Fallback when the receiver has not reported a threshold.
+         *
+         * Matches the glasses touchpad daemon's `custom_long_press_ms` at the time of
+         * writing. It is a FALLBACK, not the source of truth: whenever the receiver
+         * reports a value, that value wins -- which is the whole reason the threshold
+         * is on the wire instead of duplicated as a constant on both sides.
+         */
+        const val DEFAULT_HOLD_MS = 800
+
+        /** Sanity bounds. A forged frame must not make a hold unreachable or instant. */
+        const val MIN_HOLD_MS = 150
+        const val MAX_HOLD_MS = 3_000
+
+        /**
+         * Clamps a reported threshold into something a human can actually perform.
+         *
+         * The status channel is unauthenticated, so this value is attacker-controlled.
+         * The worst it can do is make holds slightly awkward; clamping removes the two
+         * cases that would make the gesture impossible (a 0 ms hold firing on contact,
+         * or a 60 s hold that can never complete).
+         */
+        fun sanitizeHoldMs(reported: Int): Int = when {
+            reported <= 0 -> DEFAULT_HOLD_MS
+            else -> reported.coerceIn(MIN_HOLD_MS, MAX_HOLD_MS)
+        }
+
+        /**
+         * Bits reporting the link is HEALTHY, and bits reporting a PROBLEM.
+         *
+         * Named constants, and the single definition each, because the fold, the
+         * recovery helper and the invariant all need the same answer and all three
+         * previously hardcoded their own copy. A new bit added to one list but not the
+         * others is silently discarded by [applyAdvisory] -- which is how this file
+         * accumulated four separate absorbing-bit bugs.
+         */
+        const val HEALTH_MASK = GLASSES_LINK_UP or PHONE_SERVICE_ALIVE or GLASSES_SINK_ATTACHED
+        const val PROBLEM_MASK =
+            LAST_SEND_DROPPED or WAKING_GLASSES or GLASSES_REFUSING_INPUT or GLASSES_SESSION_LOST
+
         fun encodeReason(bits: Int, reason: RefusalReason?): Int =
             (bits and REASON_MASK.inv()) or
                 ((reason?.code ?: 0) shl REASON_SHIFT and REASON_MASK)
@@ -602,6 +867,7 @@ object RemoteInputProtocol {
             wakingGlasses: Boolean,
             glassesRefusingInput: Boolean = false,
             refusalReason: RefusalReason? = null,
+            glassesSessionLost: Boolean = false,
         ): ByteArray {
             var b = 0
             if (glassesLinkUp) b = b or GLASSES_LINK_UP
@@ -611,14 +877,65 @@ object RemoteInputProtocol {
             if (wakingGlasses) b = b or WAKING_GLASSES
             if (glassesRefusingInput) b = b or GLASSES_REFUSING_INPUT
             if (glassesRefusingInput) b = encodeReason(b, refusalReason)
-            return byteArrayOf(b.toByte())
+            if (glassesSessionLost) b = b or GLASSES_SESSION_LOST
+            return java.nio.ByteBuffer.allocate(FRAME_BYTES)
+                .order(java.nio.ByteOrder.BIG_ENDIAN)
+                .putShort(b.toShort())
+                .array()
+        }
+
+        /**
+         * Every bit [encode] is capable of emitting, discovered by ASKING it.
+         *
+         * Derived by encoding all-true and OR-ing in each reason, rather than by OR-ing
+         * the mask constants together. That distinction is the whole value: a check
+         * built from [HEALTH_MASK] and [PROBLEM_MASK] cannot detect a flag missing from
+         * those masks, because it is made of them. `encode` is the independent witness
+         * -- a flag that is not classified still shows up here, and the classification
+         * check then fails, which is exactly the failure that must not be silent.
+         */
+        fun encodableBits(): Int {
+            var bits = decode(
+                encode(
+                    glassesLinkUp = true,
+                    phoneServiceAlive = true,
+                    lastSendDropped = true,
+                    glassesSinkAttached = true,
+                    wakingGlasses = true,
+                    glassesRefusingInput = true,
+                    glassesSessionLost = true,
+                )
+            )
+            for (reason in RefusalReason.entries) {
+                bits = bits or decode(
+                    encode(
+                        glassesLinkUp = true,
+                        phoneServiceAlive = true,
+                        lastSendDropped = true,
+                        glassesSinkAttached = true,
+                        wakingGlasses = true,
+                        glassesRefusingInput = true,
+                        refusalReason = reason,
+                        glassesSessionLost = true,
+                    )
+                )
+            }
+            return bits
         }
 
         fun decode(payload: ByteArray?): Int {
-            if (payload == null || payload.isEmpty()) {
-                throw MalformedFrameException("status payload must not be empty")
+            // Exactly the same strictness as before, only at the new width: a frame
+            // narrower than the flags field is not an old frame to be zero-extended,
+            // it is a peer speaking a different protocol. Zero-extending would read a
+            // truncated frame as "no problems reported", which is the one answer that
+            // must never be inferred.
+            if (payload == null || payload.size < FRAME_BYTES) {
+                throw MalformedFrameException(
+                    "status payload must be at least $FRAME_BYTES bytes, got ${payload?.size ?: 0}"
+                )
             }
-            return payload[0].toInt() and 0xFF
+            return java.nio.ByteBuffer.wrap(payload, 0, FRAME_BYTES)
+                .order(java.nio.ByteOrder.BIG_ENDIAN).short.toInt() and 0xFFFF
         }
 
         /**
@@ -633,17 +950,74 @@ object RemoteInputProtocol {
          */
         const val REPLY_SUFFIX_BYTES = 4
 
-        fun encodeWithReplyTo(bits: ByteArray, replyToSeq: Int): ByteArray =
-            java.nio.ByteBuffer.allocate(1 + REPLY_SUFFIX_BYTES)
+        /**
+         * Frame layout: flags [0..1], holdMs [2..3], replyToSeq [4..7].
+         *
+         * holdMs sits BEFORE the reply suffix so both are at fixed offsets. Appending
+         * it after a variable-presence suffix would make the suffix's own offset depend
+         * on whether the frame was solicited.
+         */
+        const val HOLD_MS_OFFSET = FRAME_BYTES
+        const val DEVICE_STATE_OFFSET = FRAME_BYTES + HOLD_MS_BYTES
+        const val REPLY_OFFSET = FRAME_BYTES + HOLD_MS_BYTES + DEVICE_STATE_BYTES
+
+        /** Flags, hold threshold and device state, with no correlation suffix. */
+        fun encodeWithHoldMs(bits: ByteArray, holdMs: Int, deviceState: Int = 0): ByteArray {
+            require(bits.size == FRAME_BYTES) {
+                "status bits must be $FRAME_BYTES bytes, got ${bits.size}"
+            }
+            return java.nio.ByteBuffer.allocate(FRAME_BYTES + HOLD_MS_BYTES + DEVICE_STATE_BYTES)
                 .order(java.nio.ByteOrder.BIG_ENDIAN)
-                .put(bits[0])
+                .put(bits)
+                .putShort(holdMs.toShort())
+                .putShort(deviceState.toShort())
+                .array()
+        }
+
+        fun encodeWithReplyTo(
+            bits: ByteArray,
+            replyToSeq: Int,
+            holdMs: Int = 0,
+            deviceState: Int = 0,
+        ): ByteArray {
+            require(bits.size == FRAME_BYTES) {
+                "status bits must be $FRAME_BYTES bytes, got ${bits.size}"
+            }
+            return java.nio.ByteBuffer
+                .allocate(FRAME_BYTES + HOLD_MS_BYTES + DEVICE_STATE_BYTES + REPLY_SUFFIX_BYTES)
+                .order(java.nio.ByteOrder.BIG_ENDIAN)
+                .put(bits)
+                .putShort(holdMs.toShort())
+                .putShort(deviceState.toShort())
                 .putInt(replyToSeq)
                 .array()
+        }
+
+        /** The receiver's opaque state bits, or 0 when the frame carries none. */
+        fun deviceState(payload: ByteArray?): Int {
+            if (payload == null || payload.size < DEVICE_STATE_OFFSET + DEVICE_STATE_BYTES) return 0
+            return java.nio.ByteBuffer.wrap(payload, DEVICE_STATE_OFFSET, DEVICE_STATE_BYTES)
+                .order(java.nio.ByteOrder.BIG_ENDIAN).short.toInt() and 0xFFFF
+        }
+
+        /**
+         * The receiver's hold threshold, or null when the frame does not carry one.
+         *
+         * Null and zero are both "not reported"; callers go to [DEFAULT_HOLD_MS]. Read
+         * unsigned, so a threshold above 32767 ms does not arrive negative -- it is then
+         * clamped by [sanitizeHoldMs] like any other out-of-range value.
+         */
+        fun holdMs(payload: ByteArray?): Int? {
+            if (payload == null || payload.size < HOLD_MS_OFFSET + HOLD_MS_BYTES) return null
+            val raw = java.nio.ByteBuffer.wrap(payload, HOLD_MS_OFFSET, HOLD_MS_BYTES)
+                .order(java.nio.ByteOrder.BIG_ENDIAN).short.toInt() and 0xFFFF
+            return if (raw == 0) null else raw
+        }
 
         /** The correlated PING seq, or null when this is an unsolicited push. */
         fun replyToSeq(payload: ByteArray?): Int? {
-            if (payload == null || payload.size < 1 + REPLY_SUFFIX_BYTES) return null
-            return java.nio.ByteBuffer.wrap(payload, 1, REPLY_SUFFIX_BYTES)
+            if (payload == null || payload.size < REPLY_OFFSET + REPLY_SUFFIX_BYTES) return null
+            return java.nio.ByteBuffer.wrap(payload, REPLY_OFFSET, REPLY_SUFFIX_BYTES)
                 .order(java.nio.ByteOrder.BIG_ENDIAN).int
         }
 
@@ -667,10 +1041,11 @@ object RemoteInputProtocol {
          */
         fun applyAdvisory(current: Int, received: Int, trusted: Boolean): Int {
             if (trusted) return received
-            val healthMask = GLASSES_LINK_UP or PHONE_SERVICE_ALIVE or GLASSES_SINK_ATTACHED
-            val problemMask = LAST_SEND_DROPPED or WAKING_GLASSES or GLASSES_REFUSING_INPUT
-            val health = current and received and healthMask
-            val problems = (current or received) and problemMask
+            // Both masks come from the single shared definitions. They were duplicated
+            // here, and a new bit omitted from this copy is not a partial failure -- it
+            // is folded away to zero and never seen by the watch at all.
+            val health = current and received and HEALTH_MASK
+            val problems = (current or received) and PROBLEM_MASK
             // The reason belongs to whichever frame is currently asserting a refusal, so it
             // is taken from the received frame rather than AND/OR-folded -- folding two
             // enums bitwise would synthesize a third, wrong reason.
@@ -713,8 +1088,11 @@ object RemoteInputProtocol {
                 trusted = false,
             )
 
-        private fun healthBitsIn(bits: Int): Int =
-            bits and (GLASSES_LINK_UP or PHONE_SERVICE_ALIVE or GLASSES_SINK_ATTACHED)
+        private fun healthBitsIn(bits: Int): Int = bits and HEALTH_MASK
+
+        /** The individual set bits of [mask], so an invariant can iterate a mask. */
+        private fun bitsOf(mask: Int): List<Int> =
+            (0 until Int.SIZE_BITS).map { 1 shl it }.filter { mask and it != 0 }
 
         /**
          * The problem bits NOT asserted by [bits], i.e. the ones it reports as resolved.
@@ -728,8 +1106,7 @@ object RemoteInputProtocol {
          * shape on this feature, so it is fixed the same structural way as the health bits
          * rather than at one careful caller, and pinned by [assertNoAbsorbingBit].
          */
-        private fun problemBitsIn(bits: Int): Int =
-            (LAST_SEND_DROPPED or WAKING_GLASSES or GLASSES_REFUSING_INPUT) and bits.inv()
+        private fun problemBitsIn(bits: Int): Int = PROBLEM_MASK and bits.inv()
 
         /**
          * Executable statement of the invariant: NO bit is absorbing, in either direction.
@@ -743,10 +1120,33 @@ object RemoteInputProtocol {
          * faces: the health direction pinned the watch at "Phone service down", and the
          * problem direction pinned it at "Not allowed here". Checking only the direction
          * that happened to break last is what let the second one ship.
+         *
+         * @return the bits actually exercised, OR-ed together. Returned rather than kept
+         *         private because the dangerous failure of an invariant like this is not
+         *         failing -- it is silently checking FEWER bits than exist and passing.
+         *         A hand-written bit list did exactly that here, and no test noticed.
+         *         The caller asserts this equals the full flag space, so coverage is
+         *         itself checked rather than assumed.
          */
-        fun assertNoAbsorbingBit() {
-            val healthBits = listOf(GLASSES_LINK_UP, PHONE_SERVICE_ALIVE, GLASSES_SINK_ATTACHED)
-            val problemBits = listOf(LAST_SEND_DROPPED, WAKING_GLASSES, GLASSES_REFUSING_INPUT)
+        fun assertNoAbsorbingBit(): Int {
+            // ENUMERATED FROM THE MASKS, never hand-listed. A hand-written list is an
+            // invariant that silently stops covering the bit you just added, which is
+            // the failure mode this whole function exists to prevent -- it would have
+            // been checking three of four bits and passing.
+            val healthBits = bitsOf(HEALTH_MASK)
+            val problemBits = bitsOf(PROBLEM_MASK)
+            check(healthBits.isNotEmpty() && problemBits.isNotEmpty()) {
+                "the health and problem masks must both be non-empty, or this invariant " +
+                    "passes by checking nothing"
+            }
+            check(HEALTH_MASK and PROBLEM_MASK == 0) {
+                "a bit cannot be both health and problem: the fold would AND and OR the " +
+                    "same bit and the later term would silently win"
+            }
+            check(HEALTH_MASK and REASON_MASK == 0 && PROBLEM_MASK and REASON_MASK == 0) {
+                "a flag bit overlaps REASON_MASK, so folding the flags would corrupt the " +
+                    "refusal reason into a different, wrong reason"
+            }
             val allHealthy = healthBits.fold(0) { acc, b -> acc or b }
 
             // A problem bit raised once must be cleared by a frame that no longer reports it.
@@ -785,6 +1185,8 @@ object RemoteInputProtocol {
                         "the process"
                 }
             }
+
+            return (healthBits + problemBits).fold(0) { acc, b -> acc or b }
         }
     }
 

@@ -107,6 +107,19 @@ class WatchInputBridge(
     @Volatile private var lastSendDropped = false
     @Volatile private var wakingGlasses = false
 
+    /**
+     * Whether the glasses currently hold an open session for the watch.
+     *
+     * Defaults to FALSE, and that is the safe direction rather than a placeholder. A
+     * freshly constructed bridge has been told nothing, and the only way this bridge
+     * gets constructed is ListenerService starting -- which means the input socket is
+     * down, which means the glasses' own transport-loss handler has cleared their
+     * session. So "no session" is not a guess here, it is what actually happened.
+     *
+     * It is nonetheless never REPORTED while the link is down; see [pushStatus].
+     */
+    @Volatile private var glassesSessionOpen = false
+
     /** The glasses' refusal counter high-water mark, and the most recent reason. */
     @Volatile private var lastRefusedTotal = 0L
     @Volatile private var refusalReason: RemoteInputProtocol.RefusalReason? = null
@@ -135,6 +148,14 @@ class WatchInputBridge(
                 // The link is up, so this burst's teardown has served its purpose. Arm
                 // again for a future relay rather than latching for the process life.
                 audioRelayStopRequested.set(false)
+            } else {
+                // The socket dropped, so the glasses ran their own transport-loss
+                // handler and cleared the session. Recording that HERE, on the edge, is
+                // what makes recovery happen on the next link-up rather than waiting up
+                // to a full ping interval for the glasses to say so themselves -- and
+                // the glasses cannot say so while the socket carrying their answer is
+                // the thing that just died.
+                glassesSessionOpen = false
             }
             pushStatus(force = true)
         }
@@ -297,6 +318,58 @@ class WatchInputBridge(
         Log.i(TAG, "FWD type=${event.type} seq=${event.seqUnsigned} steps=${event.steps}")
     }
 
+    /**
+     * Called when the glasses report whether they hold an open session for the watch.
+     *
+     * Forwarded rather than consumed here, because the phone cannot fix it: only the
+     * watch holds the HMAC key, so only the watch can announce a session. The phone's
+     * entire job for this bit is not to drop it -- which is exactly what it used to do.
+     *
+     * Forced, like every other state edge on this channel: [pushStatus] DROPS an
+     * unforced push inside the rate-limit window rather than coalescing it, so an
+     * unforced edge is not delayed, it is lost.
+     */
+    fun setGlassesSessionOpen(open: Boolean) {
+        if (glassesSessionOpen == open) return
+        glassesSessionOpen = open
+        Log.i(TAG, "glasses session open=$open")
+        pushStatus(force = true)
+    }
+
+    /**
+     * The glasses' hold threshold, relayed verbatim to the watch.
+     *
+     * Zero until the glasses report one, which the protocol reads as "not reported"
+     * and the watch answers with its own fallback. The phone does not interpret,
+     * clamp or default this -- it is a relay, and inventing a value here would let
+     * the watch believe it had learned the receiver's threshold when it had not.
+     */
+    @Volatile
+    private var glassesHoldMs = 0
+
+    /**
+     * The glasses' opaque state bits, forwarded to the watch verbatim.
+     *
+     * The phone assigns no meaning to any bit -- see [InputRfcommClient.onDeviceState].
+     */
+    @Volatile
+    private var glassesDeviceState = 0
+
+    fun setGlassesDeviceState(bits: Int) {
+        if (glassesDeviceState == bits) return
+        glassesDeviceState = bits
+        Log.i(TAG, "glasses device state=0x${Integer.toHexString(bits)}")
+        pushStatus(force = true)
+    }
+
+    /** Called when the glasses report the hold threshold their own touchpad uses. */
+    fun setGlassesHoldMs(holdMs: Int) {
+        if (glassesHoldMs == holdMs) return
+        glassesHoldMs = holdMs
+        Log.i(TAG, "glasses hold threshold=${holdMs}ms")
+        pushStatus(force = true)
+    }
+
     /** Called when the glasses report whether their input sink is attached. */
     fun setGlassesSinkAttached(attached: Boolean) {
         if (glassesSinkAttached == attached) return
@@ -380,8 +453,9 @@ class WatchInputBridge(
         if (!force && now - lastStatusPushMs < STATUS_MIN_INTERVAL_MS) return
         lastStatusPushMs = now
         val refusing = isRefusalFresh(now)
+        val linkUp = inputClient.isConnected
         val bits = StatusFlags.encode(
-            glassesLinkUp = inputClient.isConnected,
+            glassesLinkUp = linkUp,
             // Always true here by construction: this bridge only exists while
             // ListenerService is alive. The false case is reported directly by
             // WatchMessageListenerService when it finds no bridge at all.
@@ -391,11 +465,18 @@ class WatchInputBridge(
             wakingGlasses = wakingGlasses,
             glassesRefusingInput = refusing,
             refusalReason = if (refusing) refusalReason else null,
+            // Gated on the link being UP, and that gate is load-bearing rather than
+            // tidiness. The bit makes the watch mint a new session id and send a fresh
+            // OPEN; doing that while the socket that would carry the OPEN is down burns
+            // the id counter on an announcement nobody can receive, and the session
+            // would still be missing when the link returned. Reporting it only over a
+            // live link means every mint has somewhere to go.
+            glassesSessionLost = linkUp && !glassesSessionOpen,
         )
         val frame = if (replyToSeq != null) {
-            StatusFlags.encodeWithReplyTo(bits, replyToSeq)
+            StatusFlags.encodeWithReplyTo(bits, replyToSeq, glassesHoldMs, glassesDeviceState)
         } else {
-            bits
+            StatusFlags.encodeWithHoldMs(bits, glassesHoldMs, glassesDeviceState)
         }
         try {
             statusSender(frame)

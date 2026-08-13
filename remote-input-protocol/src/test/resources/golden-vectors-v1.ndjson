@@ -33,3 +33,4 @@
 {"kind":"reject","rule":"src_not_allowed","encoding":"B","mustReject":true,"reason":"src must be in the hard-coded allowlist","rfcommArgs":["1","attacker","1","1","SCROLL","1","1000","de3462d4ebde6c9b"]}
 {"kind":"reject","rule":"bad_version","encoding":"B","mustReject":true,"reason":"receivers drop frames with v != 1","rfcommArgs":["2","watch","1","1","SCROLL","1","1000","de3462d4ebde6c9b"]}
 {"kind":"reject","rule":"too_few_args","encoding":"B","mustReject":true,"reason":"Encoding B requires at least 8 positional args","rfcommArgs":["1","watch","1","1","SCROLL","1","1000"]}
+{"kind":"accept","sid":1,"seq":6,"type":"HOLD","typeCode":7,"steps":0,"wms":1400,"canonical":"1|watch|1|6|7|0|1400","tag":"9a3592af7c354cfc","payloadHex":"07000000000600000001000005789a3592af7c354cfc00000000","rfcommArgs":["1","watch","1","6","HOLD","0","1400","9a3592af7c354cfc"]}
