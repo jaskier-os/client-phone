@@ -11,6 +11,7 @@ import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableStateOf
 import android.view.WindowManager
 import androidx.wear.compose.material3.MaterialTheme
+import com.repository.listener.protocol.RemoteInputProtocol
 
 /**
  * The remote scroll screen.
@@ -47,6 +48,15 @@ class ScrollRemoteActivity : ComponentActivity() {
     private val linkState: MutableState<LinkState> = mutableStateOf(LinkState.SETUP)
     private val elapsedLabel: MutableState<String> = mutableStateOf("")
 
+    /**
+     * Whether the glasses report a recording in progress, mirrored into snapshot state.
+     *
+     * Polled on the existing 1 s tick rather than pushed: the value changes at most twice
+     * per recording, and a push would need another listener plumbed through the service
+     * for no gain at that rate.
+     */
+    private val recording: MutableState<Boolean> = mutableStateOf(false)
+
     /** Visual/tactile feedback state. Plain object, never snapshot state. */
     private val feedback = FeedbackEngine()
 
@@ -80,6 +90,22 @@ class ScrollRemoteActivity : ComponentActivity() {
                         WatchLinkService.current()?.onTap()
                         noteInteraction()
                     },
+                    onHold = {
+                        WatchLinkService.current()?.onHold()
+                        noteInteraction()
+                    },
+                    // Read through a lambda, not captured: the receiver revises this on
+                    // the status channel, and a captured value would freeze the watch at
+                    // whatever was current when the screen was composed.
+                    holdThresholdMs = {
+                        WatchLinkService.current()?.holdThresholdMs
+                            ?: RemoteInputProtocol.StatusFlags.DEFAULT_HOLD_MS
+                    },
+                    onCapture = { type ->
+                        WatchLinkService.current()?.onCapture(type)
+                        noteInteraction()
+                    },
+                    recording = recording,
                 )
             }
         }
@@ -191,8 +217,14 @@ class ScrollRemoteActivity : ComponentActivity() {
     private val elapsedTick = object : Runnable {
         override fun run() {
             refreshElapsed()
+            refreshRecording()
             attachHandler.postDelayed(this, ELAPSED_TICK_MS)
         }
+    }
+
+    private fun refreshRecording() {
+        val next = WatchLinkService.current()?.recording ?: false
+        if (recording.value != next) recording.value = next
     }
 
     private fun refreshElapsed() {

@@ -18,7 +18,8 @@ PHONE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 APK="$PHONE_DIR/wear/build/outputs/apk/debug/wear-debug.apk"
 PACKAGE="com.repository.listener"
 ACTIVITY="com.repository.listener.wear.ScrollRemoteActivity"
-TILE="com.repository.listener.wear.StatusTileService"
+COMPLICATION="com.repository.listener.wear.LinkComplicationService"
+COMPLICATION_ACTION="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST"
 SERIAL_FILE="$HOME/.config/repository/watch-serial"
 
 CLEANUP=0
@@ -135,14 +136,22 @@ fi
 # --- Whitelist from doze for the development session ---
 adb -s "$SERIAL" shell dumpsys deviceidle whitelist "+$PACKAGE" >/dev/null 2>&1
 
-# --- Add the Tile over adb (no watch interaction required) ---
-echo "Adding the tile ..."
-adb -s "$SERIAL" shell am broadcast \
-    -a com.google.android.wearable.app.DEBUG_SURFACE \
-    --es operation add-tile \
-    --ecn component "$PACKAGE/$TILE" 2>&1 | sed 's/^/  /'
-echo "  (If the tile does not appear, add it on the watch: long-press a tile >"
-echo "   Edit, or swipe to the end of the carousel and use +.)"
+# --- Report complication enumeration ---
+#
+# A complication data source cannot be placed over adb: the watch-face editor
+# owns the slot assignment and requires the user to pick it. What CAN be checked
+# without touching the watch is that the platform enumerates the provider at all,
+# which is the precondition for it being offered in the picker.
+echo "Checking the complication provider is enumerated ..."
+if adb -s "$SERIAL" shell "cmd package query-services -a $COMPLICATION_ACTION" 2>/dev/null \
+    | grep -q "$COMPLICATION"; then
+    echo "  OK: $PACKAGE/$COMPLICATION is enumerated."
+    echo "  Place it on the watch: long-press the watch face, tap the slot you want,"
+    echo "  scroll the provider list to 'Glasses Remote'."
+else
+    echo "  NOT ENUMERATED. The picker will not offer it. Check the manifest"
+    echo "  service label, icon, permission and SUPPORTED_TYPES."
+fi
 
 # --- Launch ---
 echo "Launching ..."

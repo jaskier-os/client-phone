@@ -49,6 +49,48 @@ object WatchTokens {
 
     /** Radial inset for centre content, keeping it clear of the circular edge. */
     val ContentInset = 30.dp
+
+    /**
+     * The two capture buttons, sitting where the right rim would otherwise run.
+     *
+     * They interrupt the rim track rather than floating over the centre: the centre is the
+     * readable area, and the right rim is dead space in practice because that is not where
+     * the user scrolls.
+     *
+     * Deliberately the SAME ink as the rest of the UI, not a signal colour. They are
+     * ordinary controls, and a permanent splash of colour on a 1-inch monochrome-ish
+     * display would pull the eye away from the status text every time it is read.
+     */
+    val CaptureRing = InkSecondary
+    val CaptureFill = Color(0xFF12181B)
+    val CaptureGlyph = InkPrimary
+
+    /** Radius of a capture button. */
+    val CaptureRadius = 13.dp
+
+    /** Ring weight. */
+    val CaptureRingStroke = 1.5.dp
+
+    /** How far the button centres sit from the display centre, as a fraction of radius. */
+    const val CaptureOrbit = 0.76f
+
+    /** Centre angle of each button, degrees clockwise from 12 o'clock. */
+    const val CapturePhotoAngle = 68f
+    const val CaptureVideoAngle = 112f
+
+    /**
+     * Angular half-width of the gap each button cuts in the rim track.
+     *
+     * Wider than the button itself so the arc visibly clears it rather than appearing to
+     * run underneath.
+     */
+    const val CaptureArcGapHalfSweep = 17f
+
+    /** How much a button grows while pressed, as a fraction of its radius. */
+    const val CapturePressScale = 0.18f
+
+    /** Press feedback decay, in ms. */
+    const val CapturePressMs = 260L
 }
 
 /**

@@ -74,6 +74,19 @@ class WatchLinkService : Service() {
         private const val NODE_RETRY_MS = 5_000L
 
         /**
+         * Ceiling on the reopen backoff.
+         *
+         * The condition it bounds -- phone off, or out of range -- lasts hours, so the
+         * interval must grow into the same order of magnitude rather than settling at
+         * something that still costs a synchronous preference commit every few seconds
+         * all afternoon. Two minutes is far longer than any recovery the user waits on
+         * (a phone coming back in range produces a node-resolution edge, and reconnect
+         * paths reset the counter outright), and short enough that a genuinely stuck
+         * link still retries unattended.
+         */
+        const val MAX_REOPEN_BACKOFF_MS = 120_000L
+
+        /**
          * The starting value for [statusBits]: health bits set, problem bits clear.
          *
          * See the field for why a zero seed is wrong. Written as the health mask
@@ -200,6 +213,37 @@ class WatchLinkService : Service() {
      */
     private var lastFrameSentMs = 0L
 
+    /**
+     * elapsedRealtime of the last session re-announcement, so the churn a forged
+     * status frame could otherwise cause is bounded. Worker-thread confined.
+     */
+    private var lastReopenMs = 0L
+
+    /**
+     * Reopens since the far end last CONFIRMED it holds our session. Drives the
+     * backoff. Worker-thread confined.
+     */
+    private var consecutiveReopens = 0
+
+    /**
+     * Set once teardown has begun, so the CLOSE frame cannot trip the silence backstop
+     * and end the service's life by minting a session and announcing it.
+     * Worker-thread confined.
+     */
+    private var shuttingDown = false
+
+    /**
+     * elapsedRealtime at which the OPEN for the current [sid] was dispatched.
+     *
+     * Suppresses a redundant SECOND reopen immediately after a first. The phone
+     * answers a PING from a CACHED view of the glasses' session, so the correlated
+     * reply to the very next PING after a fresh OPEN can still be carrying the verdict
+     * from before that OPEN existed. Acting on it would mint again for no reason and,
+     * because every mint restarts the establishment, could do so indefinitely under a
+     * slow link. Worker-thread confined.
+     */
+    private var sessionOpenSentMs = 0L
+
     @Volatile
     private var everSawPhoneNode = false
 
@@ -317,7 +361,14 @@ class WatchLinkService : Service() {
     override fun onDestroy() {
         // Best effort: the process can still die before GMS ships this, which is
         // why the receiver also expires a session after a silence timeout.
+        // Both marshalled onto the worker, and the flag set FIRST so it is already true
+        // when closeSession runs. Setting it from this thread instead would race the
+        // worker, and cancelling the retry from here would run BEFORE the posted
+        // closeSession -- so a retry that closeSession itself queued would survive the
+        // cancellation.
+        handler.post { shuttingDown = true }
         handler.post { closeSession() }
+        handler.post { handler.removeCallbacks(reopenRetryRunnable) }
         handler.removeCallbacks(statusTick)
         worker.quitSafely()
         instance = null
@@ -372,7 +423,17 @@ class WatchLinkService : Service() {
         sid = mintSid()
         synchronized(sendLock) { seq = 0 }
         sessionOpenSent = false
+        sessionOpenSentMs = 0L
         lastFrameSentMs = 0L
+        // This IS the fresh start the backoff is meant to be released for, so it is
+        // released here as well as on confirmation. Carrying a previous session's
+        // failure count into a deliberately new one would throttle recovery for a
+        // condition that no longer applies.
+        consecutiveReopens = 0
+        lastReopenMs = 0L
+        // A reopen owed by the PREVIOUS session must not fire into this one: it would
+        // discard a session that has just been minted and never given a chance.
+        handler.removeCallbacks(reopenRetryRunnable)
         // Re-seed the fold for the new session. Carrying a previous session's
         // latched problem bits across an explicit reopen would report a failure the
         // new link has not exhibited.
@@ -408,7 +469,136 @@ class WatchLinkService : Service() {
         // is bounded instead by the fact that this runs on the single worker thread:
         // the OPEN is dispatched before the caller's own frame, so the flag is
         // already true for every later event in the burst.
-        sessionOpenSent = dispatchEvent(node, EventType.OPEN, 0, SystemClock.elapsedRealtime())
+        val now = SystemClock.elapsedRealtime()
+        sessionOpenSent = dispatchEvent(node, EventType.OPEN, 0, now)
+        if (sessionOpenSent) sessionOpenSentMs = now
+    }
+
+    /**
+     * Abandons the current session and arms a brand new one: fresh sid, seq back to 0,
+     * OPEN owed again. Worker thread only.
+     *
+     * ## Why this always MINTS, and is the only way to re-announce
+     *
+     * Every path that wants the session announced again routes through here, and none
+     * of them may simply clear [sessionOpenSent] for the sid already on the wire. That
+     * looks equivalent and is not. The receiver treats an OPEN for a sid it already
+     * knows as a RESUME and deliberately preserves that session's sequence high-water
+     * mark -- correct while this process keeps counting up, fatal otherwise. Two ways
+     * it goes wrong, and the second is why the rule has to be absolute:
+     *
+     *  - Across a process restart the counter is back near zero, so every frame lands
+     *    under the retained mark.
+     *  - Even WITHIN one process, the receiver reserves its durable floor in blocks
+     *    AHEAD of what it has applied, so after a receiver restart the floor can sit up
+     *    to a whole reservation above the seq this watch has actually reached. A
+     *    same-sid re-announce then wedges in the worst possible way: the receiver holds
+     *    an open session, so it reports itself HEALTHY, and the status signal that
+     *    would otherwise rescue us never fires.
+     *
+     * A fresh sid is always higher, so it is never mistaken for a replay, it takes the
+     * receiver's adopt path, and it carries its own floor.
+     *
+     * ## Why it is rate limited, and why a refusal does NOT fall back
+     *
+     * Minting is a synchronous commit and a permanent step of a monotonic counter, and
+     * the trigger reaches us over an unauthenticated channel. When the limit refuses,
+     * this returns with [sessionOpenSent] UNTOUCHED -- clearing it anyway would fall
+     * back to exactly the same-sid re-announce described above, turning the safety
+     * limit into the bug. A retry is scheduled instead, because the caller has no other
+     * recovery: sends are succeeding and the node is resolved, so the silence-based
+     * trigger cannot fire, and without the retry the watch sits deadlocked until some
+     * later status edge happens to arrive.
+     *
+     * ## Why the interval BACKS OFF, which the flat limit alone did not handle
+     *
+     * A flat 5 s limit still permits an unbounded loop, and one that fires on an
+     * entirely ordinary condition rather than an attack: with the phone off or out of
+     * range, the send fails, its listener asks for a reopen, the reopen dispatches a
+     * fresh OPEN, that send fails too. One synchronous preference commit every 5 s for
+     * as long as the user is away from their phone. Recovery must therefore get
+     * CHEAPER the longer it keeps not working, so the interval doubles per consecutive
+     * attempt up to [MAX_REOPEN_BACKOFF_MS].
+     *
+     * The counter resets on EVIDENCE, not on optimism -- see [noteSessionConfirmed],
+     * called when the far end tells us, on a frame we correlated, that it is holding
+     * our session. Resetting on a successful local dispatch instead would reset on
+     * every attempt, since a dispatch "succeeding" only means GMS accepted the bytes.
+     *
+     * @return true if the session was actually re-armed.
+     */
+    private fun reopenSession(reason: String): Boolean {
+        // The session is being torn down; a new one must not be minted, and an OPEN for
+        // it must certainly not be put on the wire. Without this, closeSession's own
+        // CLOSE trips the silence backstop and shutdown ends by ANNOUNCING a session.
+        if (shuttingDown) return false
+        // Nothing has been announced yet, so the OPEN still owed will carry the current
+        // sid. Minting here would discard a perfectly good unused session id.
+        if (!sessionOpenSent) return false
+
+        val now = SystemClock.elapsedRealtime()
+        val sinceLast = now - lastReopenMs
+        val minInterval = reopenBackoffMs()
+        if (lastReopenMs != 0L && sinceLast < minInterval) {
+            val waitMs = minInterval - sinceLast
+            Log.i(TAG, "reopen ($reason) rate limited; retrying in ${waitMs}ms")
+            handler.removeCallbacks(reopenRetryRunnable)
+            handler.postDelayed(reopenRetryRunnable, waitMs)
+            return false
+        }
+        handler.removeCallbacks(reopenRetryRunnable)
+        lastReopenMs = now
+        if (consecutiveReopens < Int.MAX_VALUE) consecutiveReopens++
+
+        val previous = sid
+        sid = mintSid()
+        synchronized(sendLock) { seq = 0 }
+        sessionOpenSent = false
+        sessionOpenSentMs = 0L
+        // Clear the silence baseline too. Leaving the old session's last-send stamp in
+        // place would let the silence branch fire again the instant the new session
+        // sends its first frame, minting a second id for a session one frame old.
+        lastFrameSentMs = 0L
+        Log.i(
+            TAG,
+            "re-opening as sid=${sid.toUInt()} (was ${previous.toUInt()}): $reason",
+        )
+        // Announce immediately when there is somewhere to send it, rather than waiting
+        // for the user's next detent. Recovery the user has to trigger by hand is the
+        // deadlock they already reported, one retry later.
+        phoneNodeId?.let { ensureSessionOpen(it) } ?: resolvePhoneNode()
+        return true
+    }
+
+    /** Re-attempts a reopen the rate limit refused. See [reopenSession]. */
+    private val reopenRetryRunnable = Runnable { reopenSession("retry after rate limit") }
+
+    /**
+     * The current minimum spacing between reopens: the base interval doubled once per
+     * consecutive unconfirmed attempt, capped.
+     *
+     * Shifting rather than multiplying, and capping the shift distance, because the
+     * counter is unbounded and `1 shl 32` is `1` in Kotlin -- a silent wrap that would
+     * collapse the backoff back to its base at the exact point it is needed most.
+     */
+    private fun reopenBackoffMs(): Long {
+        val shift = (consecutiveReopens - 1).coerceIn(0, 16)
+        val scaled = RemoteInputProtocol.REOPEN_MIN_INTERVAL_MS shl shift
+        return scaled.coerceAtMost(MAX_REOPEN_BACKOFF_MS)
+    }
+
+    /**
+     * The far end has confirmed, on a frame we correlated, that it holds our session.
+     *
+     * This is the ONLY thing that resets the backoff, because it is the only available
+     * evidence that a reopen actually achieved something. A locally successful dispatch
+     * does not qualify: it means GMS accepted the bytes, which is equally true of every
+     * attempt in a loop that is getting nowhere.
+     */
+    private fun noteSessionConfirmed() {
+        if (consecutiveReopens == 0) return
+        consecutiveReopens = 0
+        handler.removeCallbacks(reopenRetryRunnable)
     }
 
     private fun closeSession() {
@@ -469,6 +659,59 @@ class WatchLinkService : Service() {
      * skipped the wait emitted a select AND a back for one double tap.
      */
     fun onTap() = onTapAt(SystemClock.elapsedRealtime())
+
+    /**
+     * The RECEIVER's hold threshold, as last reported on the status channel.
+     *
+     * The UI reads this to size its own press timer, so a hold on the watch takes
+     * exactly as long as a hold on the glasses' own touchpad. Falls back to the
+     * protocol default until a frame reports one; a receiver that never reports keeps
+     * the fallback forever, which is the correct degradation.
+     */
+    @Volatile
+    var holdThresholdMs: Int = RemoteInputProtocol.StatusFlags.DEFAULT_HOLD_MS
+        private set
+
+    /**
+     * A press was held past [holdThresholdMs]. Emitted as its own action, immediately.
+     *
+     * A hold is NOT a tap, so this CANCELS any pending single-tap window. Without that
+     * the press that became a hold would also resolve to a SELECT when its window
+     * expired and the glasses would act on both -- the same double-emission bug that
+     * made glasses-side gesture recognition untenable in the first place.
+     */
+    fun onHold() = onHoldAt(SystemClock.elapsedRealtime())
+
+    /**
+     * A capture button was pressed. [type] is [EventType.PHOTO] or [EventType.VIDEO].
+     *
+     * Emitted immediately and never coalesced, like every other discrete action. The watch
+     * attaches NO meaning to either: whether VIDEO starts or stops a recording is the
+     * glasses' decision, because only they know whether one is running.
+     */
+    fun onCapture(type: EventType) = onCaptureAt(type, SystemClock.elapsedRealtime())
+
+    @androidx.annotation.VisibleForTesting
+    internal fun onCaptureAt(type: EventType, atMs: Long) {
+        handler.post {
+            // A capture press is not a tap, so it must not leave a half-recognised tap
+            // behind to resolve into a stray SELECT afterwards.
+            handler.removeCallbacks(singleTapRunnable)
+            pendingTapMs = null
+            Log.i(TAG, "GESTURE capture -> $type at=$atMs")
+            coalescer.onDiscreteEvent(type, atMs)
+        }
+    }
+
+    @androidx.annotation.VisibleForTesting
+    internal fun onHoldAt(holdMs: Long) {
+        handler.post {
+            handler.removeCallbacks(singleTapRunnable)
+            pendingTapMs = null
+            Log.i(TAG, "GESTURE hold -> HOLD at=$holdMs")
+            coalescer.onDiscreteEvent(EventType.HOLD, holdMs)
+        }
+    }
 
     /**
      * [onTap] with the tap instant passed in rather than read.
@@ -594,34 +837,21 @@ class WatchLinkService : Service() {
             return
         }
         // The glasses drop a session that has been silent for SESSION_EXPIRY_MS, and
-        // they REJECT a PING for a sid they no longer hold -- a PING cannot
-        // resurrect anything. The idle PING backoff (30 s) is deliberately longer
-        // than that expiry (20 s), so an idle session is always already gone by the
-        // time the next keepalive goes out. Rather than shortening the backoff and
-        // paying for it on both batteries, notice the gap and re-announce: the
-        // glasses' resume path accepts an OPEN for the session already in progress
-        // and preserves its sequence high-water mark.
+        // they REJECT a PING for a sid they no longer hold -- a PING cannot resurrect
+        // anything. So a gap that long means the session is gone and must be re-armed.
+        //
+        // This branch is a BACKSTOP, not the recovery path, and saying so matters
+        // because it reads like the latter. The keepalive cadence is deliberately well
+        // under the expiry, and every frame including a PING stamps lastFrameSentMs, so
+        // on a working link this can never fire -- the keepalive that keeps the session
+        // alive is precisely what stops it noticing the session is dead. It survives
+        // only for the case where the keepalive itself stopped running. The real
+        // recovery is the glasses reporting the lost session; see [onStatus].
         val now = SystemClock.elapsedRealtime()
-        if (sessionOpenSent &&
-            lastFrameSentMs != 0L &&
+        if (lastFrameSentMs != 0L &&
             now - lastFrameSentMs >= RemoteInputProtocol.SESSION_EXPIRY_MS
         ) {
-            // Mint a new sid rather than re-announcing the old one. Reusing it puts the
-            // receiver on its resume path, which keeps the previous session's sequence
-            // high-water mark -- correct while this process keeps counting up, but fatal
-            // once the process has restarted in between: the counter is back near zero,
-            // every frame lands under the mark, and the link rejects input for good while
-            // still looking healthy. A fresh sid is always higher, so it is never mistaken
-            // for a replay and it carries its own floor.
-            val previous = sid
-            sid = mintSid()
-            synchronized(sendLock) { seq = 0 }
-            Log.i(
-                TAG,
-                "re-opening as sid=${sid.toUInt()} (was ${previous.toUInt()}) " +
-                    "after ${now - lastFrameSentMs}ms silence",
-            )
-            sessionOpenSent = false
+            reopenSession("${now - lastFrameSentMs}ms silence")
         }
         // Every session must announce itself before it can act. OPEN itself is
         // exempt, or this would recurse.
@@ -701,7 +931,13 @@ class WatchLinkService : Service() {
                 // re-send it. Marshalled onto the worker: this listener runs on the
                 // main thread, and a plain write here could clobber a concurrent
                 // worker-side write.
-                handler.post { sessionOpenSent = false }
+                //
+                // Re-armed with a NEW sid rather than by clearing the flag in place.
+                // We do not know how much of this session the far end received, so
+                // re-announcing the same sid risks landing on its resume path against
+                // a sequence floor this session can no longer reach. See
+                // [reopenSession] -- it is the only sanctioned way to re-announce.
+                handler.post { reopenSession("send failed ($type)") }
             }
         return true
     }
@@ -774,15 +1010,54 @@ class WatchLinkService : Service() {
             if (resolved != null) {
                 ensureSessionOpen(resolved)
             } else {
-                // Node lost. The next resolution must re-announce the session, or the
-                // glasses keep rejecting every action for a sid they never saw an
-                // OPEN for. Re-announcing is safe: the glasses treat an OPEN for the
-                // session already in progress as liveness and PRESERVE their own
-                // sequence high-water mark, so it can never rewind them.
-                sessionOpenSent = false
+                // Node lost. The next resolution must re-announce, or the glasses keep
+                // rejecting every action for a sid they never saw an OPEN for.
+                //
+                // Through [reopenSession], so the re-announcement carries a NEW sid.
+                // Clearing the flag in place would re-send OPEN for the current sid,
+                // which puts the glasses on their resume path against a sequence floor
+                // that may already be unreachable -- a session that reports healthy and
+                // accepts nothing. That is the exact deadlock this feature shipped with.
+                reopenSession("phone node lost")
             }
             recomputeState()
         }
+    }
+
+    /**
+     * Adopts the receiver's hold threshold from a status frame.
+     *
+     * Applied from ANY frame, correlated or not, unlike the health bits. It is not a
+     * health claim and cannot admit input or clear an observed failure -- the worst a
+     * forged value can do is make holds slightly long or short, and [sanitizeHoldMs]
+     * bounds even that to something performable.
+     */
+    /**
+     * The receiver's opaque state bits, as last reported.
+     *
+     * Read by the UI to render indicators. The MEANING of each bit is agreed between the
+     * glasses and this app; nothing in between knows them. Bit 0 = recording.
+     */
+    @Volatile
+    var deviceState: Int = 0
+        private set
+
+    /** True when the glasses report a recording in progress. */
+    val recording: Boolean
+        get() = (deviceState and RemoteInputProtocol.StatusFlags.DEVICE_STATE_RECORDING) != 0
+
+    fun onDeviceState(bits: Int) {
+        if (bits == deviceState) return
+        deviceState = bits
+        Log.i(TAG, "device state <- 0x${Integer.toHexString(bits)} recording=$recording")
+    }
+
+    fun onHoldThreshold(reportedMs: Int?) {
+        if (reportedMs == null) return
+        val next = RemoteInputProtocol.StatusFlags.sanitizeHoldMs(reportedMs)
+        if (next == holdThresholdMs) return
+        holdThresholdMs = next
+        Log.i(TAG, "hold threshold <- ${next}ms (reported $reportedMs)")
     }
 
     /** Applies a status frame received from the phone. */
@@ -821,8 +1096,70 @@ class WatchLinkService : Service() {
                 current = statusBits, received = bits, correlated = correlated,
             )
             lastStatusMs = SystemClock.elapsedRealtime()
+            maybeReopenForLostSession(bits, correlated)
             recomputeState()
         }
+    }
+
+    /**
+     * THE recovery path: the glasses say they hold no session for us, so re-announce.
+     *
+     * Worker thread only. Reads the RECEIVED bits rather than the folded [statusBits]
+     * on purpose -- the fold OR-retains a problem bit until a correlated frame clears
+     * it, so acting on the folded value would keep re-triggering off a stale assertion
+     * long after the glasses stopped making it.
+     *
+     * ## Only on a correlated frame
+     *
+     * A correlated frame answers a PING this watch sent, quoting its seq. That is as
+     * much trust as an unauthenticated channel can offer, and it is the same bar every
+     * other bit here must clear to change the watch's mind. The consequence is a bound
+     * on recovery time of one ping interval, which is the price of not letting anyone
+     * who can write to this channel steer our session id.
+     *
+     * An uncorrelated assertion is deliberately NOT answered with an extra PING to
+     * "solicit" a correlated reply. That loop sustains itself -- solicit, glasses
+     * reject, unsolicited report, solicit -- for as long as the reopen is rate limited,
+     * and it spends the glasses' separate keepalive budget while doing so. The ordinary
+     * 10 s PING already produces a correlated reply on its own.
+     *
+     * Recovery therefore takes up to TWO ping cycles rather than one, and it is worth
+     * being exact about why: the phone answers a PING immediately from its CACHED view
+     * of the glasses, so the correlated reply to the ping that first observes the loss
+     * can still be carrying the previous verdict. The fresh verdict arrives with the
+     * ping after it. Roughly 20 s worst case, against a deadlock that is currently
+     * permanent.
+     *
+     * ## Why this cannot admit anything
+     *
+     * The most a forger achieves is making us mint a HIGHER session id and sign a fresh
+     * OPEN with a key they do not have. No frame becomes acceptable that was not
+     * already; a new session strictly invalidates the old one. The cost is bounded
+     * churn, which is what [RemoteInputProtocol.REOPEN_MIN_INTERVAL_MS] limits.
+     */
+    private fun maybeReopenForLostSession(received: Int, correlated: Boolean) {
+        if (!correlated) return
+        if (!RemoteInputProtocol.StatusFlags.isSet(
+                received, RemoteInputProtocol.StatusFlags.GLASSES_SESSION_LOST,
+            )
+        ) {
+            // A correlated frame that does NOT report a lost session is the only positive
+            // evidence available that a reopen worked. It is what releases the backoff;
+            // see [noteSessionConfirmed].
+            noteSessionConfirmed()
+            return
+        }
+        // Suppress a report that predates our own most recent OPEN. The phone answers a
+        // PING from its cached view of the glasses, so the reply to the first PING after
+        // an OPEN can still describe the world before it. Acting on that would mint a
+        // second id for a session that was never given a chance to establish.
+        val sentAt = sessionOpenSentMs
+        if (sentAt != 0L &&
+            SystemClock.elapsedRealtime() - sentAt < RemoteInputProtocol.REOPEN_MIN_INTERVAL_MS
+        ) {
+            return
+        }
+        reopenSession("glasses report no open session")
     }
 
     private val statusTick = object : Runnable {

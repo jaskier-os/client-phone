@@ -132,6 +132,30 @@ object Haptics {
         return true
     }
 
+    /**
+     * The surface registered a finger. Fired on press-DOWN, before the gesture is known.
+     *
+     * Says NOTHING about delivery or acceptance -- at this point nothing has been sent
+     * and the gesture is not yet resolved. It exists purely so contact feels immediate;
+     * every press therefore produces this tick and then, once resolved, one of the
+     * sensations below. Deliberately the lightest effect available, so the second buzz
+     * is the one that carries the information.
+     */
+    fun contact(view: View) {
+        view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+    }
+
+    /**
+     * A press reached the hold threshold and a HOLD was emitted.
+     *
+     * Heavier than [contact] and distinct from [accepted], because a hold commits the
+     * user to something a tap does not (on the glasses it starts dictation) and they
+     * must be able to tell from the wrist which gesture the watch decided on.
+     */
+    fun held(view: View) {
+        view.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+    }
+
     /** Input just became impossible. Fired on the transition only. */
     fun linkLost(view: View) {
         view.performHapticFeedback(HapticFeedbackConstants.TOGGLE_OFF)

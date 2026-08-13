@@ -26,7 +26,13 @@ class WatchStatusListenerService : WearableListenerService() {
         try {
             val bits = RemoteInputProtocol.StatusFlags.decode(event.data)
             val replyTo = RemoteInputProtocol.StatusFlags.replyToSeq(event.data)
-            WatchLinkService.current()?.onStatus(bits, replyTo)
+            val holdMs = RemoteInputProtocol.StatusFlags.holdMs(event.data)
+            val deviceState = RemoteInputProtocol.StatusFlags.deviceState(event.data)
+            WatchLinkService.current()?.let {
+                it.onHoldThreshold(holdMs)
+                it.onDeviceState(deviceState)
+                it.onStatus(bits, replyTo)
+            }
         } catch (e: Exception) {
             // onMessageReceived runs on a Binder thread; an uncaught throw here
             // would take down the service on a single malformed frame.

@@ -5,7 +5,9 @@ import android.view.View
 import android.view.ViewConfiguration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -42,6 +44,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material3.Text
+import com.repository.listener.protocol.RemoteInputProtocol
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.min
 
 /**
@@ -54,6 +58,60 @@ import kotlin.math.min
  */
 fun interface RotaryDeltaSink {
     fun onDelta(delta: Float)
+}
+
+/**
+ * Fraction of the display radius that accepts taps and holds.
+ *
+ * The remaining outer ring belongs to the rotary bezel. Turning the bezel presses the
+ * glass, so without a dead zone every scroll also opened a press that matured into a
+ * HOLD -- scrolling and holding were the same gesture and only one of them could win.
+ *
+ * 0.7 leaves a ring roughly a finger-width wide on this 1.5-inch display while keeping
+ * the central target comfortably larger than a fingertip.
+ */
+private const val TAP_ZONE_FRACTION = 0.7f
+
+/** Centre of a capture button in pixels, for both drawing and hit testing. */
+internal fun captureButtonCentre(
+    angleDeg: Float,
+    width: Float,
+    height: Float,
+): Pair<Float, Float> {
+    val cx = width / 2f
+    val cy = height / 2f
+    val orbit = kotlin.math.min(width, height) / 2f * WatchTokens.CaptureOrbit
+    val rad = Math.toRadians(angleDeg.toDouble())
+    // Zero at 12 o'clock, growing clockwise, so the constants read like a clock face.
+    return (cx + orbit * kotlin.math.sin(rad)).toFloat() to
+        (cy - orbit * kotlin.math.cos(rad)).toFloat()
+}
+
+/**
+ * Which capture button a touch landed on, or null for anywhere else.
+ *
+ * The hit radius is deliberately larger than the drawn one: a 13dp circle is smaller than
+ * a fingertip, and the surrounding rim is space the user does not scroll on anyway, so
+ * spending it on a forgiving target costs nothing and prevents missed presses.
+ */
+internal fun captureButtonAt(
+    x: Float,
+    y: Float,
+    width: Float,
+    height: Float,
+    hitRadiusPx: Float,
+): RemoteInputProtocol.EventType? {
+    fun hits(angle: Float): Boolean {
+        val (bx, by) = captureButtonCentre(angle, width, height)
+        val dx = x - bx
+        val dy = y - by
+        return dx * dx + dy * dy <= hitRadiusPx * hitRadiusPx
+    }
+    return when {
+        hits(WatchTokens.CapturePhotoAngle) -> RemoteInputProtocol.EventType.PHOTO
+        hits(WatchTokens.CaptureVideoAngle) -> RemoteInputProtocol.EventType.VIDEO
+        else -> null
+    }
 }
 
 /**
@@ -85,6 +143,11 @@ fun RemoteScreen(
     engine: FeedbackEngine,
     onRotaryDelta: RotaryDeltaSink,
     onTap: () -> Unit,
+    onHold: () -> Unit,
+    holdThresholdMs: () -> Int,
+    onCapture: (RemoteInputProtocol.EventType) -> Unit,
+    /** True while the glasses report a recording in progress. */
+    recording: State<Boolean>,
 ) {
     val focusRequester = remember { FocusRequester() }
     val view = LocalView.current
@@ -105,6 +168,18 @@ fun RemoteScreen(
     //    detent writes no snapshot state at all.
     val frame = remember { mutableIntStateOf(0) }
     val wake = remember { mutableIntStateOf(0) }
+
+    // Which capture button is showing press feedback, and when it was pressed. Plain
+    // mutable state read from drawBehind, like the frame counter -- written once per
+    // press rather than per frame, so this is not on any hot path.
+    val pressedButton = remember { mutableStateOf<RemoteInputProtocol.EventType?>(null) }
+    val pressedAtMs = remember { androidx.compose.runtime.mutableLongStateOf(0L) }
+
+    val density = LocalDensity.current
+    // Generous enough to catch a fingertip; see captureButtonAt.
+    val captureHitRadiusPx = remember(density) {
+        with(density) { (WatchTokens.CaptureRadius + 9.dp).toPx() }
+    }
 
     // onRotaryScrollEvent delivers nothing unless the composable is focusable AND
     // actually holds focus, so focus is claimed here -- and RE-claimed whenever
@@ -135,7 +210,14 @@ fun RemoteScreen(
                 var alive = true
                 while (alive) {
                     withFrameMillis { nowMs ->
-                        alive = engine.advance(nowMs)
+                        // The loop must also keep running while a button press is still
+                        // fading, or the swell would freeze mid-animation whenever the
+                        // engine itself has nothing to draw -- which is the common case,
+                        // since a capture press produces no scroll and no wave.
+                        val pressAlive = pressedButton.value != null &&
+                            nowMs - pressedAtMs.longValue < WatchTokens.CapturePressMs
+                        if (!pressAlive) pressedButton.value = null
+                        alive = engine.advance(nowMs) or pressAlive
                         frame.intValue++
                     }
                 }
@@ -160,7 +242,6 @@ fun RemoteScreen(
     // allocations every frame -- ~270 a second at 90 Hz, on a screen that is held
     // awake precisely while the user is scrolling. They depend only on density,
     // so they are built once.
-    val density = LocalDensity.current
     val rimStroke = remember(density) {
         Stroke(width = with(density) { WatchTokens.RimStroke.toPx() })
     }
@@ -213,8 +294,112 @@ fun RemoteScreen(
             // tap wait out the threshold plus the link RTT before anything happens.
             // The phone relays the action verbatim; the glasses interpret it.
             .pointerInput(Unit) {
-                detectTapGestures(
-                    onTap = { position ->
+                // Contact feedback fires on press-DOWN, before the gesture is known.
+                //
+                // That ordering is the whole point: the tick reports that the surface
+                // registered the finger, which is true the instant it lands and is what
+                // makes the watch feel responsive. Waiting for the gesture to resolve
+                // put the first sensation up to a full double-tap window after the
+                // touch, which reads as a laggy screen.
+                //
+                // It is deliberately a CONTACT signal and nothing more. It makes no
+                // claim about delivery or acceptance -- those remain the distinct
+                // sensations fired below, once the gesture is known and sent. So a
+                // press produces two buzzes: "I felt you", then "here is what it was".
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+
+                    // CAPTURE BUTTONS, checked before the dead zone: they deliberately live
+                    // out in the rim band the dead zone otherwise discards.
+                    //
+                    // Fired on press-DOWN with no hold window, because these are buttons,
+                    // not gestures -- there is nothing to disambiguate, and making the user
+                    // wait out a hold threshold to take a photo would feel broken. The
+                    // press is then consumed so the release cannot also read as a tap.
+                    val button = captureButtonAt(
+                        down.position.x, down.position.y,
+                        size.width.toFloat(), size.height.toFloat(),
+                        hitRadiusPx = captureHitRadiusPx,
+                    )
+                    if (button != null) {
+                        onCapture(button)
+                        val now = SystemClock.uptimeMillis()
+                        // Visible confirmation ON THE BUTTON ITSELF: it swells and
+                        // fills. A ripple alone was not enough -- the user is looking
+                        // at the control they pressed, so that is where the answer
+                        // belongs.
+                        pressedButton.value = button
+                        pressedAtMs.value = now
+                        if (liveState.value.inputEnabled) {
+                            Haptics.held(view)
+                        } else {
+                            Haptics.refused(view)
+                        }
+                        // Wake the frame loop so the press animation is pumped even
+                        // when nothing else on screen is moving.
+                        wake.intValue++
+                        waitForUpOrCancellation()
+                        return@awaitEachGesture
+                    }
+
+                    // RIM DEAD ZONE. Turning the bezel means dragging a finger around the
+                    // edge of the glass, and that press is a real ACTION_DOWN -- so every
+                    // scroll also started a press here and fired a HOLD once it outlived
+                    // the threshold, which made scrolling impossible.
+                    //
+                    // Only the central disc accepts taps and holds. The rim is reserved
+                    // for the rotary, and a press that starts there is abandoned outright
+                    // (no contact tick either, so touching the rim to scroll stays silent
+                    // rather than promising an action that will never be sent).
+                    //
+                    // Measured from the CENTRE, not from the edges: the display is round,
+                    // so a rectangular inset would leave the diagonal corners live while
+                    // clipping the top and bottom of the usable area.
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    val dx = down.position.x - cx
+                    val dy = down.position.y - cy
+                    val radius = kotlin.math.sqrt(dx * dx + dy * dy)
+                    val liveRadius = (kotlin.math.min(size.width, size.height) / 2f) *
+                        TAP_ZONE_FRACTION
+                    if (radius > liveRadius) {
+                        // Consume the rest of this press so no later stage mistakes the
+                        // release for a tap.
+                        waitForUpOrCancellation()
+                        return@awaitEachGesture
+                    }
+
+                    Haptics.contact(view)
+
+                    // The threshold is read PER PRESS, not captured: the receiver can
+                    // revise it at any time on the status channel, and a value captured
+                    // when this pointerInput was created would pin the watch to whatever
+                    // was current at composition for the rest of the session.
+                    val holdMs = holdThresholdMs().toLong()
+                    var held = false
+                    // Wait out the hold window. A null return means the finger left
+                    // first, so this was a tap and the tap path below handles it.
+                    val up = withTimeoutOrNull(holdMs) { waitForUpOrCancellation() }
+                    if (up == null) {
+                        // Still down at the threshold: this is a hold. It is emitted
+                        // NOW rather than on release, so the gesture confirms itself
+                        // under the finger exactly as the glasses touchpad does.
+                        held = true
+                        onHold()
+                        val now = SystemClock.uptimeMillis()
+                        if (liveState.value.inputEnabled) {
+                            Haptics.held(view)
+                            engine.onWave(now, down.position.x, down.position.y, refusal = false)
+                        } else if (Haptics.refused(view)) {
+                            engine.onWave(now, down.position.x, down.position.y, refusal = true)
+                        }
+                        if (engine.needsWake()) wake.intValue++
+                        // Consume the rest of the press so the release cannot also read
+                        // as a tap. Without this one hold emits HOLD and then SELECT.
+                        waitForUpOrCancellation()
+                    }
+                    if (!held && up != null) {
+                        val position = up.position
                         // The tap is ALWAYS sent, in every state. Whether the
                         // glasses can act on it is their call, not the watch's;
                         // suppressing it here would make the watch lie about a
@@ -256,8 +441,8 @@ fun RemoteScreen(
                             }
                         }
                         if (engine.needsWake()) wake.intValue++
-                    },
-                )
+                    }
+                }
             }
             .drawBehind {
                 // Subscribing the draw to the frame counter. Reading it here is
@@ -269,13 +454,22 @@ fun RemoteScreen(
                 drawRimTrack(rimStroke)
                 drawScrollArc(engine, tint, rimStroke)
                 drawWaves(engine, tint, waveStroke)
+                // Drawn LAST so the buttons interrupt the scroll arc rather than being
+                // painted over by it. They are permanent furniture -- always present,
+                // in every link state -- so there is no condition around this call.
+                drawCaptureButtons(
+                    pressed = pressedButton.value,
+                    pressAgeMs = SystemClock.uptimeMillis() - pressedAtMs.longValue,
+                    recording = recording.value,
+                )
             }
             .semantics {
                 contentDescription = ComplicationCopy.contentDescription(current)
             },
         contentAlignment = Alignment.Center,
     ) {
-        StatusBlock(current, elapsedLabel)
+        // Nothing at all while the link is healthy -- see LinkState.hidesText.
+        if (!current.hidesText) StatusBlock(current, elapsedLabel)
     }
 }
 
@@ -332,10 +526,15 @@ private fun StatusBlock(current: LinkState, elapsedLabel: State<String>) {
 private fun DrawScope.drawRimTrack(stroke: Stroke) {
     val inset = WatchTokens.RimInset.toPx() + WatchTokens.RimStroke.toPx() / 2f
     val d = min(size.width, size.height) - inset * 2f
+    // The track is broken around the buttons, which is what makes them read as PART of
+    // the rim rather than as decals on top of it. Two arcs: the long way round from the
+    // bottom of the video button back to the top of the photo one, and nothing between.
+    val gapStart = WatchTokens.CapturePhotoAngle - WatchTokens.CaptureArcGapHalfSweep
+    val gapEnd = WatchTokens.CaptureVideoAngle + WatchTokens.CaptureArcGapHalfSweep
     drawArc(
         color = WatchTokens.RimTrack,
-        startAngle = 0f,
-        sweepAngle = 360f,
+        startAngle = gapEnd - 90f,
+        sweepAngle = 360f - (gapEnd - gapStart),
         useCenter = false,
         topLeft = Offset(inset, inset),
         size = Size(d, d),
@@ -377,6 +576,135 @@ private fun DrawScope.drawScrollArc(engine: FeedbackEngine, tint: Color, stroke:
         topLeft = Offset(inset, inset),
         size = Size(d, d),
         style = stroke,
+    )
+}
+
+/**
+ * The two capture buttons: circles in the rim on the right, in the ordinary UI ink.
+ *
+ * Each is a filled disc with a ring and a small glyph -- a solid dot for the photo
+ * shutter, a triangle for video. The glyphs are the smallest marks that still read at
+ * this size; anything more detailed becomes a smudge on a 1-inch display.
+ *
+ * A press swells the button and lights its fill for [WatchTokens.CapturePressMs]. That
+ * feedback is on the control itself rather than only in the ripple, because that is where
+ * the user is looking when they press it.
+ */
+private fun DrawScope.drawCaptureButtons(
+    pressed: RemoteInputProtocol.EventType?,
+    pressAgeMs: Long,
+    recording: Boolean,
+) {
+    val baseRadius = WatchTokens.CaptureRadius.toPx()
+    val ringStroke = Stroke(width = WatchTokens.CaptureRingStroke.toPx())
+
+    fun button(angle: Float, type: RemoteInputProtocol.EventType) {
+        val (bx, by) = captureButtonCentre(angle, size.width, size.height)
+        val centre = Offset(bx, by)
+        // The video button becomes a STOP button while recording, and is the one place
+        // colour is spent: it is the only state where doing nothing has a consequence.
+        val isStop = type == RemoteInputProtocol.EventType.VIDEO && recording
+
+        val p = if (pressed == type) {
+            (1f - (pressAgeMs.toFloat() / WatchTokens.CapturePressMs)).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+        val radius = baseRadius * (1f + WatchTokens.CapturePressScale * p)
+        val ink = if (isStop) WatchTokens.Fault else WatchTokens.CaptureRing
+        val glyphInk = if (isStop) WatchTokens.Fault else WatchTokens.CaptureGlyph
+
+        drawCircle(color = WatchTokens.CaptureFill, radius = radius, center = centre)
+        if (isStop) {
+            // A dim red wash so the recording state reads at a glance, without lighting
+            // the whole disc on an OLED held inches from the eye.
+            drawCircle(
+                color = WatchTokens.Fault.copy(alpha = 0.22f),
+                radius = radius,
+                center = centre,
+            )
+        }
+        if (p > 0f) {
+            drawCircle(color = ink.copy(alpha = 0.30f * p), radius = radius, center = centre)
+        }
+        drawCircle(
+            color = ink.copy(alpha = 0.55f + 0.45f * p),
+            radius = radius,
+            center = centre,
+            style = ringStroke,
+        )
+
+        val g = radius * 0.46f
+        when {
+            isStop -> drawStopGlyph(centre, g, glyphInk)
+            type == RemoteInputProtocol.EventType.PHOTO -> drawPhotoGlyph(centre, g, glyphInk)
+            else -> drawVideoGlyph(centre, g, glyphInk)
+        }
+    }
+
+    button(WatchTokens.CapturePhotoAngle, RemoteInputProtocol.EventType.PHOTO)
+    button(WatchTokens.CaptureVideoAngle, RemoteInputProtocol.EventType.VIDEO)
+}
+
+/**
+ * A stills camera: body, viewfinder bump, lens.
+ *
+ * Drawn rather than loaded as a vector asset because the whole glyph is ~14px across on
+ * this display -- at that size the recognisable silhouette has to be tuned by hand against
+ * the pixel grid, and a scaled-down Material icon turns to mush.
+ */
+private fun DrawScope.drawPhotoGlyph(c: Offset, g: Float, ink: Color) {
+    val w = g * 2.0f
+    val h = g * 1.45f
+    // Viewfinder bump on the top left, which is what makes it read as a camera and not
+    // as a plain rounded rectangle.
+    drawRoundRect(
+        color = ink,
+        topLeft = Offset(c.x - w * 0.30f, c.y - h * 0.78f),
+        size = Size(w * 0.30f, h * 0.24f),
+        cornerRadius = androidx.compose.ui.geometry.CornerRadius(g * 0.10f),
+    )
+    drawRoundRect(
+        color = ink,
+        topLeft = Offset(c.x - w / 2f, c.y - h / 2f + h * 0.10f),
+        size = Size(w, h * 0.90f),
+        cornerRadius = androidx.compose.ui.geometry.CornerRadius(g * 0.28f),
+    )
+    // Lens punched out in the fill colour: a hole reads better than an outline here.
+    drawCircle(
+        color = WatchTokens.CaptureFill,
+        radius = g * 0.42f,
+        center = Offset(c.x, c.y + h * 0.06f),
+    )
+}
+
+/** A video camera: body plus the lens barrel jutting right. */
+private fun DrawScope.drawVideoGlyph(c: Offset, g: Float, ink: Color) {
+    val w = g * 1.55f
+    val h = g * 1.25f
+    drawRoundRect(
+        color = ink,
+        topLeft = Offset(c.x - g * 1.05f, c.y - h / 2f),
+        size = Size(w, h),
+        cornerRadius = androidx.compose.ui.geometry.CornerRadius(g * 0.24f),
+    )
+    val path = androidx.compose.ui.graphics.Path().apply {
+        moveTo(c.x + g * 0.58f, c.y)
+        lineTo(c.x + g * 1.12f, c.y - h * 0.46f)
+        lineTo(c.x + g * 1.12f, c.y + h * 0.46f)
+        close()
+    }
+    drawPath(path, color = ink)
+}
+
+/** A stop square. Deliberately the most literal shape available. */
+private fun DrawScope.drawStopGlyph(c: Offset, g: Float, ink: Color) {
+    val s = g * 1.30f
+    drawRoundRect(
+        color = ink,
+        topLeft = Offset(c.x - s / 2f, c.y - s / 2f),
+        size = Size(s, s),
+        cornerRadius = androidx.compose.ui.geometry.CornerRadius(g * 0.18f),
     )
 }
 

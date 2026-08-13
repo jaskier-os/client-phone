@@ -82,6 +82,21 @@ enum class LinkState(
      * for those would be the same category of lie in the opposite direction.
      */
     val isRefusal: Boolean = false,
+
+    /**
+     * Draw NOTHING in the centre of the remote screen for this state.
+     *
+     * True only where everything works. A healthy link needs no words: "Connected" plus a
+     * usage hint is text the user has already read, permanently lit in the middle of a
+     * 1-inch display, and on this waveguide every lit pixel is a distraction. The dial,
+     * the buttons and the haptics already say the link is live. Text is reserved for when
+     * something is WRONG and there is something to do about it.
+     *
+     * Affects the on-screen block only. The complication and the accessibility
+     * description still read [title]/[hint] -- a glanceable tile and a screen reader have
+     * the opposite need.
+     */
+    val hidesText: Boolean = false,
 ) {
 
     /** First run: no phone node has ever been seen. */
@@ -260,6 +275,7 @@ enum class LinkState(
         severity = LinkSeverity.LIVE,
         inputEnabled = true,
         inputConfirmed = true,
+        hidesText = true,
     ),
 
     /** No status frame within the timeout. */
