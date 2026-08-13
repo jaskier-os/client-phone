@@ -44,13 +44,34 @@ class ArStreamActivity : AppCompatActivity() {
     private lateinit var btnGlassesMic: ImageButton
 
     private val state = ArStreamSessionState()
-    private var client: ArStreamClient? = null
-    private var decoder: ScreenStreamDecoder? = null
+
+    // Volatile: written on main, read on the socket threads. Without it a socket thread can keep
+    // seeing a stale null decoder, and onDestroy can miss a client and leak sockets + the P2P
+    // group + the joiner's registered BroadcastReceiver.
+    @Volatile private var client: ArStreamClient? = null
+    @Volatile private var decoder: ScreenStreamDecoder? = null
+
+    /**
+     * Last codec-config (SPS/PPS) frame seen on this connection.
+     *
+     * ScreenStreamDecoder caches nothing and the glasses send config once per connect, so a frame
+     * that arrives before the decoder exists is gone for good -- and a decoder without it renders
+     * black forever with no error anywhere. Keeping it here lets every new decoder be primed.
+     */
+    @Volatile private var lastConfigFrame: ByteArray? = null
+
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private var commandId: String? = null
     private var textureSurface: Surface? = null
-    private var streamStarted = false
+
+    @Volatile private var streamStarted = false
+
+    /** Guards against a duplicate result broadcast spawning a second connect thread. */
+    @Volatile private var resultConsumed = false
+
+    /** Set in onDestroy so work posted from background threads cannot resurrect the session. */
+    @Volatile private var destroyed = false
 
     /** Audio mode we found before taking over, restored verbatim on teardown. */
     private var previousAudioMode: Int? = null
@@ -62,6 +83,10 @@ class ArStreamActivity : AppCompatActivity() {
             val id = intent.getStringExtra("command_id") ?: return
             if (id != commandId) return
             val resultJson = intent.getStringExtra("result") ?: return
+            // One result per session: a duplicate would spawn a second connect thread and orphan
+            // the first client's sockets.
+            if (resultConsumed) return
+            resultConsumed = true
             handleStartResult(resultJson)
         }
     }
@@ -122,10 +147,23 @@ class ArStreamActivity : AppCompatActivity() {
     private fun startDecoder() {
         val surface = textureSurface ?: return
         if (decoder != null) return
-        decoder = ScreenStreamDecoder(VIDEO_WIDTH, VIDEO_HEIGHT).also { it.start(surface) }
+        val d = ScreenStreamDecoder(VIDEO_WIDTH, VIDEO_HEIGHT).also { it.start(surface) }
+        // Replay the cached SPS/PPS before anything else reaches the decoder. Re-requesting from
+        // the glasses is a fallback, not the primary path: the encoder emits config once and a
+        // sync-frame request does not reliably re-emit it.
+        lastConfigFrame?.let { d.feedFrame(it) }
+        decoder = d
         state.onDecoderStarted()
-        // Fresh decoder, no cached parameter sets: ask the glasses to resend them.
         client?.requestKeyframe()
+    }
+
+    /** Called on the video socket thread. */
+    private fun onVideoFrame(frame: ByteArray) {
+        // Header: [1] flags, bit1 = codec config.
+        if (frame.size > 1 && (frame[1].toInt() and 0x02) != 0) {
+            lastConfigFrame = frame
+        }
+        decoder?.feedFrame(frame)
     }
 
     private fun startSession() {
@@ -170,11 +208,14 @@ class ArStreamActivity : AppCompatActivity() {
     }
 
     private fun connectClient(details: JSONObject, videoPort: Int, audioPort: Int) {
-        val c = ArStreamClient(this, state)
-        c.onVideoFrame = { frame -> decoder?.feedFrame(frame) }
+        // Application context, not the Activity: this object outlives onDestroy briefly while its
+        // socket threads unwind, and holding the Activity there would leak the whole view tree.
+        val c = ArStreamClient(applicationContext, state)
+        c.onVideoFrame = { frame -> onVideoFrame(frame) }
         c.onError = { msg -> mainHandler.post { fail(msg) } }
         c.onConnected = {
             mainHandler.post {
+                if (destroyed) return@post
                 streamStarted = true
                 status.visibility = View.GONE
                 startDecoder()
@@ -182,13 +223,22 @@ class ArStreamActivity : AppCompatActivity() {
         }
         client = c
 
+        if (destroyed) {
+            // Raced with teardown: nothing has connected yet, so just drop it.
+            c.disconnect()
+            return
+        }
+
         if (!c.connect(details, videoPort, audioPort)) return
 
-        mainHandler.post {
-            engageVoiceCommunicationMode()
-            // Tap the existing recorder rather than opening a second AudioRecord.
-            ListenerService.arStreamMicSink = { samples -> c.sendMicAudio(samples, samples.size) }
+        // The sink is a @Volatile static -- set it directly rather than posting, so it can never
+        // be installed AFTER onDestroy cleared it (which would leak a live mic tap forever).
+        if (destroyed) {
+            c.disconnect()
+            return
         }
+        ListenerService.arStreamMicSink = { samples -> c.sendMicAudio(samples, samples.size) }
+        mainHandler.post { if (!destroyed) engageVoiceCommunicationMode() }
     }
 
     /**
@@ -260,6 +310,9 @@ class ArStreamActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // Set FIRST: background threads check this before installing the mic sink or touching UI,
+        // so nothing can be resurrected after teardown begins.
+        destroyed = true
         // Unconditional teardown: this is the only guarantee that the glasses camera, both mics
         // and the P2P group are released no matter how the screen was left.
         ListenerService.arStreamMicSink = null
@@ -269,6 +322,7 @@ class ArStreamActivity : AppCompatActivity() {
         decoder?.stop()
         decoder = null
         textureSurface = null
+        lastConfigFrame = null
 
         client?.disconnect()
         client = null

@@ -110,7 +110,11 @@ class WifiDirectJoiner(
         if (!active) return
         active = false
         pendingDetails = null
-        try { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) cm.bindProcessToNetwork(null) } catch (_: Exception) {}
+        // Only undo a bind we actually made. bindProcessToNetwork is process-global, so clearing
+        // it unconditionally would unbind a concurrent file-sync/sideload session mid-transfer.
+        if (bindProcessNetwork) {
+            try { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) cm.bindProcessToNetwork(null) } catch (_: Exception) {}
+        }
         boundNetwork = null
         try { p2p.cancelConnect(channel, null) } catch (_: Exception) {}
         try {

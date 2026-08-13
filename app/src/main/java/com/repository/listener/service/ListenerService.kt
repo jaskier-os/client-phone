@@ -6593,6 +6593,11 @@ class ListenerService : LifecycleService(),
                 phoneBtHost.sendCommand("start_ar_stream", commandId, "{}")
             }
             "stop_ar_stream" -> {
+                // Drop any start callback still waiting on a reply that will now never come,
+                // otherwise the entry lives in the map for the rest of the process.
+                persistentGlassesCallbacks.keys
+                    .filter { it.startsWith("arstream_") }
+                    .forEach { persistentGlassesCallbacks.remove(it) }
                 if (phoneBtHost.isConnected) {
                     phoneBtHost.sendCommand("stop_ar_stream", commandId, "{}")
                 }

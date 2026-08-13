@@ -46,6 +46,15 @@ class ArStreamClient(
     private val outboundAudio = LinkedBlockingQueue<ByteArray>(AUDIO_QUEUE_CAPACITY)
 
     /**
+     * Control frames (mute, keyframe, stop) ride a separate queue that is drained first and never
+     * evicted. On the shared queue an overflow drop could silently discard a mute -- leaving the
+     * far end transmitting after the user muted it.
+     */
+    private val outboundControl = LinkedBlockingQueue<ByteArray>()
+
+    private var audioRecvThread: Thread? = null
+
+    /**
      * Join the group and connect. Blocking -- call from a background thread.
      *
      * @param details the `details` object from the glasses' start_ar_stream result.
@@ -85,7 +94,21 @@ class ArStreamClient(
             return false
         }
 
-        val network = joiner.p2pNetwork
+        // The p2p Network often is not registered with ConnectivityManager at the instant the
+        // CONNECTION_CHANGED callback fires. Never proceed without it: bindSocket(null) is a
+        // silent no-op, and the socket would then dial 192.168.49.1 over cellular/VPN and fail
+        // with a confusing timeout instead of a clear error.
+        var network = joiner.p2pNetwork
+        val deadline = System.currentTimeMillis() + NETWORK_WAIT_MS
+        while (network == null && System.currentTimeMillis() < deadline) {
+            Thread.sleep(NETWORK_POLL_MS)
+            network = joiner.p2pNetwork
+        }
+        if (network == null) {
+            joiner.close()
+            onError?.invoke("joined the group but the WiFi-Direct network never appeared")
+            return false
+        }
         running.set(true)
 
         return try {
@@ -95,7 +118,7 @@ class ArStreamClient(
 
             startPlayback()
             thread(name = "ArStream-videoRecv") { videoLoop() }
-            thread(name = "ArStream-audioRecv") { audioLoop() }
+            audioRecvThread = thread(name = "ArStream-audioRecv") { audioLoop() }
             thread(name = "ArStream-audioSend") { audioSendLoop() }
 
             // The decoder caches no SPS/PPS, so ask for config + IDR right away rather than
@@ -112,10 +135,11 @@ class ArStreamClient(
         }
     }
 
-    private fun openSocket(network: Network?, ip: String, port: Int): Socket {
+    private fun openSocket(network: Network, ip: String, port: Int): Socket {
         val s = Socket()
-        // Bind THIS socket to the p2p network, leaving the process default untouched.
-        network?.bindSocket(s)
+        // Bind THIS socket to the p2p network, leaving the process default (and therefore the
+        // orchestrator WebSocket) untouched for the whole session.
+        network.bindSocket(s)
         s.tcpNoDelay = true
         s.connect(InetSocketAddress(ip, port), CONNECT_TIMEOUT_MS)
         return s
@@ -198,7 +222,8 @@ class ArStreamClient(
                 // does not play after the fact.
                 if (!state.shouldAcceptGlassesAudio()) continue
                 val pcm = ArStreamProtocol.decodeAudio(body)
-                track?.write(pcm, 0, pcm.size)
+                // NON_BLOCKING so teardown is never stuck behind a full playback buffer.
+                track?.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
             } catch (e: Exception) {
                 if (running.get()) LogCollector.e(TAG, "audio stream ended: ${e.message}")
                 break
@@ -208,18 +233,23 @@ class ArStreamClient(
 
     private fun audioSendLoop() {
         while (running.get()) {
-            val frame = try {
+            // Control first, always: a mute must not wait behind queued audio.
+            val frame = outboundControl.poll() ?: try {
                 outboundAudio.poll(POLL_MS, TimeUnit.MILLISECONDS) ?: continue
             } catch (_: InterruptedException) {
                 break
             }
-            val out = audioOut ?: continue
-            try {
-                out.write(frame)
-                out.flush()
-            } catch (e: Exception) {
-                if (running.get()) LogCollector.e(TAG, "audio send failed: ${e.message}")
-            }
+            writeFrame(frame)
+        }
+    }
+
+    private fun writeFrame(frame: ByteArray) {
+        val out = audioOut ?: return
+        try {
+            out.write(frame)
+            out.flush()
+        } catch (e: Exception) {
+            if (running.get()) LogCollector.e(TAG, "audio send failed: ${e.message}")
         }
     }
 
@@ -231,19 +261,20 @@ class ArStreamClient(
 
     fun setPhoneMicMuted(muted: Boolean) {
         state.setPhoneMicMuted(muted)
-        offer(ArStreamProtocol.frameControl(ArStreamProtocol.CTRL_MUTE_PHONE_MIC, muted))
+        outboundControl.offer(ArStreamProtocol.frameControl(ArStreamProtocol.CTRL_MUTE_PHONE_MIC, muted))
     }
 
     fun setGlassesMicMuted(muted: Boolean) {
         state.setGlassesMicMuted(muted)
-        offer(ArStreamProtocol.frameControl(ArStreamProtocol.CTRL_MUTE_GLASSES_MIC, muted))
+        outboundControl.offer(ArStreamProtocol.frameControl(ArStreamProtocol.CTRL_MUTE_GLASSES_MIC, muted))
     }
 
     /** Ask for a fresh config + IDR, e.g. after the TextureView Surface was recreated. */
     fun requestKeyframe() {
-        offer(ArStreamProtocol.frameControl(ArStreamProtocol.CTRL_REQUEST_KEYFRAME, true))
+        outboundControl.offer(ArStreamProtocol.frameControl(ArStreamProtocol.CTRL_REQUEST_KEYFRAME, true))
     }
 
+    /** Drop the oldest audio when the link cannot keep up; never blocks the mic callback. */
     private fun offer(frame: ByteArray) {
         if (!outboundAudio.offer(frame)) {
             outboundAudio.poll()
@@ -252,25 +283,37 @@ class ArStreamClient(
     }
 
     fun disconnect() {
-        if (!running.getAndSet(false)) {
+        if (!running.get()) {
             // Still make sure a half-open join is released.
             try { joiner.close() } catch (_: Exception) {}
             return
         }
-        try { outboundAudio.put(ArStreamProtocol.frameControl(ArStreamProtocol.CTRL_STOP, true)) } catch (_: Exception) {}
-        try { audioOut?.flush() } catch (_: Exception) {}
+        // Send STOP while the socket is still up and the send loop still running -- writing it
+        // after clearing `running` would queue it into a loop that has already exited.
+        writeFrame(ArStreamProtocol.frameControl(ArStreamProtocol.CTRL_STOP, true))
 
+        running.set(false)
+
+        // Closing the sockets is what unblocks the readers parked in readInt().
         try { videoSocket?.close() } catch (_: Exception) {}
         try { audioSocket?.close() } catch (_: Exception) {}
         videoSocket = null
         audioSocket = null
         audioOut = null
 
+        // Join the receive thread before releasing the track: it may be inside track.write(),
+        // which closing the socket does NOT interrupt, and releasing under it would crash native.
+        try { audioRecvThread?.join(AUDIO_JOIN_TIMEOUT_MS) } catch (_: InterruptedException) {}
+        audioRecvThread = null
+
+        try { track?.pause() } catch (_: Exception) {}
+        try { track?.flush() } catch (_: Exception) {}
         try { track?.stop() } catch (_: Exception) {}
         try { track?.release() } catch (_: Exception) {}
         track = null
 
         outboundAudio.clear()
+        outboundControl.clear()
         try { joiner.close() } catch (e: Exception) { LogCollector.e(TAG, "joiner close: ${e.message}") }
         LogCollector.i(TAG, "disconnected")
     }
@@ -281,5 +324,10 @@ class ArStreamClient(
         const val CONNECT_TIMEOUT_MS = 10_000
         const val AUDIO_QUEUE_CAPACITY = 100
         const val POLL_MS = 200L
+        const val AUDIO_JOIN_TIMEOUT_MS = 500L
+
+        /** The p2p Network can lag the connection callback by a moment. */
+        const val NETWORK_WAIT_MS = 3_000L
+        const val NETWORK_POLL_MS = 100L
     }
 }
