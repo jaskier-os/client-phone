@@ -34,4 +34,10 @@
     <string name="config_map_provider_hint">Map provider</string>
     <string name="phone_empty">No calls found</string>
     <string name="sherlock_search">Sherlock</string>
+    <string name="ar_stream_tile">AR Stream</string>
+    <string name="ar_stream_connecting">Connecting to glasses...</string>
+    <string name="ar_stream_phone_mic_on">Phone mic on</string>
+    <string name="ar_stream_phone_mic_off">Phone mic muted</string>
+    <string name="ar_stream_glasses_mic_on">Glasses mic on</string>
+    <string name="ar_stream_glasses_mic_off">Glasses mic muted</string>
 </resources>

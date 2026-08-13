@@ -158,6 +158,7 @@ class ListenerService : LifecycleService(),
         const val ACTION_ADB_DISPATCH = "com.repository.listener.ADB_DISPATCH"
 
         const val ACTION_RECORDING_RESULT = "com.repository.listener.RECORDING_RESULT"
+        const val ACTION_AR_STREAM_RESULT = "com.repository.listener.AR_STREAM_RESULT"
         const val ACTION_TELEPROMPTER_STATE = "com.repository.listener.TELEPROMPTER_STATE"
 
         const val ACTION_TRANSLATION_STATE = "com.repository.listener.TRANSLATION_STATE"
@@ -417,6 +418,12 @@ class ListenerService : LifecycleService(),
 
         // Direct callback for mouse events (no broadcast overhead)
         @Volatile var mouseEventListener: ((ByteArray) -> Unit)? = null
+
+        /**
+         * Live AR stream uplink tap, set by ArStreamActivity while a session is open.
+         * Receives the same 16 kHz mono PCM16 chunks the wake-word pipeline consumes.
+         */
+        @Volatile var arStreamMicSink: ((ShortArray) -> Unit)? = null
 
         // Direct callback for keyboard events (no broadcast overhead)
         @Volatile var keyboardEventListener: ((ByteArray) -> Unit)? = null
@@ -3087,7 +3094,16 @@ class ListenerService : LifecycleService(),
         phoneBtHost.inputRfcommClient.onSinkState = { attached ->
             watchInputBridge?.setGlassesSinkAttached(attached)
         }
-        phoneBtHost.inputRfcommClient.onRouterStatus = { _, sinkAttached, _ ->
+        // `sessionOpen` is NOT discarded here, and the underscore that used to stand in
+        // for it was the last mile of a permanent deadlock. The glasses hold the live
+        // session in memory while persisting only the replay high-water mark, so after
+        // a glasses restart they correctly reject every frame for a session they hold
+        // no OPEN for -- and the watch cannot discover that on its own, because its own
+        // keepalive keeps succeeding and so its silence-based re-announce trigger never
+        // fires. The glasses were already reporting the fact; the phone parsed it and
+        // threw it away one line short of the watch.
+        phoneBtHost.inputRfcommClient.onRouterStatus = { sessionOpen, sinkAttached, _ ->
+            watchInputBridge?.setGlassesSessionOpen(sessionOpen)
             watchInputBridge?.setGlassesSinkAttached(sinkAttached)
         }
         // The glasses' UI received input and REFUSED it. Forwarded so the watch can say
@@ -3095,6 +3111,15 @@ class ListenerService : LifecycleService(),
         // glasses' internal flash while the watch went on showing "Connected".
         phoneBtHost.inputRfcommClient.onRefusal = { reason, refusedTotal ->
             watchInputBridge?.setGlassesRefusal(reason, refusedTotal)
+        }
+        // The glasses' own hold threshold, relayed so the watch's press timer matches the
+        // physical touchpad instead of a frozen copy of the number that can drift from it.
+        phoneBtHost.inputRfcommClient.onHoldThreshold = { holdMs ->
+            watchInputBridge?.setGlassesHoldMs(holdMs)
+        }
+        // Opaque glasses state, copied to the watch. Do NOT interpret the bits here.
+        phoneBtHost.inputRfcommClient.onDeviceState = { bits ->
+            watchInputBridge?.setGlassesDeviceState(bits)
         }
         phoneBtHost.onGlassesCommandResult = { requestId, result ->
             onGlassesCommandResult(requestId, result)
@@ -3903,6 +3928,10 @@ class ListenerService : LifecycleService(),
         if (phoneChunkDbgCount % 500 == 1L) {
             LogCollector.i(TAG, "onChunk #$phoneChunkDbgCount: state=$state bt=${phoneBtHost.isConnected} screenOn=$isGlassesScreenOn")
         }
+        // Live AR stream uplink. AudioRecorder is a singleton with one ChunkListener slot, and a
+        // second AudioRecord on MIC would both contend and defeat the AEC attached to this
+        // session -- so the stream taps the existing chunks rather than opening its own.
+        arStreamMicSink?.invoke(samples)
         // Two-way mode: phone mic is NOT used anymore -- the glasses inward mic
         // (CH_AUDIO_DATA_INWARD) replaces it. Audio arrives via BT and is fed to
         // azurePhoneMicSession in onGlassesInwardAudioData().
@@ -5993,6 +6022,15 @@ class ListenerService : LifecycleService(),
 
     // --- ADB Command Dispatch ---
 
+    /** Carries the glasses' start_ar_stream reply (WiFi-Direct details + ports) to ArStreamActivity. */
+    private fun broadcastArStreamResult(commandId: String, resultJson: String) {
+        sendBroadcast(Intent(ACTION_AR_STREAM_RESULT).apply {
+            setPackage(packageName)
+            putExtra("command_id", commandId)
+            putExtra("result", resultJson)
+        })
+    }
+
     private fun broadcastRecordingResult(commandId: String, success: Boolean, message: String) {
         sendBroadcast(Intent(ACTION_RECORDING_RESULT).apply {
             setPackage(packageName)
@@ -6538,6 +6576,27 @@ class ListenerService : LifecycleService(),
                 AdbResultWriter.writeSuccess(this, commandId, type, JSONObject().put("message", "$type sent"))
             }
 
+            "start_ar_stream" -> {
+                if (!phoneBtHost.isConnected) {
+                    broadcastArStreamResult(commandId, JSONObject().apply {
+                        put("success", false)
+                        put("error", "Glasses not connected")
+                    }.toString())
+                    return
+                }
+                // One-shot: the glasses reply carries the WiFi-Direct details and ports the
+                // ArStreamActivity needs to connect.
+                persistentGlassesCallbacks[commandId] = { result ->
+                    persistentGlassesCallbacks.remove(commandId)
+                    broadcastArStreamResult(commandId, result.toString())
+                }
+                phoneBtHost.sendCommand("start_ar_stream", commandId, "{}")
+            }
+            "stop_ar_stream" -> {
+                if (phoneBtHost.isConnected) {
+                    phoneBtHost.sendCommand("stop_ar_stream", commandId, "{}")
+                }
+            }
             "start_teleprompter" -> {
                 if (!phoneBtHost.isConnected) {
                     broadcastTeleprompterState(commandId, "stopped", 0f, 3)

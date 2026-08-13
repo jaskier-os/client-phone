@@ -83,6 +83,16 @@
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:theme="@style/Theme.Listener" />
 
+        <!-- Live glasses AR view. Landscape to match the composited 16:9 stream. -->
+        <activity
+            android:name=".ui.ArStreamActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:excludeFromRecents="true"
+            android:screenOrientation="landscape"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+            android:theme="@style/Theme.Listener" />
+
 
         <activity
             android:name=".ui.AudioRecordingsActivity"

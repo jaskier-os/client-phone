@@ -38,6 +38,7 @@ class GlassesAppsFragment : Fragment() {
 
     private lateinit var tileRecordVideo: MaterialCardView
     private lateinit var tileRecordArScreen: MaterialCardView
+    private lateinit var tileArStream: MaterialCardView
     private lateinit var tileTranslation: MaterialCardView
     private lateinit var tileTeleprompter: MaterialCardView
     private lateinit var tileAudioRecordings: MaterialCardView
@@ -287,6 +288,7 @@ class GlassesAppsFragment : Fragment() {
         // Tiles
         tileRecordVideo = view.findViewById(R.id.tileRecordVideo)
         tileRecordArScreen = view.findViewById(R.id.tileRecordArScreen)
+        tileArStream = view.findViewById(R.id.tileArStream)
         tileTranslation = view.findViewById(R.id.tileTranslation)
         tileTeleprompter = view.findViewById(R.id.tileTeleprompter)
 
@@ -299,6 +301,10 @@ class GlassesAppsFragment : Fragment() {
 
         tileRecordVideo.setOnClickListener { gateTileLaunch { startRecording("record_video") } }
         tileRecordArScreen.setOnClickListener { gateTileLaunch { startRecording("record_ar_screen") } }
+        tileArStream.setOnClickListener {
+            // The Activity owns the whole session (BT command, WiFi-Direct, sockets, audio).
+            gateTileLaunch { startActivity(Intent(requireContext(), ArStreamActivity::class.java)) }
+        }
         tileTranslation.setOnClickListener { gateTileLaunch { showTranslationConfigDialog() } }
         tileTeleprompter.setOnClickListener { gateTileLaunch { showTeleprompterDialog() } }
         tileAudioRecordings.setOnClickListener {

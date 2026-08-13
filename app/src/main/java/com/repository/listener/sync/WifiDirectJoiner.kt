@@ -19,7 +19,19 @@ import android.os.Looper
  * so HTTP requests route over it.
  */
 @SuppressLint("MissingPermission")
-class WifiDirectJoiner(private val context: Context) {
+class WifiDirectJoiner(
+    private val context: Context,
+    /**
+     * When true (the default, used by file sync and sideload) the whole process is bound to the
+     * P2P network so every socket routes over p2p0.
+     *
+     * Long-lived callers MUST pass false and bind their own sockets via [p2pNetwork] instead.
+     * A process-wide bind lasts as long as the session, so for a call-length AR stream it would
+     * also drag the orchestrator WebSocket and every other network user onto a link with no
+     * internet route -- which presents as a server outage, not as a local binding decision.
+     */
+    private val bindProcessNetwork: Boolean = true,
+) {
 
     companion object { private const val TAG = "WifiDirectJoiner" }
 
@@ -54,9 +66,16 @@ class WifiDirectJoiner(private val context: Context) {
             p2p.requestConnectionInfo(channel) { info ->
                 if (info != null && info.groupFormed && !info.isGroupOwner) {
                     val ip = info.groupOwnerAddress?.hostAddress ?: return@requestConnectionInfo
-                    remoteLog?.invoke("$TAG: joined group, owner ip=$ip -- binding process network")
-                    // Bind the calling process to the P2P network so HTTP GETs route over p2p0.
-                    bindProcessToP2pNetwork()
+                    if (bindProcessNetwork) {
+                        remoteLog?.invoke("$TAG: joined group, owner ip=$ip -- binding process network")
+                        // Bind the calling process to the P2P network so HTTP GETs route over p2p0.
+                        bindProcessToP2pNetwork()
+                    } else {
+                        // Resolve the network but leave the process default alone; the caller
+                        // binds its own sockets.
+                        boundNetwork = findP2pNetwork()
+                        remoteLog?.invoke("$TAG: joined group, owner ip=$ip -- per-socket bind mode")
+                    }
                     onReady?.invoke(ip)
                 }
             }
@@ -171,22 +190,39 @@ class WifiDirectJoiner(private val context: Context) {
     private fun bindProcessToP2pNetwork() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
         try {
-            val nets = cm.allNetworks
-            for (n in nets) {
-                val caps = cm.getNetworkCapabilities(n) ?: continue
-                val link = cm.getLinkProperties(n) ?: continue
-                val iface = link.interfaceName ?: ""
-                val isWifi = caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
-                if (isWifi && iface.startsWith("p2p")) {
-                    cm.bindProcessToNetwork(n)
-                    boundNetwork = n
-                    remoteLog?.invoke("$TAG: bound process to network iface=$iface")
-                    return
-                }
+            val n = findP2pNetwork()
+            if (n == null) {
+                remoteLog?.invoke("$TAG: no p2p* interface found in active networks")
+                return
             }
-            remoteLog?.invoke("$TAG: no p2p* interface found in active networks")
+            cm.bindProcessToNetwork(n)
+            boundNetwork = n
+            remoteLog?.invoke("$TAG: bound process to p2p network")
         } catch (e: Exception) {
             remoteLog?.invoke("$TAG: bindProcessToP2pNetwork failed: ${e.message}")
+        }
+    }
+
+    /**
+     * The P2P [android.net.Network], for callers that bind individual sockets rather than the
+     * whole process. Available once [onReady] has fired.
+     */
+    val p2pNetwork: android.net.Network?
+        get() = boundNetwork ?: findP2pNetwork()
+
+    private fun findP2pNetwork(): android.net.Network? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
+        return try {
+            cm.allNetworks.firstOrNull { n ->
+                val caps = cm.getNetworkCapabilities(n)
+                val link = cm.getLinkProperties(n)
+                caps != null && link != null &&
+                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) &&
+                    (link.interfaceName ?: "").startsWith("p2p")
+            }
+        } catch (e: Exception) {
+            remoteLog?.invoke("$TAG: findP2pNetwork failed: ${e.message}")
+            null
         }
     }
 
