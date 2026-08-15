@@ -177,7 +177,10 @@ object LogCollector {
         "GlassesFragment",
         "TelegramNotif",
         "AudioRecordingList",
-        "AudioViewer"
+        "AudioViewer",
+        // Live AR stream: glasses camera+HUD over WiFi-Direct plus two-way audio.
+        "ArStreamClient",
+        "ArStreamActivity"
     )
 
     /** Tags for glasses file sync. */

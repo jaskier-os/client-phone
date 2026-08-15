@@ -3,6 +3,7 @@ package com.repository.listener.arstream
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioTrack
 import android.net.Network
 import com.repository.listener.sync.WifiDirectJoiner
@@ -33,6 +34,14 @@ class ArStreamClient(
     var onConnected: (() -> Unit)? = null
     var onError: ((String) -> Unit)? = null
 
+    /**
+     * Taps on the two audio directions, for the session recorder. They fire only for audio that is
+     * actually played / actually sent, so a muted side contributes nothing and the recording shows
+     * the mute exactly as the user heard it.
+     */
+    var onUplinkAudio: ((ShortArray) -> Unit)? = null
+    var onPhoneMicAudio: ((ShortArray, Int) -> Unit)? = null
+
     // Per-socket bind, NOT bindProcessToNetwork: a call-length process bind would drag the
     // orchestrator WebSocket onto the p2p link, which has no internet route.
     private val joiner = WifiDirectJoiner(context, bindProcessNetwork = false)
@@ -43,6 +52,9 @@ class ArStreamClient(
     private var track: AudioTrack? = null
 
     private val running = AtomicBoolean(false)
+
+    /** Latches on the first disconnect so concurrent callers cannot race the teardown. */
+    private val closed = AtomicBoolean(false)
     private val outboundAudio = LinkedBlockingQueue<ByteArray>(AUDIO_QUEUE_CAPACITY)
 
     /**
@@ -53,6 +65,17 @@ class ArStreamClient(
     private val outboundControl = LinkedBlockingQueue<ByteArray>()
 
     private var audioRecvThread: Thread? = null
+
+    // Traffic counters, logged periodically. Without these a silent link is indistinguishable
+    // from a stalled decoder, which is exactly the ambiguity that wastes debugging time.
+    @Volatile private var videoFrameCount = 0L
+    @Volatile private var audioFrameCount = 0L
+    @Volatile private var micFrameCount = 0L
+    @Volatile private var samplesWritten = 0L
+
+    /** Samples the AudioTrack refused because its buffer was full. Silent truncation otherwise. */
+    @Volatile private var shortWrites = 0L
+    @Volatile private var droppedSamples = 0L
 
     /**
      * Join the group and connect. Blocking -- call from a background thread.
@@ -68,6 +91,7 @@ class ArStreamClient(
             return false
         }
 
+        LogCollector.i(TAG, "connect: joining group ip=$ip video=$videoPort audio=$audioPort")
         val joined = LinkedBlockingQueue<Pair<Boolean, String>>()
         joiner.remoteLog = { LogCollector.i(TAG, it) }
         joiner.onReady = { joined.offer(true to it) }
@@ -94,26 +118,30 @@ class ArStreamClient(
             return false
         }
 
-        // The p2p Network often is not registered with ConnectivityManager at the instant the
-        // CONNECTION_CHANGED callback fires. Never proceed without it: bindSocket(null) is a
-        // silent no-op, and the socket would then dial 192.168.49.1 over cellular/VPN and fail
-        // with a confusing timeout instead of a clear error.
-        var network = joiner.p2pNetwork
-        val deadline = System.currentTimeMillis() + NETWORK_WAIT_MS
-        while (network == null && System.currentTimeMillis() < deadline) {
-            Thread.sleep(NETWORK_POLL_MS)
-            network = joiner.p2pNetwork
-        }
-        if (network == null) {
+        // Binding to a p2p Network is best-effort, NOT a precondition.
+        //
+        // This hardware runs the group owner on 192.168.43.1 and reuses wlan0
+        // (`p2p_no_group_iface=1`), so there is no separate p2p Network to resolve -- the existing
+        // file-sync and sideload paths have always found none and reach the glasses over the
+        // routing table regardless. Requiring one here blocked every session on this device.
+        val network = joiner.p2pNetwork
+        LogCollector.i(
+            TAG,
+            if (network != null) "binding sockets to the p2p network"
+            else "no distinct p2p network (group shares wlan0) -- connecting via the routing table"
+        )
+        // A disconnect may have landed while we were joining; do not open sockets nobody will close.
+        if (closed.get()) {
             joiner.close()
-            onError?.invoke("joined the group but the WiFi-Direct network never appeared")
             return false
         }
         running.set(true)
 
         return try {
-            videoSocket = openSocket(network, ip, videoPort)
-            audioSocket = openSocket(network, ip, audioPort)
+            // Retry like GlassesSyncClient does: the group is formed but not always immediately
+            // routable, and the first connect can refuse before the GO's listener is reachable.
+            videoSocket = openSocketWithRetry(network, ip, videoPort)
+            audioSocket = openSocketWithRetry(network, ip, audioPort)
             audioOut = audioSocket!!.getOutputStream()
 
             startPlayback()
@@ -135,11 +163,31 @@ class ArStreamClient(
         }
     }
 
-    private fun openSocket(network: Network, ip: String, port: Int): Socket {
+    private fun openSocketWithRetry(network: Network?, ip: String, port: Int): Socket {
+        var last: Exception? = null
+        for (attempt in 1..CONNECT_ATTEMPTS) {
+            try {
+                return openSocket(network, ip, port)
+            } catch (e: Exception) {
+                last = e
+                LogCollector.i(TAG, "connect $ip:$port attempt $attempt failed: ${e.message}")
+                if (attempt < CONNECT_ATTEMPTS) Thread.sleep(CONNECT_RETRY_BASE_MS * attempt)
+            }
+        }
+        throw last ?: java.io.IOException("connect to $ip:$port failed")
+    }
+
+    private fun openSocket(network: Network?, ip: String, port: Int): Socket {
         val s = Socket()
-        // Bind THIS socket to the p2p network, leaving the process default (and therefore the
-        // orchestrator WebSocket) untouched for the whole session.
-        network.bindSocket(s)
+        // Per-socket bind when a distinct p2p Network exists; this leaves the process default (and
+        // therefore the orchestrator WebSocket) untouched, unlike the process-wide bind the
+        // sideload path uses. When there is no such Network the routing table already reaches the
+        // group owner -- that is how file sync has always worked here.
+        try {
+            network?.bindSocket(s)
+        } catch (e: Exception) {
+            LogCollector.i(TAG, "bindSocket failed (${e.message}); continuing unbound")
+        }
         s.tcpNoDelay = true
         s.connect(InetSocketAddress(ip, port), CONNECT_TIMEOUT_MS)
         return s
@@ -154,8 +202,12 @@ class ArStreamClient(
         track = AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    // Voice-communication so the platform routes and processes this as a call leg.
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    // USAGE_MEDIA -> STREAM_MUSIC -> loudspeaker at normal media volume.
+                    // USAGE_VOICE_COMMUNICATION would land on STREAM_VOICE_CALL, which without a
+                    // real call routes to the EARPIECE at call volume and reads as silence. This
+                    // gives up the platform voice-comm AEC; the glasses run WebRtcAecm internally,
+                    // and inaudible-with-AEC is worse than audible-without.
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
@@ -170,6 +222,24 @@ class ArStreamClient(
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
         track?.play()
+        logAudioRouting()
+    }
+
+    /**
+     * One-shot routing diagnostic. "Which stream did the platform pick, and is its volume zero"
+     * is invisible from every other log line, and it is the whole question when audio is silent.
+     */
+    private fun logAudioRouting() {
+        val t = track
+        val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        val streamType = try { t?.streamType } catch (_: Exception) { null }
+        LogCollector.i(
+            TAG,
+            "routing usage=MEDIA streamType=$streamType (STREAM_MUSIC=${AudioManager.STREAM_MUSIC}) " +
+                "musicVolume=${am?.getStreamVolume(AudioManager.STREAM_MUSIC)}/" +
+                "${am?.getStreamMaxVolume(AudioManager.STREAM_MUSIC)} " +
+                "audioMode=${am?.mode} trackState=${t?.state} playState=${t?.playState}"
+        )
     }
 
     private fun videoLoop() {
@@ -189,6 +259,11 @@ class ArStreamClient(
                 }
                 val body = ByteArray(len)
                 input.readFully(body)
+                videoFrameCount++
+                if (videoFrameCount == 1L || videoFrameCount % 150L == 0L) {
+                    val flags = if (body.size > 1) body[1].toInt() and 0xFF else -1
+                    LogCollector.i(TAG, "video frame #$videoFrameCount len=$len flags=$flags")
+                }
                 onVideoFrame?.invoke(body)
             } catch (e: Exception) {
                 if (running.get()) {
@@ -222,8 +297,35 @@ class ArStreamClient(
                 // does not play after the fact.
                 if (!state.shouldAcceptGlassesAudio()) continue
                 val pcm = ArStreamProtocol.decodeAudio(body)
+                audioFrameCount++
+                onUplinkAudio?.invoke(pcm)
                 // NON_BLOCKING so teardown is never stuck behind a full playback buffer.
-                track?.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING)
+                val written = track?.write(pcm, 0, pcm.size, AudioTrack.WRITE_NON_BLOCKING) ?: 0
+                if (written > 0) samplesWritten += written
+                if (written < pcm.size) {
+                    // Ignoring the return silently truncates playback, which presents as chopped
+                    // audio and is indistinguishable from a routing failure without this counter.
+                    shortWrites++
+                    droppedSamples += (pcm.size - written.coerceAtLeast(0))
+                    if (shortWrites == 1L || shortWrites % 100L == 0L) {
+                        LogCollector.i(
+                            TAG,
+                            "short write #$shortWrites wrote=$written/${pcm.size} droppedSamples=$droppedSamples"
+                        )
+                    }
+                }
+                if (audioFrameCount == 1L || audioFrameCount % 200L == 0L) {
+                    var peak = 0
+                    for (s in pcm) { val a = kotlin.math.abs(s.toInt()); if (a > peak) peak = a }
+                    // playbackHeadPosition proves the samples are being CONSUMED, not just accepted:
+                    // a track routed nowhere still takes writes but its head never advances.
+                    val head = try { track?.playbackHeadPosition } catch (_: Exception) { null }
+                    LogCollector.i(
+                        TAG,
+                        "uplink audio #$audioFrameCount samples=${pcm.size} peak=$peak " +
+                            "head=$head written=$samplesWritten shortWrites=$shortWrites"
+                    )
+                }
             } catch (e: Exception) {
                 if (running.get()) LogCollector.e(TAG, "audio stream ended: ${e.message}")
                 break
@@ -256,6 +358,13 @@ class ArStreamClient(
     /** Feed phone mic PCM (16 kHz mono) for the glasses wearer to hear. */
     fun sendMicAudio(pcm: ShortArray, length: Int) {
         if (!running.get() || !state.shouldSendPhoneMic()) return
+        onPhoneMicAudio?.invoke(pcm, length)
+        micFrameCount++
+        if (micFrameCount == 1L || micFrameCount % 200L == 0L) {
+            var peak = 0
+            for (i in 0 until length) { val a = kotlin.math.abs(pcm[i].toInt()); if (a > peak) peak = a }
+            LogCollector.i(TAG, "phone mic uplink #$micFrameCount len=$length peak=$peak")
+        }
         offer(ArStreamProtocol.frameAudio(pcm, length))
     }
 
@@ -282,7 +391,15 @@ class ArStreamClient(
         }
     }
 
+    /**
+     * Tear the session down. Safe to call from any thread and any number of times, but MUST NOT be
+     * called from the main thread: it writes to a socket and joins a thread.
+     */
     fun disconnect() {
+        // CAS, not a plain read: onDestroy and an error path can call this concurrently, and two
+        // callers both proceeding would release the AudioTrack while the other is still writing.
+        if (!closed.compareAndSet(false, true)) return
+
         if (!running.get()) {
             // Still make sure a half-open join is released.
             try { joiner.close() } catch (_: Exception) {}
@@ -326,8 +443,8 @@ class ArStreamClient(
         const val POLL_MS = 200L
         const val AUDIO_JOIN_TIMEOUT_MS = 500L
 
-        /** The p2p Network can lag the connection callback by a moment. */
-        const val NETWORK_WAIT_MS = 3_000L
-        const val NETWORK_POLL_MS = 100L
+        /** Same 3-attempt / linear-backoff shape GlassesSyncClient uses for its pulls. */
+        const val CONNECT_ATTEMPTS = 3
+        const val CONNECT_RETRY_BASE_MS = 500L
     }
 }

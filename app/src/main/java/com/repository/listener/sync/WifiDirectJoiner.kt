@@ -72,9 +72,13 @@ class WifiDirectJoiner(
                         bindProcessToP2pNetwork()
                     } else {
                         // Resolve the network but leave the process default alone; the caller
-                        // binds its own sockets.
-                        boundNetwork = findP2pNetwork()
-                        remoteLog?.invoke("$TAG: joined group, owner ip=$ip -- per-socket bind mode")
+                        // binds its own sockets. Pass the owner IP so the lookup can match by
+                        // route rather than interface name.
+                        boundNetwork = findP2pNetwork(ip)
+                        remoteLog?.invoke(
+                            "$TAG: joined group, owner ip=$ip -- per-socket bind mode, " +
+                                "network=${if (boundNetwork != null) "resolved" else "NOT FOUND"}"
+                        )
                     }
                     onReady?.invoke(ip)
                 }
@@ -187,9 +191,12 @@ class WifiDirectJoiner(
     }
 
     /**
-     * Bind the process's default network to the P2P network so HTTP GETs in
-     * GlassesSyncClient reach 192.168.49.1 via p2p0 rather than cellular/primary WiFi.
-     * We enumerate active networks, find the one with TRANSPORT_WIFI + p2p interface name.
+     * Bind the process's default network to the P2P network so HTTP GETs in GlassesSyncClient
+     * reach the group owner via the p2p link rather than cellular/primary WiFi.
+     *
+     * Best-effort by design: on this hardware the group reuses wlan0, so no distinct p2p Network
+     * exists and this is a no-op -- file sync and sideload have always worked that way, reaching
+     * the owner over the normal routing table.
      */
     private fun bindProcessToP2pNetwork() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
@@ -212,22 +219,62 @@ class WifiDirectJoiner(
      * whole process. Available once [onReady] has fired.
      */
     val p2pNetwork: android.net.Network?
-        get() = boundNetwork ?: findP2pNetwork()
+        get() = boundNetwork ?: findP2pNetwork(pendingDetails?.ip)
 
-    private fun findP2pNetwork(): android.net.Network? {
+    /**
+     * The Network carrying the WiFi-Direct group.
+     *
+     * Identified by the ROUTE to the group owner, not by interface name. On this hardware the
+     * group owner sits at 192.168.43.1 and the group reuses `wlan0` (the firmware runs with
+     * `p2p_no_group_iface=1`), so the obvious `interfaceName.startsWith("p2p")` test matches
+     * nothing and the join silently yields no usable Network. Measured on-device: the phone
+     * logged "joined group, owner ip=192.168.43.1" while the name-based lookup returned null.
+     *
+     * @param ownerIp group owner address from WIFI_READY; when null only the name/route heuristics
+     *   are available.
+     */
+    private fun findP2pNetwork(ownerIp: String? = null): android.net.Network? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return null
         return try {
-            cm.allNetworks.firstOrNull { n ->
-                val caps = cm.getNetworkCapabilities(n)
-                val link = cm.getLinkProperties(n)
-                caps != null && link != null &&
-                    caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) &&
-                    (link.interfaceName ?: "").startsWith("p2p")
+            val candidates = cm.allNetworks.filter { n ->
+                val caps = cm.getNetworkCapabilities(n) ?: return@filter false
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) &&
+                    !caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)
             }
+            val target = ownerIp ?: pendingDetails?.ip
+
+            // 1) A network whose link actually covers the group owner's subnet.
+            if (target != null) {
+                candidates.firstOrNull { n ->
+                    val link = cm.getLinkProperties(n) ?: return@firstOrNull false
+                    link.linkAddresses.any { la ->
+                        sameSubnet(la.address?.hostAddress, target, la.prefixLength)
+                    }
+                }?.let { return it }
+            }
+
+            // 2) A genuinely separate p2p interface, where the device makes one.
+            candidates.firstOrNull { (cm.getLinkProperties(it)?.interfaceName ?: "").startsWith("p2p") }
+                ?: run {
+                    remoteLog?.invoke("$TAG: no p2p network found (owner=$target)")
+                    null
+                }
         } catch (e: Exception) {
             remoteLog?.invoke("$TAG: findP2pNetwork failed: ${e.message}")
             null
         }
+    }
+
+    /** True when [a] and [b] share the first [prefixLength] bits (IPv4 only). */
+    private fun sameSubnet(a: String?, b: String?, prefixLength: Int): Boolean {
+        if (a == null || b == null || prefixLength !in 1..32) return false
+        val ax = a.split(".").mapNotNull { it.toIntOrNull() }
+        val bx = b.split(".").mapNotNull { it.toIntOrNull() }
+        if (ax.size != 4 || bx.size != 4) return false
+        val ai = (ax[0] shl 24) or (ax[1] shl 16) or (ax[2] shl 8) or ax[3]
+        val bi = (bx[0] shl 24) or (bx[1] shl 16) or (bx[2] shl 8) or bx[3]
+        val mask = if (prefixLength == 32) -1 else ((-1) shl (32 - prefixLength))
+        return (ai and mask) == (bi and mask)
     }
 
     private fun locationServicesEnabled(): Boolean {

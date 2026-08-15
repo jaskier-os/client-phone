@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Required to set MODE_IN_COMMUNICATION for the AR stream's voice leg; without it the
+         platform voice-comm AEC never engages. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -83,13 +86,13 @@
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:theme="@style/Theme.Listener" />
 
-        <!-- Live glasses AR view. Landscape to match the composited 16:9 stream. -->
+        <!-- Live glasses AR view. Portrait, matching the composited stream orientation. -->
         <activity
             android:name=".ui.ArStreamActivity"
             android:exported="false"
             android:launchMode="singleTask"
             android:excludeFromRecents="true"
-            android:screenOrientation="landscape"
+            android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
             android:theme="@style/Theme.Listener" />
 

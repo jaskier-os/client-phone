@@ -40,4 +40,14 @@
     <string name="ar_stream_phone_mic_off">Phone mic muted</string>
     <string name="ar_stream_glasses_mic_on">Glasses mic on</string>
     <string name="ar_stream_glasses_mic_off">Glasses mic muted</string>
+    <string name="ar_stream_phone_audio_enabled">Phone outgoing audio enabled</string>
+    <string name="ar_stream_phone_audio_disabled">Phone outgoing audio disabled</string>
+    <string name="ar_stream_glasses_audio_enabled">Glasses incoming audio enabled</string>
+    <string name="ar_stream_glasses_audio_disabled">Glasses incoming audio disabled</string>
+    <string name="ar_stream_record_start">Start recording</string>
+    <string name="ar_stream_record_stop">Stop recording</string>
+    <string name="ar_stream_recording_started">Recording started</string>
+    <string name="ar_stream_recording_saved">Recording saved to gallery</string>
+    <string name="ar_stream_recording_failed">Recording failed</string>
+    <string name="ar_stream_recording_not_ready">Waiting for video before recording</string>
 </resources>

@@ -18,8 +18,10 @@ import android.widget.ImageButton
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowInsetsControllerCompat
+import com.google.android.material.snackbar.Snackbar
 import com.repository.listener.R
 import com.repository.listener.arstream.ArStreamClient
+import com.repository.listener.arstream.ArStreamRecorder
 import com.repository.listener.arstream.ArStreamProtocol
 import com.repository.listener.arstream.ArStreamSessionState
 import com.repository.listener.service.ListenerService
@@ -42,6 +44,23 @@ class ArStreamActivity : AppCompatActivity() {
     private lateinit var status: TextView
     private lateinit var btnPhoneMic: ImageButton
     private lateinit var btnGlassesMic: ImageButton
+    private lateinit var btnRecord: ImageButton
+    private lateinit var txtRecordTime: TextView
+
+    /**
+     * Session recorder. Volatile: started/stopped on main but fed from both socket threads, and a
+     * stale null there would silently drop every frame of a recording that the UI says is running.
+     */
+    private val recorderRef = java.util.concurrent.atomic.AtomicReference<ArStreamRecorder?>(null)
+
+    /**
+     * Session recorder. Backed by an AtomicReference so the stop button and onDestroy cannot both
+     * claim the same recorder: exactly one caller takes it and finalises it, and the loser does
+     * not report a spurious failure over the winner's successful save.
+     */
+    private var recorder: ArStreamRecorder?
+        get() = recorderRef.get()
+        set(v) { recorderRef.set(v) }
 
     private val state = ArStreamSessionState()
 
@@ -73,9 +92,21 @@ class ArStreamActivity : AppCompatActivity() {
     /** Set in onDestroy so work posted from background threads cannot resurrect the session. */
     @Volatile private var destroyed = false
 
-    /** Audio mode we found before taking over, restored verbatim on teardown. */
-    private var previousAudioMode: Int? = null
-    private var previousSpeakerphone: Boolean? = null
+    /** Connect parameters kept for a single mid-session reconnect after a transient drop. */
+    @Volatile private var lastDetails: JSONObject? = null
+    @Volatile private var lastVideoPort = ArStreamProtocol.VIDEO_PORT
+    @Volatile private var lastAudioPort = ArStreamProtocol.AUDIO_PORT
+
+    /** One retry only -- a reconnect loop would hide a genuinely dead session forever. */
+    @Volatile private var reconnectAttempted = false
+
+    private val replyTimeout = Runnable {
+        if (!streamStarted) fail("Glasses did not answer the stream request")
+    }
+
+    private val connectTimeout = Runnable {
+        if (!streamStarted) fail("Could not connect to the glasses stream")
+    }
 
     private val resultReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context?, intent: Intent?) {
@@ -95,15 +126,24 @@ class ArStreamActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_ar_stream)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Playback is USAGE_MEDIA -> STREAM_MUSIC (see ArStreamClient.startPlayback), so the
+        // hardware keys must adjust that stream and not the ringer. Deliberately NOT
+        // MODE_IN_COMMUNICATION: that routes to the earpiece at call volume and reads as silence.
+        volumeControlStream = AudioManager.STREAM_MUSIC
 
         textureView = findViewById(R.id.arStreamTexture)
         status = findViewById(R.id.txtArStreamStatus)
         btnPhoneMic = findViewById(R.id.btnPhoneMic)
         btnGlassesMic = findViewById(R.id.btnGlassesMic)
 
+        btnRecord = findViewById(R.id.btnArRecord)
+        txtRecordTime = findViewById(R.id.txtArRecordTime)
+
         btnPhoneMic.setOnClickListener { togglePhoneMic() }
         btnGlassesMic.setOnClickListener { toggleGlassesMic() }
+        btnRecord.setOnClickListener { toggleRecording() }
 
+        sizeTextureToAspect()
         setupSurface()
         enterImmersive()
         registerResultReceiver()
@@ -117,6 +157,31 @@ class ArStreamActivity : AppCompatActivity() {
         } else {
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(resultReceiver, filter)
+        }
+    }
+
+    /**
+     * Letterbox the TextureView to the stream's aspect ratio.
+     *
+     * A match_parent TextureView stretches the decoded frame to the phone's screen shape, which on
+     * a 20:9 phone showing a 4:3 stream both distorted the picture and ran it past the edges.
+     * Sizing the view itself keeps the geometry correct without any scaling matrix.
+     */
+    private fun sizeTextureToAspect() {
+        textureView.post {
+            val parent = textureView.parent as? View ?: return@post
+            val availW = parent.width
+            val availH = parent.height
+            if (availW == 0 || availH == 0) return@post
+            val scale = minOf(
+                availW.toFloat() / VIDEO_WIDTH,
+                availH.toFloat() / VIDEO_HEIGHT
+            )
+            textureView.layoutParams = textureView.layoutParams.apply {
+                width = (VIDEO_WIDTH * scale).toInt()
+                height = (VIDEO_HEIGHT * scale).toInt()
+            }
+            textureView.requestLayout()
         }
     }
 
@@ -136,6 +201,7 @@ class ArStreamActivity : AppCompatActivity() {
                 decoder?.stop()
                 decoder = null
                 state.onSurfaceDestroyed()
+                textureSurface?.release()
                 textureSurface = null
                 return true
             }
@@ -153,6 +219,10 @@ class ArStreamActivity : AppCompatActivity() {
         // sync-frame request does not reliably re-emit it.
         lastConfigFrame?.let { d.feedFrame(it) }
         decoder = d
+        // Re-check after publishing: a config frame that arrived while the decoder was being
+        // constructed saw decoder == null and was dropped. Feeding it twice is harmless; missing
+        // it means a black surface for the rest of the session.
+        lastConfigFrame?.let { d.feedFrame(it) }
         state.onDecoderStarted()
         client?.requestKeyframe()
     }
@@ -164,6 +234,92 @@ class ArStreamActivity : AppCompatActivity() {
             lastConfigFrame = frame
         }
         decoder?.feedFrame(frame)
+        recorder?.onVideoFrame(frame)
+    }
+
+    private fun toggleRecording() {
+        val rec = recorderRef.getAndSet(null)
+        if (rec == null) startRecording() else stopRecording(rec)
+    }
+
+    private fun startRecording() {
+        val config = lastConfigFrame
+        if (config == null) {
+            // Without SPS/PPS the muxer cannot describe the track; starting anyway would produce a
+            // file no player can open, which is worse than refusing.
+            snack(getString(R.string.ar_stream_recording_not_ready))
+            return
+        }
+        val rec = ArStreamRecorder(applicationContext)
+        try {
+            rec.start(config, VIDEO_WIDTH, VIDEO_HEIGHT)
+        } catch (e: Exception) {
+            LogCollector.e(TAG, "record start failed: ${e.message}")
+            snack(getString(R.string.ar_stream_recording_failed))
+            return
+        }
+        // Publish the taps only after a successful start, so a failed start cannot leave the
+        // socket threads feeding a dead recorder.
+        client?.onUplinkAudio = { pcm -> recorder?.onGlassesAudio(pcm) }
+        client?.onPhoneMicAudio = { pcm, len -> recorder?.onPhoneMicAudio(pcm, len) }
+        recorder = rec
+        // The glasses only send config once per connection, so the recording would otherwise start
+        // at whatever GOP boundary comes next -- ask for an IDR immediately.
+        client?.requestKeyframe()
+
+        btnRecord.setImageResource(R.drawable.ic_stop)
+        btnRecord.contentDescription = getString(R.string.ar_stream_record_stop)
+        txtRecordTime.visibility = View.VISIBLE
+        txtRecordTime.text = formatElapsed(0)
+        mainHandler.post(recordTicker)
+        snack(getString(R.string.ar_stream_recording_started))
+    }
+
+    /** @param rec already claimed from [recorderRef] by the caller. */
+    private fun stopRecording(rec: ArStreamRecorder) {
+        client?.onUplinkAudio = null
+        client?.onPhoneMicAudio = null
+        mainHandler.removeCallbacks(recordTicker)
+
+        btnRecord.setImageResource(R.drawable.ic_fiber_manual_record)
+        btnRecord.contentDescription = getString(R.string.ar_stream_record_start)
+        txtRecordTime.visibility = View.GONE
+
+        // stop() muxes, copies to MediaStore and joins codec threads -- all illegal on main.
+        thread(name = "ArStream-recStop") {
+            val uri = try {
+                rec.stop()
+            } catch (e: Exception) {
+                LogCollector.e(TAG, "record stop failed: ${e.message}")
+                null
+            }
+            mainHandler.post {
+                if (isFinishing || destroyed) return@post
+                snack(
+                    getString(
+                        if (uri != null) R.string.ar_stream_recording_saved
+                        else R.string.ar_stream_recording_failed
+                    )
+                )
+            }
+        }
+    }
+
+    private val recordTicker = object : Runnable {
+        override fun run() {
+            val rec = recorder ?: return
+            txtRecordTime.text = formatElapsed(rec.elapsedMs)
+            mainHandler.postDelayed(this, 500L)
+        }
+    }
+
+    private fun formatElapsed(ms: Long): String {
+        val total = ms / 1000
+        return String.format(java.util.Locale.US, "REC %02d:%02d", total / 60, total % 60)
+    }
+
+    private fun snack(text: String) {
+        Snackbar.make(findViewById(android.R.id.content), text, Snackbar.LENGTH_SHORT).show()
     }
 
     private fun startSession() {
@@ -179,9 +335,10 @@ class ArStreamActivity : AppCompatActivity() {
         }
         startService(intent)
 
-        mainHandler.postDelayed({
-            if (!streamStarted) fail("Glasses did not start the stream")
-        }, START_TIMEOUT_MS)
+        // Only covers the BT round trip. The connect phase (group join up to 30s + network wait +
+        // TCP connect) gets its own, longer budget once the glasses have answered -- one combined
+        // timeout would kill healthy sessions on a slow WiFi-Direct negotiation.
+        mainHandler.postDelayed(replyTimeout, REPLY_TIMEOUT_MS)
     }
 
     private fun handleStartResult(resultJson: String) {
@@ -204,6 +361,15 @@ class ArStreamActivity : AppCompatActivity() {
         val videoPort = obj.optInt("video_port", ArStreamProtocol.VIDEO_PORT)
         val audioPort = obj.optInt("audio_port", ArStreamProtocol.AUDIO_PORT)
 
+        // The glasses answered, so swap the short reply budget for the long connect budget.
+        mainHandler.removeCallbacks(replyTimeout)
+        mainHandler.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
+
+        // Remembered so a mid-session stream drop can be retried without another BT round trip.
+        lastDetails = details
+        lastVideoPort = videoPort
+        lastAudioPort = audioPort
+
         thread(name = "ArStream-connect") { connectClient(details, videoPort, audioPort) }
     }
 
@@ -213,10 +379,17 @@ class ArStreamActivity : AppCompatActivity() {
         val c = ArStreamClient(applicationContext, state)
         c.onVideoFrame = { frame -> onVideoFrame(frame) }
         c.onError = { msg -> mainHandler.post { fail(msg) } }
+        // A mid-session reconnect builds a NEW client; without re-arming the taps here an
+        // in-flight recording would silently lose all audio after the drop.
+        if (recorder != null) {
+            c.onUplinkAudio = { pcm -> recorder?.onGlassesAudio(pcm) }
+            c.onPhoneMicAudio = { pcm, len -> recorder?.onPhoneMicAudio(pcm, len) }
+        }
         c.onConnected = {
             mainHandler.post {
                 if (destroyed) return@post
                 streamStarted = true
+                mainHandler.removeCallbacks(connectTimeout)
                 status.visibility = View.GONE
                 startDecoder()
             }
@@ -231,44 +404,13 @@ class ArStreamActivity : AppCompatActivity() {
 
         if (!c.connect(details, videoPort, audioPort)) return
 
-        // The sink is a @Volatile static -- set it directly rather than posting, so it can never
-        // be installed AFTER onDestroy cleared it (which would leak a live mic tap forever).
+        // Publish then re-check: a plain "check, then assign" still loses the race if onDestroy
+        // runs between the two, leaving a live mic tap wired to a dead session forever.
+        ListenerService.arStreamMicSink = { samples -> c.sendMicAudio(samples, samples.size) }
         if (destroyed) {
+            ListenerService.arStreamMicSink = null
             c.disconnect()
             return
-        }
-        ListenerService.arStreamMicSink = { samples -> c.sendMicAudio(samples, samples.size) }
-        mainHandler.post { if (!destroyed) engageVoiceCommunicationMode() }
-    }
-
-    /**
-     * Put the phone in voice-communication mode for the session. This is the path the platform's
-     * echo cancellation is actually tuned for; the wake-word recorder already attaches an
-     * AcousticEchoCanceler, and MODE_IN_COMMUNICATION is what makes it behave like a call.
-     */
-    private fun engageVoiceCommunicationMode() {
-        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        try {
-            previousAudioMode = am.mode
-            @Suppress("DEPRECATION")
-            previousSpeakerphone = am.isSpeakerphoneOn
-            am.mode = AudioManager.MODE_IN_COMMUNICATION
-        } catch (e: Exception) {
-            LogCollector.e(TAG, "audio mode switch failed: ${e.message}")
-        }
-    }
-
-    private fun restoreAudioMode() {
-        val am = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        try {
-            previousAudioMode?.let { am.mode = it }
-            @Suppress("DEPRECATION")
-            previousSpeakerphone?.let { am.isSpeakerphoneOn = it }
-        } catch (e: Exception) {
-            LogCollector.e(TAG, "audio mode restore failed: ${e.message}")
-        } finally {
-            previousAudioMode = null
-            previousSpeakerphone = null
         }
     }
 
@@ -281,6 +423,12 @@ class ArStreamActivity : AppCompatActivity() {
         btnPhoneMic.contentDescription = getString(
             if (muted) R.string.ar_stream_phone_mic_off else R.string.ar_stream_phone_mic_on
         )
+        snack(
+            getString(
+                if (muted) R.string.ar_stream_phone_audio_disabled
+                else R.string.ar_stream_phone_audio_enabled
+            )
+        )
     }
 
     private fun toggleGlassesMic() {
@@ -292,9 +440,47 @@ class ArStreamActivity : AppCompatActivity() {
         btnGlassesMic.contentDescription = getString(
             if (muted) R.string.ar_stream_glasses_mic_off else R.string.ar_stream_glasses_mic_on
         )
+        snack(
+            getString(
+                if (muted) R.string.ar_stream_glasses_audio_disabled
+                else R.string.ar_stream_glasses_audio_enabled
+            )
+        )
     }
 
     private fun fail(message: String) {
+        // A socket thread's error post can beat removeCallbacksAndMessages in onDestroy.
+        if (destroyed || isFinishing) return
+
+        // A running session that hits EOF on the video socket is usually a transient WiFi-Direct
+        // drop, not the glasses going away -- killing the whole activity for it made one bad
+        // frame end the session. Retry the socket connect ONCE (the glasses server is still
+        // listening and re-primes any new client); only a second failure is fatal.
+        if (streamStarted && !reconnectAttempted && message.contains(VIDEO_ENDED_MARKER, true)) {
+            val d = lastDetails
+            if (d != null) {
+                reconnectAttempted = true
+                LogCollector.e(TAG, "video stream ended, attempting single reconnect")
+                streamStarted = false
+                status.visibility = View.VISIBLE
+                status.text = getString(R.string.ar_stream_connecting)
+                ListenerService.arStreamMicSink = null
+                val old = client
+                client = null
+                decoder?.stop()
+                decoder = null
+                lastConfigFrame = null
+                val vp = lastVideoPort
+                val ap = lastAudioPort
+                thread(name = "ArStream-reconnect") {
+                    try { old?.disconnect() } catch (_: Exception) {}
+                    if (!destroyed) connectClient(d, vp, ap)
+                }
+                mainHandler.postDelayed(connectTimeout, CONNECT_TIMEOUT_MS)
+                return
+            }
+        }
+
         LogCollector.e(TAG, "session failed: $message")
         status.visibility = View.VISIBLE
         status.text = message
@@ -319,14 +505,33 @@ class ArStreamActivity : AppCompatActivity() {
         try { unregisterReceiver(resultReceiver) } catch (_: Exception) {}
         mainHandler.removeCallbacksAndMessages(null)
 
+        // Finalise any running recording BEFORE the client goes away. An MP4 abandoned without
+        // MediaMuxer.stop() has no moov atom and is unplayable, so this must happen on every exit
+        // path, not just the explicit stop button.
+        val rec = recorderRef.getAndSet(null)
+        if (rec != null) {
+            val c0 = client
+            c0?.onUplinkAudio = null
+            c0?.onPhoneMicAudio = null
+            thread(name = "ArStream-recFinalize") {
+                try { rec.stop() } catch (e: Exception) {
+                    LogCollector.e(TAG, "recorder finalize failed: ${e.message}")
+                }
+            }
+        }
+
         decoder?.stop()
         decoder = null
+        textureSurface?.release()
         textureSurface = null
         lastConfigFrame = null
 
-        client?.disconnect()
+        // Off the main thread: disconnect() writes CTRL_STOP to a socket and joins a thread, both
+        // of which are illegal on main (NetworkOnMainThreadException would be swallowed by the
+        // catch inside, silently skipping the stop notification). disconnect() is idempotent.
+        val c = client
         client = null
-        restoreAudioMode()
+        if (c != null) thread(name = "ArStream-teardown") { c.disconnect() }
 
         val stopId = "arstream_stop_${UUID.randomUUID().toString().take(8)}"
         try {
@@ -343,9 +548,17 @@ class ArStreamActivity : AppCompatActivity() {
 
     private companion object {
         const val TAG = "ArStreamActivity"
-        const val VIDEO_WIDTH = 1280
-        const val VIDEO_HEIGHT = 720
-        const val START_TIMEOUT_MS = 45_000L
+        /** The ArStreamClient error text that means "socket EOF", i.e. a retryable drop. */
+        const val VIDEO_ENDED_MARKER = "video stream ended"
+
+        /** Portrait 4:3, matching the glasses compositor output (sensor is 4032x3024). */
+        const val VIDEO_WIDTH = 720
+        const val VIDEO_HEIGHT = 960
+        /** BT round trip to the glasses (they postDelay 1.5s before even starting). */
+        const val REPLY_TIMEOUT_MS = 20_000L
+
+        /** WiFi-Direct group join (up to 30s) + network wait (3s) + two TCP connects (10s each). */
+        const val CONNECT_TIMEOUT_MS = 60_000L
         const val ERROR_DISMISS_MS = 4_000L
     }
 }

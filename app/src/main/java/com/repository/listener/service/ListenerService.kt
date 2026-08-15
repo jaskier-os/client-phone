@@ -4624,8 +4624,14 @@ class ListenerService : LifecycleService(),
         phoneWakeTimestamp = System.currentTimeMillis()
         LogCollector.i(TAG, "Phone wake amplitude: $phoneWakeAmplitude")
 
-        // Rule 1: glasses screen ON + connected = delegate to glasses entirely
-        if (isGlassesScreenOn && phoneBtHost.isConnected) {
+        // Rule 1: glasses screen ON + connected = delegate to glasses entirely.
+        // Gated on the glasses wake-word toggle: with it off the user has said the wake word must
+        // not start an AI session on the glasses, and the phone's own detector firing is still a
+        // wake word. Without this gate the toggle only stopped the glasses-side detector while
+        // the phone kept starting glasses sessions on its behalf.
+        if (isGlassesScreenOn && phoneBtHost.isConnected &&
+            AppConfig.getGlassesWakewordEnabled(this)
+        ) {
             LogCollector.i(TAG, "Glasses screen ON - delegating to glasses")
             delegatePhoneWakeToGlasses("phone wake, screen ON")
             return  // phone stays IDLE, no overlay, no sound
@@ -4633,11 +4639,11 @@ class ListenerService : LifecycleService(),
 
         // Rule 1.5: phone AI triggering disabled by user
         if (!AppConfig.getPhoneAiTriggerEnabled(this)) {
-            if (phoneBtHost.isConnected) {
+            if (phoneBtHost.isConnected && AppConfig.getGlassesWakewordEnabled(this)) {
                 LogCollector.i(TAG, "Phone AI trigger disabled - delegating to glasses")
                 delegatePhoneWakeToGlasses("phone trigger disabled")
             } else {
-                LogCollector.i(TAG, "Phone AI trigger disabled and glasses offline - ignoring wake word")
+                LogCollector.i(TAG, "Phone AI trigger disabled or glasses wakeword off - ignoring wake word")
                 resetWakeConflictState()
             }
             return
@@ -6601,6 +6607,11 @@ class ListenerService : LifecycleService(),
                 if (phoneBtHost.isConnected) {
                     phoneBtHost.sendCommand("stop_ar_stream", commandId, "{}")
                 }
+                // Every sibling command writes a result; without one an ADB-issued stop polls
+                // until it times out.
+                AdbResultWriter.writeSuccess(this, commandId, type, JSONObject().apply {
+                    put("stopped", true)
+                })
             }
             "start_teleprompter" -> {
                 if (!phoneBtHost.isConnected) {

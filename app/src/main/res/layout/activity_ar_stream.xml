@@ -6,10 +6,12 @@
     android:background="@android:color/black"
     android:keepScreenOn="true">
 
+    <!-- Sized in code to the stream's aspect ratio: match_parent on both axes stretched the 4:3
+         picture across the phone's taller screen and pushed it past the edges. -->
     <TextureView
         android:id="@+id/arStreamTexture"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
         android:layout_gravity="center" />
 
     <TextView
@@ -53,5 +55,31 @@
             android:padding="12dp"
             android:src="@drawable/ic_mic_glasses_on"
             app:tint="@color/gbx_orange" />
+
+        <ImageButton
+            android:id="@+id/btnArRecord"
+            android:layout_width="56dp"
+            android:layout_height="56dp"
+            android:layout_marginStart="24dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/ar_stream_record_start"
+            android:scaleType="fitCenter"
+            android:padding="12dp"
+            android:src="@drawable/ic_fiber_manual_record"
+            app:tint="@color/gbx_orange" />
     </LinearLayout>
+
+    <!-- Elapsed recording time. GONE while idle, so the idle and recording states differ by more
+         than the icon swap alone. -->
+    <TextView
+        android:id="@+id/txtArRecordTime"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="24dp"
+        android:background="#99000000"
+        android:padding="8dp"
+        android:textColor="#FFFF4444"
+        android:textSize="16sp"
+        android:visibility="gone" />
 </FrameLayout>
