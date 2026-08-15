@@ -124,10 +124,27 @@ class GlassesSettingsActivity : AppCompatActivity() {
         lblBrightness.text = "Brightness: $brightness"
 
         // Dropdowns
-        setupDropdown(dropdownScreenTimeout, screenTimeoutOptions, AppConfig.getGlassesScreenTimeout(this))
-        setupDropdown(dropdownPowerTimeout, powerTimeoutOptions, AppConfig.getGlassesPowerTimeout(this))
+        setupDropdown(
+            dropdownScreenTimeout,
+            screenTimeoutOptions,
+            AppConfig.getGlassesScreenTimeout(this),
+            defaultValue = AppConfig.DEFAULT_GLASSES_SCREEN_TIMEOUT_SEC.toString(),
+        )
+        setupDropdown(
+            dropdownPowerTimeout,
+            powerTimeoutOptions,
+            AppConfig.getGlassesPowerTimeout(this),
+            defaultValue = AppConfig.DEFAULT_GLASSES_POWER_TIMEOUT_MIN.toString(),
+        )
         setupDropdown(dropdownNotificationSound, notificationSoundOptions, AppConfig.getGlassesNotificationSound(this))
-        setupDropdown(dropdownNotificationDuration, notificationDurationOptions, AppConfig.getGlassesNotificationDuration(this))
+        // "5" matches the option explicitly labelled "(default)"; without this the
+        // fallback would silently be the first entry, "3 seconds".
+        setupDropdown(
+            dropdownNotificationDuration,
+            notificationDurationOptions,
+            AppConfig.getGlassesNotificationDuration(this),
+            defaultValue = "5",
+        )
 
         // Chat font size
         val storedChatFontSize = AppConfig.getGlassesChatFontSize(this)
@@ -160,10 +177,18 @@ class GlassesSettingsActivity : AppCompatActivity() {
     private fun captureSnapshot(): SettingsSnapshot {
         return SettingsSnapshot(
             brightness = seekBrightness.progress,
-            screenTimeout = getDropdownValue(dropdownScreenTimeout, screenTimeoutOptions),
-            powerTimeout = getDropdownValue(dropdownPowerTimeout, powerTimeoutOptions),
+            screenTimeout = getDropdownValue(
+                dropdownScreenTimeout, screenTimeoutOptions,
+                AppConfig.DEFAULT_GLASSES_SCREEN_TIMEOUT_SEC.toString(),
+            ),
+            powerTimeout = getDropdownValue(
+                dropdownPowerTimeout, powerTimeoutOptions,
+                AppConfig.DEFAULT_GLASSES_POWER_TIMEOUT_MIN.toString(),
+            ),
             notificationSound = getDropdownValue(dropdownNotificationSound, notificationSoundOptions),
-            notificationDuration = getDropdownValue(dropdownNotificationDuration, notificationDurationOptions),
+            notificationDuration = getDropdownValue(
+                dropdownNotificationDuration, notificationDurationOptions, "5",
+            ),
             chatFontSize = progressToChatFontSize(seekChatFontSize.progress).toString(),
             wakewordEnabled = swWakeword.isChecked
         )
@@ -294,24 +319,46 @@ class GlassesSettingsActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * @param defaultValue option VALUE to select when [storedValue] is unset or
+     * unrecognized. Without it this fell back to the FIRST option, which for
+     * power timeout is "Off"/"0" -- so a fresh install rendered "Off" and the
+     * first save persisted a literal "0", disabling glasses fold-shutdown and
+     * silently defeating the `?: 60` default in getGlassesPowerTimeoutMin().
+     * Pass the same default the AppConfig getter uses.
+     */
     private fun setupDropdown(
         dropdown: AutoCompleteTextView,
         options: List<Pair<String, String>>,
-        storedValue: String
+        storedValue: String,
+        defaultValue: String? = null,
     ) {
         val labels = options.map { it.first }
         val adapter = NoFilterAdapter(this, android.R.layout.simple_dropdown_item_1line, labels)
         dropdown.setAdapter(adapter)
-        val matchingLabel = options.find { it.second == storedValue }?.first ?: labels.first()
+        val fallback = defaultValue
+            ?.let { d -> options.find { it.second == d }?.first }
+            ?: labels.first()
+        val matchingLabel = options.find { it.second == storedValue }?.first ?: fallback
         dropdown.setText(matchingLabel, false)
     }
 
+    /**
+     * @param defaultValue returned when the field text matches no option. Pass
+     * the same value used in setupDropdown: the previous fallback was
+     * options.first(), which for the timeout lists is the "off" entry ("0") --
+     * so any unmatched text silently wrote "0" and disabled the feature, even
+     * after AppConfig.migrateGlassesSettings had repaired it.
+     */
     private fun getDropdownValue(
         dropdown: AutoCompleteTextView,
-        options: List<Pair<String, String>>
+        options: List<Pair<String, String>>,
+        defaultValue: String? = null,
     ): String {
         val selected = dropdown.text.toString()
-        return options.find { it.first == selected }?.second ?: options.first().second
+        options.find { it.first == selected }?.let { return it.second }
+        return defaultValue?.takeIf { d -> options.any { it.second == d } }
+            ?: options.first().second
     }
 
     private fun chatFontSizeToProgress(sizeInSp: Int): Int = (sizeInSp - 8).coerceIn(0, 16)

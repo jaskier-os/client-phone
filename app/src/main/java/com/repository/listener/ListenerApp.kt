@@ -17,6 +17,13 @@ class ListenerApp : Application() {
     override fun onCreate() {
         super.onCreate()
         LogCollector.init(this)
+        // Repair glasses settings that a past dropdown-default bug persisted as a
+        // literal "0" (see AppConfig.migrateGlassesSettings). Lives here, not in
+        // ListenerService.onCreate, because GlassesSettingsActivity can be opened
+        // before the service starts: it would otherwise render the un-migrated
+        // "0" as "Off"/"Always on" and re-persist it on save. Application.onCreate
+        // runs on every process entry, so the Activity always sees migrated values.
+        AppConfig.migrateGlassesSettings(this)
         // Resolve + init the active map provider from config (default yandex). With
         // Google selected and a blank MapKit key this still runs -- the Google
         // provider's init does no Yandex work.

@@ -16,6 +16,7 @@ object AppConfig {
     private const val KEY_GLASSES_BRIGHTNESS = "glasses_brightness"
     private const val KEY_GLASSES_SCREEN_TIMEOUT = "glasses_screen_timeout"
     private const val KEY_GLASSES_POWER_TIMEOUT = "glasses_power_timeout"
+    private const val KEY_GLASSES_SETTINGS_MIGRATION = "glasses_settings_migration"
     private const val KEY_GLASSES_NOTIFICATION_SOUND = "glasses_notification_sound"
     private const val KEY_GLASSES_NOTIFICATION_DURATION = "glasses_notification_duration"
     private const val KEY_GLASSES_WAKEWORD_ENABLED = "glasses_wakeword_enabled"
@@ -226,7 +227,8 @@ object AppConfig {
 
     /** Int-typed accessor for the CH_SETTINGS contract. 0 = never, else clamped to 5..86400. */
     fun getGlassesScreenTimeoutSec(context: Context): Int {
-        val raw = getGlassesScreenTimeout(context).toIntOrNull() ?: 300
+        val raw = getGlassesScreenTimeout(context).toIntOrNull()
+            ?: DEFAULT_GLASSES_SCREEN_TIMEOUT_SEC
         return clampTimeoutSec(raw)
     }
 
@@ -247,9 +249,55 @@ object AppConfig {
         prefs(context).edit().putString(KEY_GLASSES_POWER_TIMEOUT, value).apply()
     }
 
+    /**
+     * Minutes folded before the glasses power off. Also the value the settings
+     * dropdown pre-selects when nothing is stored -- keep the two in sync, or a
+     * fresh install renders a different option than this getter reports and the
+     * first save silently persists it.
+     */
+    const val DEFAULT_GLASSES_POWER_TIMEOUT_MIN = 60
+
+    /** Screen-off seconds; mirrors getGlassesScreenTimeoutSec()'s fallback. */
+    const val DEFAULT_GLASSES_SCREEN_TIMEOUT_SEC = 300
+
+    // Bump when a migration step is added below.
+    private const val GLASSES_SETTINGS_MIGRATION_VERSION = 1
+
+    /**
+     * Repairs settings that a UI bug persisted as a literal "0".
+     *
+     * setupDropdown() used to fall back to the FIRST option when no value was
+     * stored. The first entry of both the power- and screen-timeout lists is the
+     * "off" choice ("Off"/"0", "Always on"/"0"), so a fresh install rendered
+     * "off", and the first save in the settings screen wrote "0" for real. On the
+     * glasses that became power_timeout_min=0, which disables fold-shutdown AND
+     * Rokid's own rkd_shutdown_timeout backstop -- so nothing powered the glasses
+     * down when suspend failed.
+     *
+     * A stored "0" is indistinguishable from a deliberate "Off", so this rewrites
+     * it to the default exactly once (guarded by a version pref) rather than
+     * clamping on every read. Users who genuinely want "Off" can re-select it and
+     * it will stick. Idempotent and safe to call on every startup; required
+     * because affected devices cannot be fixed by a reinstall (that would only
+     * clear prefs, and reinstalling is disallowed here).
+     */
+    fun migrateGlassesSettings(context: Context) {
+        val p = prefs(context)
+        if (p.getInt(KEY_GLASSES_SETTINGS_MIGRATION, 0) >= GLASSES_SETTINGS_MIGRATION_VERSION) return
+        val e = p.edit()
+        if (p.getString(KEY_GLASSES_POWER_TIMEOUT, "") == "0") {
+            e.putString(KEY_GLASSES_POWER_TIMEOUT, DEFAULT_GLASSES_POWER_TIMEOUT_MIN.toString())
+        }
+        if (p.getString(KEY_GLASSES_SCREEN_TIMEOUT, "") == "0") {
+            e.putString(KEY_GLASSES_SCREEN_TIMEOUT, DEFAULT_GLASSES_SCREEN_TIMEOUT_SEC.toString())
+        }
+        e.putInt(KEY_GLASSES_SETTINGS_MIGRATION, GLASSES_SETTINGS_MIGRATION_VERSION).apply()
+    }
+
     /** Int-typed accessor for the CH_SETTINGS contract. 0 = never, else clamped to 1..1440. */
     fun getGlassesPowerTimeoutMin(context: Context): Int {
-        val raw = getGlassesPowerTimeout(context).toIntOrNull() ?: 60
+        val raw = getGlassesPowerTimeout(context).toIntOrNull()
+            ?: DEFAULT_GLASSES_POWER_TIMEOUT_MIN
         return clampPowerTimeoutMin(raw)
     }
 

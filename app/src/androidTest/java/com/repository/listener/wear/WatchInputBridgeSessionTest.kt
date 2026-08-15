@@ -269,7 +269,13 @@ class WatchInputBridgeSessionTest {
             assertTrue(
                 "the watch must still get its correlated status reply, or its RTT " +
                     "measurement and link display break",
-                synchronized(statuses) { statuses.any { it.size > 1 } },
+                // Tested by actually PARSING the correlation, not by frame length. The
+                // length test read `size > 1`, which was meaningful only while a bare
+                // status frame was one byte; the frame is now two, so that comparison
+                // became true for every frame and quietly stopped asserting anything.
+                synchronized(statuses) {
+                    statuses.any { RemoteInputProtocol.StatusFlags.replyToSeq(it) != null }
+                },
             )
         } finally {
             WatchMessageListenerService.bridge = null
