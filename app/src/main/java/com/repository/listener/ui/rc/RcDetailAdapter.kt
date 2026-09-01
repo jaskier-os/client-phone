@@ -19,6 +19,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.repository.listener.R
@@ -67,6 +68,19 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
         // Using a payload skips RecyclerView's default change animation, which
         // otherwise causes a 1-Hz blink on the elapsed-counter ticker.
         const val PAYLOAD_AGENT_TICK = "agent_tick"
+
+        /** A tool status that means the invocation is over, one way or another. */
+        fun isTerminalStatus(status: String): Boolean =
+            status == "complete" || status == "error"
+
+        /**
+         * Tools that never produce a matching tool_result -- answering the
+         * question or approving the plan IS the completion. Without this they
+         * would sit in the approved-but-not-complete state forever, pulsing and
+         * driving the elapsed ticker with nothing to wait for.
+         */
+        fun completesOnApproval(toolName: String): Boolean =
+            toolName == "AskUserQuestion" || toolName == "ExitPlanMode"
     }
 
     private val messages = mutableListOf<RcMessage>()
@@ -126,10 +140,19 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
         // primary text without touching layout/animation/borders. This avoids
         // the RecyclerView change-animation blink seen on full rebinds.
         if (payloads.isNotEmpty() && payloads.contains(PAYLOAD_AGENT_TICK)) {
-            val msg = messages[position]
-            if (msg is RcMessage.ToolStatus && msg.isAgent) {
-                holder.primaryText.text = buildAgentPrimaryLabel(msg)
-                return
+            when (val msg = messages[position]) {
+                is RcMessage.ToolStatus -> {
+                    holder.primaryText.text =
+                        if (msg.isAgent) buildAgentPrimaryLabel(msg) else buildToolPrimaryText(msg)
+                    return
+                }
+                is RcMessage.PermissionRequest -> {
+                    if (msg.approved && !msg.completed) {
+                        holder.primaryText.text = buildRunningPermissionLabel(msg)
+                        return
+                    }
+                }
+                else -> {}
             }
         }
         super.onBindViewHolder(holder, position, payloads)
@@ -169,7 +192,10 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                 val statusColor = when (msg.status) {
                     "complete" -> color(ctx, R.color.gbx_green)
                     "error" -> color(ctx, R.color.gbx_red)
-                    else -> color(ctx, R.color.gbx_aqua)
+                    "calling", "running" -> color(ctx, R.color.gbx_aqua)
+                    // Historical rows from before status was stamped: neutral,
+                    // not the in-flight color.
+                    else -> color(ctx, R.color.gbx_gray)
                 }
                 if (msg.isAgent) {
                     // Border follows status (aqua=calling, green=complete, red=error).
@@ -224,7 +250,15 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                     } else {
                         holder.secondaryText?.text = msg.description.ifEmpty { "" }
                     }
-                } else if (msg.result != null && msg.approved) {
+                } else if (msg.approved && !msg.completed) {
+                    // Approved but the tool_result has not arrived yet -- e.g.
+                    // TaskOutput blocking on a subagent. Rendering this as
+                    // "complete" was the bug: the user saw a finished tool
+                    // while it was still running.
+                    holder.primaryText.text = buildRunningPermissionLabel(msg)
+                    val text = PermissionDialog.formatToolArgs(msg.toolName, msg.toolArgs)
+                    setSecondaryText(holder.secondaryText, text, isPlanTool(msg.toolName), ctx)
+                } else if (msg.result != null && msg.completed) {
                     // Completed tool: show tool-specific output
                     val toolStatus = RcMessage.ToolStatus(
                         id = msg.id, timestamp = msg.timestamp,
@@ -252,13 +286,29 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                 }
                 holder.secondaryText?.visibility = View.VISIBLE
 
-                // Dynamic border color: orange=pending, green=approved, red=rejected
+                // Border color tracks three states, not two:
+                //   orange = awaiting approval
+                //   aqua   = approved and still running
+                //   green  = finished
+                //   red    = rejected
                 val borderColor = when {
                     msg.pending -> color(holder.itemView.context, R.color.gbx_orange)
+                    msg.approved && !msg.completed -> color(holder.itemView.context, R.color.gbx_aqua)
                     msg.approved -> color(holder.itemView.context, R.color.gbx_green)
                     else -> color(holder.itemView.context, R.color.gbx_red)
                 }
                 holder.itemView.findViewWithTag<View>("card_border")?.setBackgroundColor(borderColor)
+
+                // Pulse while running, matching the ToolStatus row treatment.
+                if (msg.approved && !msg.completed) {
+                    holder.itemView.startAnimation(AlphaAnimation(1f, 0.3f).apply {
+                        duration = 800
+                        repeatCount = Animation.INFINITE
+                        repeatMode = Animation.REVERSE
+                    })
+                } else {
+                    holder.itemView.clearAnimation()
+                }
 
                 // Click to preview Write/Edit content when resolved
                 holder.itemView.setOnClickListener(null)
@@ -395,9 +445,49 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
     }
 
     fun submitMessages(newMessages: List<RcMessage>) {
+        val old = messages.toList()
         messages.clear()
         messages.addAll(newMessages)
-        notifyDataSetChanged()
+        // DiffUtil rather than notifyDataSetChanged: a full invalidation
+        // re-runs the Markwon markdown parse for every bound row, which on a
+        // long transcript is the bulk of the open cost.
+        DiffUtil.calculateDiff(object : DiffUtil.Callback() {
+            override fun getOldListSize() = old.size
+            override fun getNewListSize() = newMessages.size
+            override fun areItemsTheSame(oldPos: Int, newPos: Int) =
+                old[oldPos].id == newMessages[newPos].id
+            override fun areContentsTheSame(oldPos: Int, newPos: Int) =
+                old[oldPos] == newMessages[newPos]
+        }, /* detectMoves = */ false).dispatchUpdatesTo(this)
+    }
+
+    /**
+     * Insert older history above the current rows.
+     *
+     * Deliberately a positional insert, not a list replace: the caller anchors
+     * the scroll position on a known index, which only holds if the existing
+     * rows keep their positions (shifted by exactly [older].size).
+     */
+    fun prependMessages(older: List<RcMessage>): Int {
+        if (older.isEmpty()) return 0
+        // A page boundary can overlap if entries were appended mid-scroll;
+        // drop anything already present so no row renders twice. The count is
+        // returned because the caller anchors the scroll on it -- offsetting by
+        // the requested size instead of the inserted size overshoots.
+        val existing = messages.mapTo(HashSet()) { it.id }
+        val fresh = older.filter { it.id !in existing }
+        if (fresh.isEmpty()) return 0
+        messages.addAll(0, fresh)
+        notifyItemRangeInserted(0, fresh.size)
+        return fresh.size
+    }
+
+    /** Append newer rows without disturbing anything already loaded above. */
+    fun appendMessages(newer: List<RcMessage>) {
+        if (newer.isEmpty()) return
+        val start = messages.size
+        messages.addAll(newer)
+        notifyItemRangeInserted(start, newer.size)
     }
 
     fun updateStreamingText(requestId: String, text: String) {
@@ -411,7 +501,7 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
         }
     }
 
-    fun upsertToolStatus(toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String? = null, isAgent: Boolean = false, agentName: String? = null, agentTask: String? = null, agentToolCount: Int? = null, agentTokens: Long? = null, agentElapsedMs: Long? = null) {
+    fun upsertToolStatus(toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String? = null, isAgent: Boolean = false, agentName: String? = null, agentTask: String? = null, agentToolCount: Int? = null, agentTokens: Long? = null, agentElapsedMs: Long? = null, elapsedMs: Long? = null, seq: Int = 0) {
         // Suppress standalone cards for tools that don't need visible output
         if (toolName == "AskUserQuestion" || toolName == "EnterPlanMode") {
             // Just update existing PermissionRequest if found, don't create new card
@@ -419,6 +509,9 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                 val msg = messages[i]
                 if (msg is RcMessage.PermissionRequest && msg.toolName == toolName && !msg.pending) {
                     msg.result = result
+                    // These tools have no tool_result of their own, so the
+                    // status event that carries the answer IS the completion.
+                    msg.completed = true
                     notifyItemChanged(i)
                     return
                 }
@@ -431,7 +524,23 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
             val msg = messages[i]
             // Match PermissionRequest by toolCallId or toolName (skip for agents)
             if (!isAgent && msg is RcMessage.PermissionRequest && msg.toolName == toolName && !msg.pending) {
-                msg.result = result
+                // A card already bound to a DIFFERENT invocation must not absorb
+                // this one -- seq restarts at 1 per toolCallId, so a second Bash
+                // call would otherwise be swallowed by the first card's higher
+                // seq and never render at all.
+                if (msg.toolCallId != null && toolCallId != null && msg.toolCallId != toolCallId) continue
+                // A finished card cannot take another invocation either.
+                if (msg.completed && msg.toolCallId != toolCallId) continue
+                // Out-of-order guard, only meaningful within one invocation: a
+                // heartbeat scheduled just before the tool_result can arrive
+                // after 'complete', which would otherwise revert the card to a
+                // running state it can never leave.
+                if (seq > 0 && msg.toolCallId == toolCallId && seq < msg.seq) return
+                if (seq > 0) msg.seq = seq
+                if (msg.startedAtMs == null) msg.startedAtMs = System.currentTimeMillis()
+                if (toolCallId != null) msg.toolCallId = toolCallId
+                if (result != null) msg.result = result
+                if (isTerminalStatus(status)) msg.completed = true
                 notifyItemChanged(i)
                 return
             }
@@ -445,8 +554,16 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                     false
                 }
                 if (matches) {
+                    // Same out-of-order guard as the permission card above, plus
+                    // a hard rule: a row that reached a terminal status never
+                    // goes back to running.
+                    if (seq > 0 && seq < msg.seq) return
+                    if (isTerminalStatus(msg.status) && !isTerminalStatus(status)) return
                     messages[i] = msg.copy(
                         status = status,
+                        seq = if (seq > 0) seq else msg.seq,
+                        startedAtMs = msg.startedAtMs ?: System.currentTimeMillis(),
+                        elapsedMs = elapsedMs ?: msg.elapsedMs,
                         result = result ?: msg.result,
                         toolArgs = toolArgs ?: msg.toolArgs,
                         isAgent = isAgent || msg.isAgent,
@@ -477,6 +594,9 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
             isAgent = isAgent,
             agentName = agentName,
             agentTask = agentTask,
+            startedAtMs = System.currentTimeMillis(),
+            elapsedMs = elapsedMs,
+            seq = seq,
             agentDispatchedAt = if (isAgent) System.currentTimeMillis() else null,
             agentToolCount = agentToolCount,
             agentTokens = agentTokens,
@@ -486,14 +606,21 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
     }
 
     /**
-     * Force a re-bind of any in-flight agent rows so the elapsed counter ticks.
-     * Returns true if any agent row is still in calling/running state.
+     * Force a re-bind of every in-flight row so its elapsed counter ticks.
+     * Covers ALL tools, not just agents: TaskOutput can block for minutes and
+     * needs the same live feedback. Also covers approved-but-unfinished
+     * permission cards.
+     * Returns true if anything is still in flight.
      */
-    fun tickInFlightAgentRows(): Boolean {
+    fun tickInFlightToolRows(): Boolean {
         var anyInFlight = false
         for (i in messages.indices) {
-            val m = messages[i]
-            if (m is RcMessage.ToolStatus && m.isAgent && (m.status == "calling" || m.status == "running")) {
+            val inFlight = when (val m = messages[i]) {
+                is RcMessage.ToolStatus -> m.status == "calling" || m.status == "running"
+                is RcMessage.PermissionRequest -> m.approved && !m.completed
+                else -> false
+            }
+            if (inFlight) {
                 anyInFlight = true
                 // Payload-scoped rebind -- ItemAnimator skips the change
                 // animation when payloads are present, killing the blink.
@@ -501,6 +628,16 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
             }
         }
         return anyInFlight
+    }
+
+    /**
+     * Label for an approved tool whose result has not arrived yet, e.g.
+     * "[*] TaskOutput - 1m 12s".
+     */
+    fun buildRunningPermissionLabel(msg: RcMessage.PermissionRequest): String {
+        val head = "[*] ${friendlyToolName(msg.toolName)}"
+        val started = msg.startedAtMs ?: return head
+        return "$head - ${formatElapsedMmSs(System.currentTimeMillis() - started)}"
     }
 
     fun updateThinking(text: String) {
@@ -852,6 +989,8 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(color(ctx, R.color.gbx_gray))
             setTypeface(typeface, Typeface.ITALIC)
+            // Marker for the instrumentation harness to find thinking rows.
+            contentDescription = "rcThinkingText"
         }
 
         val container = LinearLayout(ctx).apply {
@@ -949,6 +1088,21 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
     }
 
     private fun buildToolPrimaryText(msg: RcMessage.ToolStatus): String {
+        val base = buildToolPrimaryTextBase(msg)
+        // While a tool is in flight, append a live elapsed counter so a
+        // long-blocking tool (TaskOutput) visibly ticks instead of looking hung.
+        if (msg.status != "calling" && msg.status != "running") return base
+        // Prefer the local clock so the 1Hz ticker advances smoothly; the
+        // server's elapsedMs only updates every 2s and would visibly stutter.
+        val elapsed = msg.startedAtMs?.let { System.currentTimeMillis() - it }
+            ?: msg.elapsedMs
+            ?: return base
+        // Below the heartbeat interval there is nothing meaningful to show.
+        if (elapsed < 2000L) return base
+        return "$base - ${formatElapsedMmSs(elapsed)}"
+    }
+
+    private fun buildToolPrimaryTextBase(msg: RcMessage.ToolStatus): String {
         val statusIcon = when (msg.status) {
             "running" -> "[*] "
             "complete" -> "[+] "

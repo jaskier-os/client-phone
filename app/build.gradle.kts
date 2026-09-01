@@ -141,6 +141,10 @@ dependencies {
 
     // OkHttp for WebSocket + HTTP
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // SSE device transport: the same message channel with no HTTP Upgrade
+    // handshake, for networks that interfere with WebSockets specifically.
+    // See network/RcTransport.kt.
+    implementation("com.squareup.okhttp3:okhttp-sse:4.12.0")
 
     // WebRTC for audio streaming
     implementation("io.getstream:stream-webrtc-android:1.3.7")

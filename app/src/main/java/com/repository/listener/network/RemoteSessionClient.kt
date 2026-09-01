@@ -490,11 +490,49 @@ class RemoteSessionClient(
         })
     }
 
+    /**
+     * One page of a session's transcript.
+     *
+     * @param transcript the entries as a JSON array string, oldest-first
+     * @param nextCursor cursor for the next (older) page, null at the beginning
+     * @param hasMore whether older entries exist
+     * @param truncated the server reached the start of its capped store, which
+     *   is NOT the start of the conversation -- older history is unrecoverable
+     */
+    data class TranscriptPage(
+        val transcript: String,
+        val nextCursor: String?,
+        val hasMore: Boolean,
+        val truncated: Boolean
+    )
+
     fun getTranscript(sessionId: String, callback: (Result<String>) -> Unit) {
+        getTranscriptPage(sessionId, limit = null, before = null) { result ->
+            callback(result.map { it.transcript })
+        }
+    }
+
+    /**
+     * Fetch a page of transcript history. With `limit` null this is the legacy
+     * unbounded fetch, which is what a long conversation makes slow -- pass a
+     * limit and page upward with the returned cursor instead.
+     */
+    fun getTranscriptPage(
+        sessionId: String,
+        limit: Int?,
+        before: String?,
+        callback: (Result<TranscriptPage>) -> Unit
+    ) {
         val encodedId = java.net.URLEncoder.encode(sessionId, "UTF-8")
-        val url = "$baseUrl/api/v1/remote-control/sessions/$encodedId/transcript"
+        val urlBuilder = StringBuilder("$baseUrl/api/v1/remote-control/sessions/$encodedId/transcript")
+        if (limit != null) {
+            urlBuilder.append("?limit=").append(limit)
+            if (!before.isNullOrEmpty()) {
+                urlBuilder.append("&before=").append(java.net.URLEncoder.encode(before, "UTF-8"))
+            }
+        }
         val request = Request.Builder()
-            .url(url)
+            .url(urlBuilder.toString())
             .addHeader("x-api-key", apiKey)
             .get()
             .build()
@@ -513,9 +551,17 @@ class RemoteSessionClient(
                         return
                     }
                     try {
+                        // Parse the body once. It used to be materialized three
+                        // times (string -> JSONObject -> toString), which on a
+                        // long transcript is megabytes of needless copying.
                         val json = JSONObject(resp.body!!.string())
-                        val transcript = json.optJSONArray("transcript")?.toString() ?: "[]"
-                        handler.post { callback(Result.success(transcript)) }
+                        val page = TranscriptPage(
+                            transcript = json.optJSONArray("transcript")?.toString() ?: "[]",
+                            nextCursor = if (json.isNull("nextCursor")) null else json.optString("nextCursor", null),
+                            hasMore = json.optBoolean("hasMore", false),
+                            truncated = json.optBoolean("truncated", false)
+                        )
+                        handler.post { callback(Result.success(page)) }
                     } catch (e: Exception) {
                         LogCollector.e(TAG, "Parse getTranscript failed: ${e.message}")
                         handler.post { callback(Result.failure(e)) }

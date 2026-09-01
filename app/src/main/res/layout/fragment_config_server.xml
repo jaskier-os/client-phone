@@ -47,6 +47,22 @@
         </com.google.android.material.textfield.TextInputLayout>
 
         <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="12dp"
+            app:helperText="Message channel. SSE uses plain streaming HTTPS with no WebSocket upgrade, for networks that block it."
+            style="@style/Widget.Material3.TextInputLayout.OutlinedBox.ExposedDropdownMenu">
+
+            <AutoCompleteTextView
+                android:id="@+id/dropdownTransport"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Transport"
+                android:inputType="none" />
+
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
             android:id="@+id/modelDropdownLayout"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

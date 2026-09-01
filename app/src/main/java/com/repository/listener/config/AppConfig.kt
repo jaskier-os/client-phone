@@ -7,7 +7,13 @@ object AppConfig {
     private const val PREFS_NAME = "listener_config"
 
     private const val KEY_ORCHESTRATOR_URL = "orchestrator_url"
+    private const val KEY_TRANSPORT = "device_transport"
+    private const val KEY_LAST_GOOD_TRANSPORT = "device_transport_last_good"
     private const val KEY_API_KEY = "api_key"
+
+    const val TRANSPORT_AUTO = "auto"
+    const val TRANSPORT_WS = "ws"
+    const val TRANSPORT_SSE = "sse"
     private const val KEY_DEVICE_ID = "device_id"
     private const val KEY_MODEL = "model"
     private const val KEY_MOUSE_SENSITIVITY_X = "mouse_sensitivity_x"
@@ -126,6 +132,34 @@ object AppConfig {
 
     fun setOrchestratorUrl(context: Context, url: String) {
         prefs(context).edit().putString(KEY_ORCHESTRATOR_URL, url).apply()
+    }
+
+    /**
+     * Which channel carries device messages: "auto" (default), "ws" or "sse".
+     *
+     * "sse" replaces the WebSocket with a streaming-HTTPS GET plus POSTs, which
+     * removes the HTTP `Upgrade` handshake that some networks single out. Note
+     * it uses the same host, port and certificate, so it does not change the
+     * TLS fingerprint. "auto" starts on the WebSocket and latches to SSE when
+     * that handshake looks blocked.
+     */
+    fun getTransportPreference(context: Context): String =
+        prefs(context).getString(KEY_TRANSPORT, TRANSPORT_AUTO) ?: TRANSPORT_AUTO
+
+    fun setTransportPreference(context: Context, mode: String) {
+        prefs(context).edit().putString(KEY_TRANSPORT, mode).apply()
+    }
+
+    /**
+     * The transport auto-selection settled on last run, so a phone on a
+     * WebSocket-hostile network starts where it left off instead of re-failing
+     * the handshake on every launch.
+     */
+    fun getLastGoodTransport(context: Context): String? =
+        prefs(context).getString(KEY_LAST_GOOD_TRANSPORT, null)
+
+    fun setLastGoodTransport(context: Context, mode: String) {
+        prefs(context).edit().putString(KEY_LAST_GOOD_TRANSPORT, mode).apply()
     }
 
     fun getOrchestratorHttpUrl(context: Context): String {

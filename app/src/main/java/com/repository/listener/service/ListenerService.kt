@@ -3028,7 +3028,19 @@ class ListenerService : LifecycleService(),
         val apiKey = AppConfig.getApiKey(this)
         val deviceId = AppConfig.getDeviceId(this)
 
-        orchestratorClient = OrchestratorClient(orchestratorUrl, deviceId, apiKey)
+        // Transport: an explicit preference wins; otherwise start on whatever
+        // auto-selection settled on last run, so a phone on a WebSocket-hostile
+        // network doesn't re-fail the handshake at every launch.
+        val transportPref = AppConfig.getTransportPreference(this).let { pref ->
+            if (pref == AppConfig.TRANSPORT_AUTO) {
+                AppConfig.getLastGoodTransport(this) ?: AppConfig.TRANSPORT_AUTO
+            } else pref
+        }
+        orchestratorClient = OrchestratorClient(
+            orchestratorUrl, deviceId, apiKey,
+            transportPreference = transportPref,
+            onTransportLatched = { mode -> AppConfig.setLastGoodTransport(this, mode) }
+        )
         orchestratorClient.setListener(this)
 
         // Discover the desktop's LAN-direct relay server (mDNS) so audio relay can
@@ -7393,6 +7405,7 @@ class ListenerService : LifecycleService(),
                             rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
                             val commitRunnable = Runnable {
                                 rcTurnFinishRunnables.remove(sessionId)
+                                rcInFlightToolCalls.remove(sessionId)
                                 val rows = rcMirror.commitTurn(sessionId)
                                 rcSeenToolCallIds.clear()
                                 if (rcBridge.openSessionId == sessionId &&
@@ -9168,6 +9181,7 @@ class ListenerService : LifecycleService(),
         }
         cancelRcDoneClear(sessionId)
         rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
+        rcInFlightToolCalls.remove(sessionId)
         rcSessionTurning.remove(sessionId)
         rcTranscriptCache.remove(sessionId)
         // Promptness only, NOT the memory bound: this hook never fires on a dropped WS, a PC-side
@@ -9213,8 +9227,23 @@ class ListenerService : LifecycleService(),
             // tool chains. Wait RC_DONE_DEBOUNCE_MS; onRcToolStatus cancels if
             // a tool event arrives, proving the turn isn't really finished.
             rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
-            val r = Runnable {
+            // Bounded so a tool_result lost in transit cannot suppress "Done"
+            // forever -- after the cap we commit anyway and drop the stale set.
+            var inFlightWaits = 0
+            lateinit var r: Runnable
+            r = Runnable {
                 rcTurnFinishRunnables.remove(sessionId)
+                // A turn cannot be over while a tool is still running. Re-arm
+                // rather than commit -- otherwise a long-blocking tool (e.g.
+                // TaskOutput) would be reported as "Done" while still working.
+                if (rcInFlightToolCalls[sessionId]?.isNotEmpty() == true &&
+                    inFlightWaits < RC_MAX_IN_FLIGHT_WAITS) {
+                    inFlightWaits++
+                    rcTurnFinishRunnables[sessionId] = r
+                    mainHandler.postDelayed(r, RC_DONE_DEBOUNCE_MS)
+                    return@Runnable
+                }
+                rcInFlightToolCalls.remove(sessionId)
                 // Only here is a turn really over: raw isFinal fires between tool calls. Commit the
                 // rows, and if the glasses are sitting in this thread, delivering them IS the read
                 // -- without that the bar stays lit behind a thread the user is actively reading,
@@ -9606,14 +9635,29 @@ class ListenerService : LifecycleService(),
         })
     }
 
-    override fun onRcToolStatus(sessionId: String, toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String?, contextPct: Int, isAgent: Boolean, agentName: String?, agentTask: String?, agentToolCount: Int?, agentTokens: Long?, agentElapsedMs: Long?) {
+    override fun onRcToolStatus(sessionId: String, toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String?, contextPct: Int, isAgent: Boolean, agentName: String?, agentTask: String?, agentToolCount: Int?, agentTokens: Long?, agentElapsedMs: Long?, elapsedMs: Long?, seq: Int) {
         // A tool event means the AI is still working: cancel any pending
         // "done" clear that an earlier isFinal MESSAGE may have scheduled.
         if (rcSessionTurning.containsKey(sessionId)) {
             markRcTurning(sessionId, true)
         }
+        // Track which calls are still outstanding so the turn-finish commit can
+        // refuse to fire while one is running.
+        if (toolCallId != null) {
+            val inFlight = rcInFlightToolCalls.getOrPut(sessionId) {
+                java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+            }
+            if (status == "calling" || status == "running") inFlight.add(toolCallId)
+            else inFlight.remove(toolCallId)
+        }
         // Cancel the pending turn-finish commit -- the turn is not over yet.
-        rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
+        // A "running" heartbeat is deliberately exempt: heartbeats arrive every
+        // 2s and the debounce is 5s, so cancelling on them would keep the commit
+        // permanently disarmed and the turn would never be reported done.
+        // The commit runnable already refuses to fire while a call is in flight.
+        if (status != "running") {
+            rcTurnFinishRunnables.remove(sessionId)?.let { mainHandler.removeCallbacks(it) }
+        }
         // Re-mark turning in rcDumpState so the next isFinal can fire a real transition.
         rcDumpState.compute(sessionId) { _, prev ->
             prev?.copy(turning = true)
@@ -9639,6 +9683,8 @@ class ListenerService : LifecycleService(),
             if (agentToolCount != null) put("agentToolCount", agentToolCount)
             if (agentTokens != null) put("agentTokens", agentTokens)
             if (agentElapsedMs != null) put("agentElapsedMs", agentElapsedMs)
+            if (elapsedMs != null) put("elapsedMs", elapsedMs)
+            if (seq > 0) put("seq", seq)
         }.toString()
         sendBroadcast(Intent(ACTION_RC_TOOL_STATUS).apply {
             setPackage(packageName)
@@ -11555,7 +11601,26 @@ class ListenerService : LifecycleService(),
     // turning immediately would flash "X/N Done" between segments.
     private val rcDoneClearRunnables = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
     private val rcTurnFinishRunnables = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
+
+    /**
+     * Tool calls the orchestrator has announced but not yet reported a result
+     * for, per session. A turn cannot be over while this is non-empty -- the
+     * turn-finish debounce re-arms instead of committing. Filtering the
+     * debounce cancel by event type is not sufficient: a long tool emits
+     * "calling" once and then only heartbeats, so an isFinal arriving mid-tool
+     * would cancel once and then commit while the tool was still running.
+     */
+    private val rcInFlightToolCalls =
+        java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
     private val RC_DONE_DEBOUNCE_MS: Long = 5000L
+
+    /**
+     * How many times the turn-finish commit may re-arm while a tool is still
+     * in flight before giving up and committing anyway. At 5s per wait this is
+     * an hour -- long enough for any real tool, short enough that a tool_result
+     * lost in transit cannot suppress "Done" indefinitely.
+     */
+    private val RC_MAX_IN_FLIGHT_WAITS: Int = 720
     @Volatile private var lastIdleNotificationText: String = "Waiting for command"
 
     /**

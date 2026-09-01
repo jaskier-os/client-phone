@@ -150,26 +150,27 @@ class RemoteControlActivity : AppCompatActivity() {
         }
     }
 
-    // Re-binds any in-flight agent rows once per second so the elapsed-time
-    // segment ticks during the call. Auto-stops itself once no agent row is
-    // still in calling/running state.
+    // Re-binds any in-flight tool row once per second so the elapsed-time
+    // segment ticks during the call. Covers every tool, not just agents -- a
+    // TaskOutput can block for minutes and needs the same live feedback.
+    // Auto-stops itself once nothing is in calling/running state.
     @Volatile
-    private var agentTickActive: Boolean = false
-    private val agentTickRunnable = object : Runnable {
+    private var toolTickActive: Boolean = false
+    private val toolTickRunnable = object : Runnable {
         override fun run() {
-            val stillInFlight = adapter.tickInFlightAgentRows()
+            val stillInFlight = adapter.tickInFlightToolRows()
             if (stillInFlight) {
                 thinkingHandler.postDelayed(this, 1000)
             } else {
-                agentTickActive = false
+                toolTickActive = false
             }
         }
     }
-    private fun ensureAgentTicker() {
-        if (agentTickActive) return
-        agentTickActive = true
-        thinkingHandler.removeCallbacks(agentTickRunnable)
-        thinkingHandler.postDelayed(agentTickRunnable, 1000)
+    private fun ensureToolTicker() {
+        if (toolTickActive) return
+        toolTickActive = true
+        thinkingHandler.removeCallbacks(toolTickRunnable)
+        thinkingHandler.postDelayed(toolTickRunnable, 1000)
     }
 
     private fun formatElapsed(ms: Long): String {
@@ -410,6 +411,8 @@ class RemoteControlActivity : AppCompatActivity() {
                 val agentToolCount = if (obj.has("agentToolCount")) obj.optInt("agentToolCount", -1).takeIf { it >= 0 } else null
                 val agentTokens = if (obj.has("agentTokens")) obj.optLong("agentTokens", -1L).takeIf { it >= 0 } else null
                 val agentElapsedMs = if (obj.has("agentElapsedMs")) obj.optLong("agentElapsedMs", -1L).takeIf { it >= 0 } else null
+                val elapsedMs = if (obj.has("elapsedMs")) obj.optLong("elapsedMs", -1L).takeIf { it >= 0 } else null
+                val seq = obj.optInt("seq", 0)
                 runOnUiThread {
                     hideThinkingAnimation()
                     if (ctxPct >= 0) updateContextUsage(ctxPct, -1.0)
@@ -420,13 +423,15 @@ class RemoteControlActivity : AppCompatActivity() {
                     if (rcUiStatus is RcUiStatus.Sending) {
                         setRcStatus(RcUiStatus.Thinking(sendingStartedAtMs))
                     }
-                    // Only show tool status for completion/error, not calling (permission card handles that).
-                    // Exception: agent tool calls (Task / sub-agents) do not produce a permission card,
-                    // so render them on "calling" too — otherwise the user would see no row at all.
-                    if (status == "calling" && !isAgent) return@runOnUiThread
-                    adapter.upsertToolStatus(toolName, status, result, toolArgs, toolCallId, isAgent, agentName, agentTask, agentToolCount, agentTokens, agentElapsedMs)
-                    if (isAgent && (status == "calling" || status == "running")) {
-                        ensureAgentTicker()
+                    // Every tool status is rendered, including "calling". The old
+                    // code suppressed non-agent "calling" on the theory that the
+                    // permission card represented the in-flight tool -- but that
+                    // card had no running state, so an approved-but-still-running
+                    // tool read as finished. upsertToolStatus routes the update
+                    // to the permission card when one exists.
+                    adapter.upsertToolStatus(toolName, status, result, toolArgs, toolCallId, isAgent, agentName, agentTask, agentToolCount, agentTokens, agentElapsedMs, elapsedMs, seq)
+                    if (status == "calling" || status == "running") {
+                        ensureToolTicker()
                     }
                     scrollToBottom()
                 }
@@ -494,6 +499,9 @@ class RemoteControlActivity : AppCompatActivity() {
                     val effectiveStart = if (startedAt > 0L) startedAt else System.currentTimeMillis()
                     setRcStatus(RcUiStatus.Thinking(effectiveStart))
                 }
+                // The orchestrator emits an empty rc_thinking as a spinner stamp
+                // at turn start, then real text once thinking blocks arrive.
+                // Only the latter should create a ThinkingBlock row.
                 if (text.isNotEmpty()) {
                     adapter.updateThinking(text)
                     scrollToBottom()
@@ -697,9 +705,17 @@ class RemoteControlActivity : AppCompatActivity() {
         val wsUrl = AppConfig.getOrchestratorUrl(this)
         val rcApiKey = AppConfig.getApiKey(this)
         val rcDeviceId = AppConfig.getDeviceId(this)
-        RemoteSessionClient(wsUrl, rcApiKey, rcDeviceId).getTranscript(sessionId) { result ->
-            result.onSuccess { transcriptJson ->
-                parseAndLoadTranscript(transcriptJson)
+        // Only the newest page: a long conversation used to ship in full on
+        // every open (including every onResume), which is what made it slow.
+        RemoteSessionClient(wsUrl, rcApiKey, rcDeviceId)
+            .getTranscriptPage(sessionId, transcriptPageSize, null) { result ->
+            result.onSuccess { page ->
+                parseAndLoadTranscript(page.transcript)
+                runOnUiThread {
+                    oldestCursor = page.nextCursor
+                    hasMoreHistory = page.hasMore
+                    historyTruncated = page.truncated
+                }
                 transcriptLoaded = true
                 runOnUiThread { hideLoadingOverlay() }
             }
@@ -718,13 +734,42 @@ class RemoteControlActivity : AppCompatActivity() {
         })
     }
 
+    /**
+     * Parse a transcript payload into renderable rows without touching the UI.
+     * Used by both the initial load and the older-page prepend, so a prepended
+     * page goes through exactly the same dedup/permission-merge logic.
+     * Returns an empty list on malformed input.
+     */
+    private fun parseTranscriptEntries(transcriptJson: String): List<RcMessage> {
+        var parsed: List<RcMessage> = emptyList()
+        parseTranscriptInto(transcriptJson) { parsed = it }
+        return parsed
+    }
+
     private fun parseAndLoadTranscript(transcriptJson: String) {
+        parseTranscriptInto(transcriptJson, null)
+    }
+
+    /**
+     * Shared transcript parser. When [collect] is null the result is committed
+     * to the adapter as a full replace (the initial-load path); otherwise the
+     * rows are handed to the caller and the UI is left alone.
+     */
+    private fun parseTranscriptInto(transcriptJson: String, collect: ((List<RcMessage>) -> Unit)?) {
         try {
             val arr = JSONArray(transcriptJson)
             val messages = mutableListOf<RcMessage>()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
                 val type = obj.optString("type", "text")
+                // Stable row identity, so DiffUtil and the prepend dedup can
+                // recognise the same entry across fetches. The server stamps a
+                // `uid` per entry; only fall back to a random id when it is
+                // absent, which makes that row diff as new.
+                var sub = 0
+                val entryUid = obj.optString("uid", "")
+                fun rowId(): String =
+                    if (entryUid.isNotEmpty()) "$entryUid#${sub++}" else UUID.randomUUID().toString()
                 // Stored transcript entries have { type: "rc_message", data: { ... } }
                 val data = obj.optJSONObject("data")
                 when (type) {
@@ -735,7 +780,7 @@ class RemoteControlActivity : AppCompatActivity() {
                             else -> RcMessage.Role.SYSTEM
                         }
                         messages.add(RcMessage.TextMessage(
-                            id = UUID.randomUUID().toString(),
+                            id = rowId(),
                             timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
                             role = role,
                             text = obj.optString("text", ""),
@@ -744,10 +789,15 @@ class RemoteControlActivity : AppCompatActivity() {
                     }
                     "tool" -> {
                         messages.add(RcMessage.ToolStatus(
-                            id = UUID.randomUUID().toString(),
+                            id = rowId(),
                             timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
                             toolName = obj.optString("toolName", ""),
-                            status = obj.optString("status", "complete")
+                            // A transcript entry is by definition a finished call --
+                            // but say so explicitly rather than defaulting an absent
+                            // status to "complete", which also silently masked live
+                            // entries that never got one.
+                            status = obj.optString("status", "unknown")
+                                .let { if (it == "calling" || it == "running") "complete" else it }
                         ))
                     }
                     "rc_message" -> {
@@ -778,7 +828,7 @@ class RemoteControlActivity : AppCompatActivity() {
                                 }
                                 if (!isSuperseded) {
                                     messages.add(RcMessage.TextMessage(
-                                        id = UUID.randomUUID().toString(),
+                                        id = rowId(),
                                         timestamp = System.currentTimeMillis(),
                                         role = RcMessage.Role.ASSISTANT,
                                         text = text,
@@ -795,7 +845,7 @@ class RemoteControlActivity : AppCompatActivity() {
                                 if (ta is String) ta else ta.toString()
                             } else ""
                             messages.add(RcMessage.PermissionRequest(
-                                id = UUID.randomUUID().toString(),
+                                id = rowId(),
                                 timestamp = System.currentTimeMillis(),
                                 toolName = data.optString("toolName", ""),
                                 toolArgs = toolArgsVal,
@@ -806,7 +856,11 @@ class RemoteControlActivity : AppCompatActivity() {
                                 // orchestrator (via rcPermissionReceiver) are pending,
                                 // because those confirm the CLI is still waiting.
                                 pending = false,
-                                approved = false
+                                approved = false,
+                                // Historical entries are finished by definition; without
+                                // this they would render with the in-flight treatment
+                                // forever.
+                                completed = true
                             ))
                         }
                     }
@@ -815,14 +869,17 @@ class RemoteControlActivity : AppCompatActivity() {
                     }
                     "rc_tool_status" -> {
                         if (data != null) {
+                            // Persisted transcript tool entries are always finished
+                            // (heartbeats are never persisted), so an absent status
+                            // means the entry predates explicit stamping.
                             val status = data.optString("status", "complete")
-                            if (status != "calling") {
+                            if (status != "calling" && status != "running") {
                                 val toolArgsVal = if (data.has("toolArgs") && !data.isNull("toolArgs")) {
                                     val ta = data.get("toolArgs")
                                     if (ta is String) ta else ta.toString()
                                 } else null
                                 messages.add(RcMessage.ToolStatus(
-                                    id = UUID.randomUUID().toString(),
+                                    id = rowId(),
                                     timestamp = System.currentTimeMillis(),
                                     toolName = data.optString("toolName", ""),
                                     status = status,
@@ -840,7 +897,7 @@ class RemoteControlActivity : AppCompatActivity() {
                             val text = data.optString("text", "")
                             if (text.isNotEmpty()) {
                                 messages.add(RcMessage.TextMessage(
-                                    id = UUID.randomUUID().toString(),
+                                    id = rowId(),
                                     timestamp = System.currentTimeMillis(),
                                     role = RcMessage.Role.USER,
                                     text = text,
@@ -916,14 +973,32 @@ class RemoteControlActivity : AppCompatActivity() {
                     merged.add(msg)
                 }
             }
+            if (collect != null) {
+                // Caller owns placement (prepend path); do not touch the adapter.
+                collect(merged)
+                return
+            }
             runOnUiThread {
-                LogCollector.i(TAG, "parseAndLoadTranscript: fetched=${arr.length()} merged=${merged.size} adapterBefore=${adapter.getMessages().size}")
-                if (merged.isNotEmpty()) {
+                val existing = adapter.getMessages()
+                LogCollector.i(TAG, "parseAndLoadTranscript: fetched=${arr.length()} merged=${merged.size} adapterBefore=${existing.size}")
+                if (merged.isEmpty()) {
+                    LogCollector.i(TAG, "parseAndLoadTranscript: merged is empty, adapter NOT updated")
+                } else if (existing.size > merged.size && merged.any { m -> existing.any { it.id == m.id } }) {
+                    // The user has paged in older history that this newest-page
+                    // payload does not contain. Replacing would silently discard
+                    // it and yank them to the bottom, so splice the fresh rows
+                    // onto the tail instead and leave the scroll position alone.
+                    val known = existing.mapTo(HashSet()) { it.id }
+                    val appended = merged.filter { it.id !in known }
+                    if (appended.isNotEmpty()) {
+                        adapter.appendMessages(appended)
+                        if (isUserNearBottom) scrollToBottom()
+                    }
+                    LogCollector.i(TAG, "parseAndLoadTranscript: kept ${existing.size} paged rows, appended ${appended.size}")
+                } else {
                     adapter.submitMessages(merged)
                     scrollToBottom()
                     LogCollector.i(TAG, "parseAndLoadTranscript: adapter updated, adapterAfter=${adapter.getMessages().size}")
-                } else {
-                    LogCollector.i(TAG, "parseAndLoadTranscript: merged is empty, adapter NOT updated")
                 }
                 // Pending permissions are NOT queued from the transcript --
                 // only live re-sends from the orchestrator (via rcPermissionReceiver)
@@ -934,6 +1009,72 @@ class RemoteControlActivity : AppCompatActivity() {
             }
         } catch (e: Exception) {
             LogCollector.e(TAG, "Failed to parse RC transcript: ${e.message}")
+        }
+    }
+
+    // --- Upward pagination ---------------------------------------------------
+    // A long conversation used to be fetched, parsed and bound in full on every
+    // open, which is what made it slow. The newest page loads first; older pages
+    // are pulled in as the user scrolls to the top.
+
+    /** Cursor for the next older page, or null when at the beginning. */
+    private var oldestCursor: String? = null
+    /** Whether the server says older entries exist. */
+    private var hasMoreHistory: Boolean = false
+    /** Server reached the start of its capped store -- older history is gone. */
+    private var historyTruncated: Boolean = false
+    @Volatile
+    private var loadingOlderPage: Boolean = false
+
+    /** Rows to fetch per page. */
+    private val transcriptPageSize: Int = 100
+
+    /**
+     * Fetch the page older than [oldestCursor] and prepend it, preserving the
+     * user's scroll position.
+     */
+    private fun loadOlderTranscriptPage() {
+        val cursor = oldestCursor
+        if (loadingOlderPage || !hasMoreHistory || cursor == null || sessionId.isEmpty()) return
+        loadingOlderPage = true
+        val client = RemoteSessionClient(
+            AppConfig.getOrchestratorUrl(this),
+            AppConfig.getApiKey(this),
+            AppConfig.getDeviceId(this)
+        )
+        client.getTranscriptPage(sessionId, transcriptPageSize, cursor) { result ->
+            result.onSuccess { page ->
+                val older = parseTranscriptEntries(page.transcript)
+                runOnUiThread {
+                    if (older.isNotEmpty()) {
+                        // Anchor on the first visible row so the content the
+                        // user is reading stays put while rows appear above it.
+                        val lm = recyclerView.layoutManager as LinearLayoutManager
+                        val anchorPos = lm.findFirstVisibleItemPosition()
+                        val anchorOffset =
+                            if (anchorPos == RecyclerView.NO_POSITION) 0
+                            else lm.findViewByPosition(anchorPos)?.top ?: 0
+                        // Offset by the count actually INSERTED, not the count
+                        // requested: the adapter drops rows it already has, and
+                        // using the requested size would overshoot the anchor.
+                        val inserted = adapter.prependMessages(older)
+                        if (inserted > 0 && anchorPos != RecyclerView.NO_POSITION) {
+                            lm.scrollToPositionWithOffset(anchorPos + inserted, anchorOffset)
+                        }
+                    }
+                    oldestCursor = page.nextCursor
+                    hasMoreHistory = page.hasMore
+                    historyTruncated = page.truncated
+                    loadingOlderPage = false
+                    LogCollector.i(TAG, "loadOlderTranscriptPage: added=${older.size} hasMore=${page.hasMore} truncated=${page.truncated}")
+                }
+            }
+            result.onFailure { err ->
+                LogCollector.e(TAG, "Failed to fetch older transcript page: ${err.message}")
+                // Clear the guard so a later scroll can retry; leave the cursor
+                // intact so no history is skipped.
+                runOnUiThread { loadingOlderPage = false }
+            }
         }
     }
 
@@ -1001,6 +1142,12 @@ class RemoteControlActivity : AppCompatActivity() {
                 val totalItems = lm.itemCount
                 isUserNearBottom = lastVisible >= totalItems - 3
                 scrollToBottomBtn.visibility = if (isUserNearBottom) View.GONE else View.VISIBLE
+                // Approaching the top: pull in the next older page. Triggering a
+                // few rows early means the history is usually already there by
+                // the time the user reaches the edge.
+                if (dy < 0 && lm.findFirstVisibleItemPosition() <= 3) {
+                    loadOlderTranscriptPage()
+                }
             }
         })
 
@@ -1131,6 +1278,9 @@ class RemoteControlActivity : AppCompatActivity() {
         registerBroadcastReceivers()
         refreshSessionStatus()
         thinkingHandler.post(draftRunnable)
+        // Restart the elapsed ticker if anything was still running when we
+        // paused; ensureToolTicker is a no-op when nothing is in flight.
+        ensureToolTicker()
 
         // Re-fetch transcript to catch messages that arrived while receivers
         // were unregistered (onPause -> onResume gap). Broadcasts are fire-and-
@@ -1195,6 +1345,10 @@ class RemoteControlActivity : AppCompatActivity() {
         }
         unregisterBroadcastReceivers()
         thinkingHandler.removeCallbacks(thinkingRunnable)
+        // Stop the elapsed ticker while off-screen; onResume restarts it if
+        // anything is still in flight.
+        thinkingHandler.removeCallbacks(toolTickRunnable)
+        toolTickActive = false
         hideSlashPopup()
         val recorder = voiceRecorder
         voiceRecorder = null
@@ -1631,6 +1785,15 @@ class RemoteControlActivity : AppCompatActivity() {
         currentPermissionRequest = null
         request.pending = false
         request.approved = approved
+        // Approving starts the tool, it does not finish it. A rejected tool
+        // never runs, so that IS terminal. `completed` flips only when the
+        // orchestrator reports the real tool_result.
+        if (!approved || RcDetailAdapter.completesOnApproval(request.toolName)) {
+            request.completed = true
+        } else {
+            request.startedAtMs = System.currentTimeMillis()
+            ensureToolTicker()
+        }
 
         val isQuestion = request.toolName == "AskUserQuestion"
         val isPlanApproval = request.toolName == "ExitPlanMode"

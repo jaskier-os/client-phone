@@ -88,6 +88,9 @@ class ServerConfigFragment : Fragment() {
     private val models = listOf("sonnet", "opus", "haiku")
     private val sttProviders = listOf("local", "anthropic")
     private val sttProviderLabels = listOf("Local", "Anthropic")
+    private val transportValues =
+        listOf(AppConfig.TRANSPORT_AUTO, AppConfig.TRANSPORT_WS, AppConfig.TRANSPORT_SSE)
+    private val transportLabels = listOf("Auto", "WebSocket", "SSE (no upgrade)")
     private val sttLanguages = listOf("ru", "en")
     private val sttLanguageLabels = listOf("Russian", "English")
     private val locatorApis = listOf(AppConfig.LOCATOR_API_YANDEX, AppConfig.LOCATOR_API_GPS)
@@ -119,6 +122,24 @@ class ServerConfigFragment : Fragment() {
         dropdownModel.setText(AppConfig.getModel(ctx), false)
         dropdownModel.setOnItemClickListener { _, _, position, _ ->
             AppConfig.setModel(ctx, models[position])
+            broadcastSettingsChanged()
+        }
+
+        // Device transport dropdown. "Auto" tries the WebSocket and falls back
+        // to SSE when the upgrade handshake looks blocked; the explicit choices
+        // pin it, which is what makes the behaviour testable.
+        val dropdownTransport = view.findViewById<AutoCompleteTextView>(R.id.dropdownTransport)
+        val transportAdapter = NoFilterAdapter(ctx, android.R.layout.simple_dropdown_item_1line, transportLabels)
+        dropdownTransport.setAdapter(transportAdapter)
+        val transportIdx = transportValues.indexOf(AppConfig.getTransportPreference(ctx)).takeIf { it >= 0 } ?: 0
+        dropdownTransport.setText(transportLabels[transportIdx], false)
+        dropdownTransport.setOnItemClickListener { _, _, position, _ ->
+            AppConfig.setTransportPreference(ctx, transportValues[position])
+            // A pinned choice must not be overridden by what auto-selection
+            // happened to latch onto previously.
+            if (transportValues[position] != AppConfig.TRANSPORT_AUTO) {
+                AppConfig.setLastGoodTransport(ctx, transportValues[position])
+            }
             broadcastSettingsChanged()
         }
 

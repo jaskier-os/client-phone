@@ -18,6 +18,15 @@ sealed class RcMessage {
         val toolCallId: String? = null,
         val isAgent: Boolean = false, val agentName: String? = null,
         val agentTask: String? = null,
+        // Wall-clock origin for the elapsed counter on ANY in-flight tool (not
+        // just agents). Stamped when the Calling row is created.
+        val startedAtMs: Long? = null,
+        // Server-reported elapsed, sent with each 'running' heartbeat.
+        val elapsedMs: Long? = null,
+        // Monotonic per-tool sequence from the orchestrator. sendToPhone is
+        // async, so a heartbeat can land after the 'complete' frame; without
+        // this guard a late 'running' would strand the row as in-flight.
+        val seq: Int = 0,
         // Agent live-state and final stats (Tier B: populated on Complete from
         // AgentTool's <usage> block; agentDispatchedAt is stamped on Calling
         // so the UI can tick elapsed time during the call).
@@ -33,7 +42,14 @@ sealed class RcMessage {
         val requestId: String, val description: String,
         var pending: Boolean = true,
         var approved: Boolean = false,
-        var result: String? = null
+        var result: String? = null,
+        // Approval is NOT completion: an approved TaskOutput can keep running
+        // for minutes. `completed` is set only when the real tool_result
+        // arrives, so the card can render pending -> running -> complete.
+        var completed: Boolean = false,
+        var toolCallId: String? = null,
+        var startedAtMs: Long? = null,
+        var seq: Int = 0
     ) : RcMessage()
 
     data class PlanUpdate(

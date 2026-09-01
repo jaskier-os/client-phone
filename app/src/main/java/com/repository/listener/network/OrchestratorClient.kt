@@ -22,11 +22,23 @@ private fun JSONObject.optStringOrNull(key: String): String? =
 class OrchestratorClient(
     private val url: String,
     private val deviceId: String,
-    private val apiKey: String
+    private val apiKey: String,
+    /**
+     * Which channel to carry device messages over: [TRANSPORT_AUTO],
+     * [TRANSPORT_WS] or [TRANSPORT_SSE]. `auto` starts on the WebSocket and
+     * latches to SSE if the Upgrade handshake looks blocked.
+     */
+    private val transportPreference: String = TRANSPORT_AUTO,
+    /** Called when auto-selection latches onto a transport, so it can be persisted. */
+    private val onTransportLatched: ((String) -> Unit)? = null
 ) {
 
     companion object {
         private const val TAG = "OrchestratorClient"
+
+        const val TRANSPORT_AUTO = "auto"
+        const val TRANSPORT_WS = "ws"
+        const val TRANSPORT_SSE = "sse"
 
         /** Strip null bytes and lone surrogates that crash JNI Modified UTF-8. */
         fun sanitizeUtf8(input: String): String {
@@ -113,7 +125,7 @@ class OrchestratorClient(
         fun onRcSessionEnd(sessionId: String) {}
         fun onRcMessage(sessionId: String, text: String, isFinal: Boolean, requestId: String?, contextPct: Int = -1, costUsd: Double = -1.0) {}
         fun onRcPermissionRequest(sessionId: String, toolName: String, toolArgs: String, requestId: String, description: String?) {}
-        fun onRcToolStatus(sessionId: String, toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String? = null, contextPct: Int = -1, isAgent: Boolean = false, agentName: String? = null, agentTask: String? = null, agentToolCount: Int? = null, agentTokens: Long? = null, agentElapsedMs: Long? = null) {}
+        fun onRcToolStatus(sessionId: String, toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String? = null, contextPct: Int = -1, isAgent: Boolean = false, agentName: String? = null, agentTask: String? = null, agentToolCount: Int? = null, agentTokens: Long? = null, agentElapsedMs: Long? = null, elapsedMs: Long? = null, seq: Int = 0) {}
         fun onRcThinkingEnd(sessionId: String, elapsedMs: Long) {}
         fun onRcPlanUpdate(sessionId: String, entering: Boolean, planContent: String?) {}
         fun onRcAgentStatus(sessionId: String, agentId: String, name: String, status: String, depth: Int) {}
@@ -146,8 +158,13 @@ class OrchestratorClient(
     var isConnected = false
         private set
 
-    private var ws: WebSocket? = null
-    private var client: OkHttpClient? = null
+    /**
+     * The device message channel. Named `ws` because that is what it was for
+     * this class's whole history and every send site reads `ws?.send(...)`;
+     * it is now the transport abstraction, which may be a WebSocket or an
+     * SSE+POST pair. Nothing above this line cares which.
+     */
+    private val ws: RcTransport? get() = transport
     private var listener: MessageListener? = null
     @Volatile
     private var reconnectAttempts = 0
@@ -232,27 +249,26 @@ class OrchestratorClient(
         // Cancel any previous watchdog
         connectWatchdogRunnable?.let { handler.removeCallbacks(it) }
 
-        client = OkHttpClient.Builder()
-            .pingInterval(0, TimeUnit.SECONDS)  // Disabled: health check is separate HTTP stream
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.MILLISECONDS)
-            .writeTimeout(0, TimeUnit.MILLISECONDS)
-            .build()
+        // Which channel to use. `auto` starts on the WebSocket and latches to
+        // SSE if the Upgrade handshake is refused -- the failure mode seen on
+        // networks that single out WebSockets.
+        val chosen = resolveTransport()
+        activeTransportKind = chosen
+        transport = when (chosen) {
+            TRANSPORT_SSE -> SseTransport(httpBaseUrl, apiKey, deviceId)
+            else -> WsTransport(url, apiKey)
+        }
+        LogCollector.i(TAG, "Connecting via $chosen")
 
-        val request = Request.Builder()
-            .url(url)
-            .addHeader("x-api-key", apiKey)
-            .build()
-
-        ws = client!!.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                LogCollector.i(TAG, "WebSocket connected to $url")
+        transport!!.connect(object : RcTransport.Callbacks {
+            override fun onOpen() {
+                LogCollector.i(TAG, "$activeTransportKind connected to $url")
                 connectWatchdogRunnable?.let { handler.removeCallbacks(it) }
                 reconnectAttempts = 0
                 isConnected = true
                 lastWsFrameAt = System.currentTimeMillis()
                 val identifyMsg = Protocol.createIdentifyMessage(deviceId)
-                webSocket.send(identifyMsg.toString())
+                transport?.send(identifyMsg.toString())
                 LogCollector.i(TAG, "Sent identify message for device $deviceId")
                 identified = true
                 // Drain any messages enqueued while disconnected.
@@ -268,7 +284,7 @@ class OrchestratorClient(
                 var failedAt = -1
                 for (i in snapshot.indices) {
                     val msg = snapshot[i]
-                    val ok = try { webSocket.send(msg) } catch (_: Exception) { false }
+                    val ok = try { transport?.send(msg) ?: false } catch (_: Exception) { false }
                     if (ok) drained++ else { failedAt = i; break }
                 }
                 if (failedAt >= 0) {
@@ -295,7 +311,7 @@ class OrchestratorClient(
                 listener?.onConnected()
             }
 
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            override fun onBinary(bytes: ByteString) {
                 lastWsFrameAt = System.currentTimeMillis()
                 // Binary frame: notification TTS audio [notifId 36 bytes] + [audio data]
                 if (bytes.size > 36) {
@@ -309,7 +325,7 @@ class OrchestratorClient(
                 }
             }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
+            override fun onText(text: String) {
                 lastWsFrameAt = System.currentTimeMillis()
                 // Sanitize: strip null bytes and lone surrogates that crash JNI Modified UTF-8
                 val safeText = sanitizeUtf8(text)
@@ -571,7 +587,9 @@ class OrchestratorClient(
                             val agentToolCount = if (envelope.has("agentToolCount")) envelope.optInt("agentToolCount", -1).takeIf { it >= 0 } else null
                             val agentTokens = if (envelope.has("agentTokens")) envelope.optLong("agentTokens", -1L).takeIf { it >= 0 } else null
                             val agentElapsedMs = if (envelope.has("agentElapsedMs")) envelope.optLong("agentElapsedMs", -1L).takeIf { it >= 0 } else null
-                            listener?.onRcToolStatus(sessionId, toolName, rcStatus, result, toolArgs, toolCallId, ctxPct, isAgent, agentName, agentTask, agentToolCount, agentTokens, agentElapsedMs)
+                            val elapsedMs = if (envelope.has("elapsedMs")) envelope.optLong("elapsedMs", -1L).takeIf { it >= 0 } else null
+                            val seq = envelope.optInt("seq", 0)
+                            listener?.onRcToolStatus(sessionId, toolName, rcStatus, result, toolArgs, toolCallId, ctxPct, isAgent, agentName, agentTask, agentToolCount, agentTokens, agentElapsedMs, elapsedMs, seq)
                         }
                         Protocol.TYPE_RC_PLAN_UPDATE -> {
                             val sessionId = envelope.optString("sessionId", "")
@@ -629,7 +647,7 @@ class OrchestratorClient(
                             val status = envelope.optString("status", "")
                             if (status == "ping") {
                                 val pong = Protocol.createHealthPong()
-                                webSocket.send(pong.toString())
+                                transport?.send(pong.toString())
                             }
                         }
                         "ws_size_test_result" -> {
@@ -651,25 +669,23 @@ class OrchestratorClient(
                 }
             }
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                LogCollector.i(TAG, "WebSocket closed: code=$code reason=$reason")
-                stopHeartbeat()
-                synchronized(this@OrchestratorClient) {
-                    isConnected = false
-                    identified = false
-                }
-                listener?.onDisconnected()
-                scheduleReconnect()
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                LogCollector.e(TAG, "WebSocket failure: ${t.message}")
+            override fun onClosed(reason: String, upgradeRejected: Boolean) {
+                LogCollector.i(TAG, "$activeTransportKind closed: $reason")
                 connectWatchdogRunnable?.let { handler.removeCallbacks(it) }
                 stopHeartbeat()
                 synchronized(this@OrchestratorClient) {
                     isConnected = false
                     identified = false
                 }
+                // A refused Upgrade is the signature of a network that objects
+                // to WebSockets specifically, so switch to the transport that
+                // performs no handshake rather than retrying the same one.
+                if (upgradeRejected) noteUpgradeRejected()
+                // Tear the old channel down before reconnecting. Leaving an SSE
+                // stream attached while a new one opens makes the server fan
+                // every frame out twice.
+                try { transport?.close() } catch (_: Exception) {}
+                transport = null
                 listener?.onDisconnected()
                 scheduleReconnect()
             }
@@ -680,12 +696,56 @@ class OrchestratorClient(
         connectWatchdogRunnable = Runnable {
             if (!isConnected && !isShutdown) {
                 LogCollector.e(TAG, "Connect watchdog: no onOpen after ${CONNECT_WATCHDOG_MS}ms, forcing reconnect")
-                try { ws?.cancel() } catch (_: Exception) {}
-                ws = null
+                // A stalled connect is also evidence of interference; two in a
+                // row on the WebSocket is enough to try the handshake-free
+                // transport instead of retrying the same thing forever.
+                noteConnectStall()
+                try { transport?.close() } catch (_: Exception) {}
+                transport = null
                 scheduleReconnect()
             }
         }
         handler.postDelayed(connectWatchdogRunnable!!, CONNECT_WATCHDOG_MS)
+    }
+
+    // ---- transport selection -------------------------------------------------
+
+    @Volatile
+    private var transport: RcTransport? = null
+    @Volatile
+    private var activeTransportKind: String = TRANSPORT_WS
+    /** Latched for the rest of the process once the WebSocket looks blocked. */
+    @Volatile
+    private var forceSseThisRun: Boolean = false
+    @Volatile
+    private var consecutiveConnectStalls: Int = 0
+
+    /** HTTPS origin derived from the WS url, for the SSE endpoints. */
+    private val httpBaseUrl: String = baseWsUrl
+        .replace("ws://", "http://")
+        .replace("wss://", "https://")
+
+    private fun resolveTransport(): String {
+        val configured = transportPreference
+        if (configured == TRANSPORT_WS || configured == TRANSPORT_SSE) return configured
+        return if (forceSseThisRun) TRANSPORT_SSE else TRANSPORT_WS
+    }
+
+    private fun noteUpgradeRejected() {
+        if (activeTransportKind != TRANSPORT_WS || forceSseThisRun) return
+        LogCollector.w(TAG, "WebSocket upgrade refused -- switching to SSE for this run")
+        forceSseThisRun = true
+        onTransportLatched?.invoke(TRANSPORT_SSE)
+    }
+
+    private fun noteConnectStall() {
+        if (activeTransportKind != TRANSPORT_WS || forceSseThisRun) return
+        consecutiveConnectStalls++
+        if (consecutiveConnectStalls >= 2) {
+            LogCollector.w(TAG, "Two consecutive WebSocket connect stalls -- switching to SSE for this run")
+            forceSseThisRun = true
+            onTransportLatched?.invoke(TRANSPORT_SSE)
+        }
     }
 
     /**
@@ -871,8 +931,19 @@ class OrchestratorClient(
         return sent
     }
 
-    fun sendBinary(data: ByteArray) {
-        ws?.send(ByteString.of(*data))
+    /**
+     * Send a raw binary frame on the device channel.
+     *
+     * Only the WebSocket transport carries binary; SSE is text-only and the
+     * orchestrator has no inbound binary handler for the device channel
+     * anyway. Report the failure rather than inventing an envelope the server
+     * would silently ignore.
+     */
+    fun sendBinary(data: ByteArray): Boolean {
+        val t = transport
+        if (t is WsTransport) return t.sendBinary(ByteString.of(*data))
+        LogCollector.e(TAG, "sendBinary is unsupported on the $activeTransportKind transport")
+        return false
     }
 
     fun sendTodoList(): Boolean {
@@ -1469,10 +1540,8 @@ class OrchestratorClient(
         disconnectTranscribeStream()
         reconnectRunnable?.let { handler.removeCallbacks(it) }
         reconnectRunnable = null
-        ws?.close(1000, "Client disconnect")
-        ws = null
-        client?.dispatcher?.executorService?.shutdown()
-        client = null
+        transport?.close()
+        transport = null
         LogCollector.i(TAG, "Disconnected")
     }
 
@@ -1524,8 +1593,8 @@ class OrchestratorClient(
             stopHeartbeat()
             handler.post {
                 isConnected = false
-                ws?.close(1000, "Heartbeat timeout")
-                ws = null
+                transport?.close()
+                transport = null
                 listener?.onDisconnected()
                 scheduleReconnect()
             }
