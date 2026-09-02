@@ -200,6 +200,18 @@ class OrchestratorClient(
     private var lastWsFrameAt = 0L
     private val WS_STALE_THRESHOLD_MS = 5 * 60 * 1000L
 
+    // Health ping/pong, the only end-to-end liveness signal for the socket.
+    // The separate HTTP health check proves the SERVER is up, which a half-open
+    // socket passes happily while every message the phone sends is silently
+    // discarded -- so the pong is what actually detects a dead connection.
+    @Volatile
+    private var lastHealthPingAtMs = 0L
+    @Volatile
+    private var lastHealthPongAtMs = 0L
+
+    /** Pings are 5s apart; three unanswered is a dead socket, not jitter. */
+    private val HEALTH_PONG_TIMEOUT_MS = 20_000L
+
     // ---- rc_user_message retry queue ----------------------------------------
     // Each phone-originated user message gets a client UUID. We hold it here
     // until the orchestrator acks it (rc_user_message_ack with the same
@@ -334,6 +346,11 @@ class OrchestratorClient(
                     val type = envelope.optString("type", "")
                     if (type != "health") {
                         LogCollector.d(TAG, "WS frame: type=$type (${text.length} chars)")
+                    } else {
+                        // The pong is the only proof the socket is alive INBOUND.
+                        // Without it a half-open connection looks healthy while
+                        // everything the user sends is silently dropped.
+                        lastHealthPongAtMs = System.currentTimeMillis()
                     }
 
                     when (type) {
@@ -1278,14 +1295,25 @@ class OrchestratorClient(
         p.attempt += 1
         val webSocket = ws
         val canSend = isConnected && identified && webSocket != null
+        val payload = Protocol.createRcUserMessage(p.sessionId, p.text, p.requestId).toString()
         val sent = if (canSend) {
             try {
-                webSocket.send(Protocol.createRcUserMessage(p.sessionId, p.text, p.requestId).toString())
+                webSocket.send(payload)
             } catch (e: Exception) {
                 LogCollector.w(TAG, "rc_user_message send threw on attempt ${p.attempt}: ${e.message}")
                 false
             }
         } else false
+        // "sent" here means the transport ACCEPTED the frame, not that the
+        // server received it -- OkHttp queues. Log the gating inputs and the
+        // payload size so a message that is reported sent but never arrives can
+        // be told apart from one that was never handed over.
+        LogCollector.i(
+            TAG,
+            "rc_user_message attempt=${p.attempt} accepted=$sent transport=$activeTransportKind " +
+                "isConnected=$isConnected identified=$identified bytes=${payload.length} " +
+                "session=${p.sessionId.take(8)} req=${p.requestId.take(8)}",
+        )
 
         if (sent) {
             // Optimistic: mark as in-flight 'sending' (first attempt) or
@@ -1548,6 +1576,11 @@ class OrchestratorClient(
     private fun startHeartbeat() {
         stopHeartbeat()
         consecutiveHeartbeatFailures = 0
+        // Seed both stamps at connect time: a fresh socket has not been pinged
+        // yet, and comparing against 0 would read as "never answered".
+        val now = System.currentTimeMillis()
+        lastHealthPingAtMs = now
+        lastHealthPongAtMs = now
         heartbeatExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "orchestrator-heartbeat").apply { isDaemon = true }
         }
@@ -1576,8 +1609,23 @@ class OrchestratorClient(
                         return@use
                     }
 
-                    // Send health ping (for orchestrator-side monitoring)
+                    // Send health ping. The orchestrator answers every ping, so
+                    // a reply is proof the socket is alive END TO END -- unlike
+                    // the HTTP check above, which only proves the server process
+                    // is up, and which a half-open socket passes happily.
+                    val pingAtMs = System.currentTimeMillis()
+                    lastHealthPingAtMs = pingAtMs
                     wsRef.send("""{"type":"health","status":"ping"}""")
+
+                    // A ping that went unanswered while later pings were sent
+                    // means the socket is dead in the inbound direction: the
+                    // phone believes it is connected, the server has already
+                    // forgotten it, and every message the user sends vanishes.
+                    val sincePong = pingAtMs - lastHealthPongAtMs
+                    if (lastHealthPongAtMs > 0 && sincePong > HEALTH_PONG_TIMEOUT_MS) {
+                        onHeartbeatFailure("no health reply in ${sincePong}ms (half-open socket)")
+                        return@use
+                    }
                     consecutiveHeartbeatFailures = 0
                 }
             } catch (e: Exception) {

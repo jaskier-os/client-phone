@@ -52,6 +52,10 @@ class WsTransport(
     private val url: String,
     private val apiKey: String
 ) : RcTransport {
+    companion object {
+        private const val TAG = "WsTransport"
+    }
+
     private var client: OkHttpClient? = null
     private var ws: WebSocket? = null
 
@@ -87,8 +91,23 @@ class WsTransport(
         })
     }
 
-    override fun send(payload: String): Boolean =
-        try { ws?.send(payload) ?: false } catch (_: Exception) { false }
+    override fun send(payload: String): Boolean {
+        val socket = ws ?: return false
+        return try {
+            val ok = socket.send(payload)
+            // queueSize is bytes accepted but not yet written to the network.
+            // A frame that OkHttp accepts and never flushes looks identical to a
+            // delivered one from the caller's side, so surface the backlog.
+            val queued = socket.queueSize()
+            if (!ok || queued > 0) {
+                LogCollector.w(TAG, "ws send accepted=$ok queued=${queued}B bytes=${payload.length}")
+            }
+            ok
+        } catch (e: Exception) {
+            LogCollector.w(TAG, "ws send threw: ${e.message}")
+            false
+        }
+    }
 
     /** Binary frames, which only this transport can carry natively. */
     fun sendBinary(bytes: ByteString): Boolean =
