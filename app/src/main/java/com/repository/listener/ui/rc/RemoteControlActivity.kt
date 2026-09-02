@@ -888,6 +888,14 @@ class RemoteControlActivity : AppCompatActivity() {
                                     status = status,
                                     result = if (data.has("result") && !data.isNull("result")) data.optString("result", null) else null,
                                     toolArgs = toolArgsVal,
+                                    // Carry the invocation id through. Without it
+                                    // a reconnect -- which reloads the transcript
+                                    // and replaces the rows -- leaves the tool
+                                    // row unidentifiable, so the next heartbeat
+                                    // matches nothing and adds a SECOND row for
+                                    // the same call: one stale and complete, one
+                                    // live and running.
+                                    toolCallId = if (data.has("toolCallId") && !data.isNull("toolCallId")) data.optString("toolCallId", null) else null,
                                     isAgent = data.optBoolean("isAgent", false),
                                     agentName = if (data.has("agentName") && !data.isNull("agentName")) data.optString("agentName", null) else null,
                                     agentTask = if (data.has("agentTask") && !data.isNull("agentTask")) data.optString("agentTask", null) else null
@@ -999,9 +1007,32 @@ class RemoteControlActivity : AppCompatActivity() {
                     }
                     LogCollector.i(TAG, "parseAndLoadTranscript: kept ${existing.size} paged rows, appended ${appended.size}")
                 } else {
-                    adapter.submitMessages(merged)
+                    // Preserve rows for calls that are still in flight. The
+                    // transcript only holds finished entries, so replacing
+                    // wholesale during a live turn -- which a reconnect does --
+                    // swaps a running row for a stale complete one, and the next
+                    // heartbeat then has nothing to match.
+                    // Identity has to be matched on BOTH forms. A live row knows
+                    // its toolCallId; the persisted transcript entry for the
+                    // same invocation often does not, and keying on one form
+                    // only leaves the two looking unrelated -- so the stale
+                    // "complete" row renders beside the live "running" one.
+                    fun keysOf(m: RcMessage): Set<String> {
+                        val t = m as? RcMessage.ToolStatus ?: return emptySet()
+                        val keys = mutableSetOf("${t.toolName}|${t.toolArgs}")
+                        t.toolCallId?.let { keys.add(it) }
+                        return keys
+                    }
+                    val liveKeys = existing
+                        .filter { (it as? RcMessage.ToolStatus)?.status.let { s -> s == "calling" || s == "running" } }
+                        .flatMapTo(HashSet()) { keysOf(it) }
+                    val reconciled = if (liveKeys.isEmpty()) merged else {
+                        merged.filterNot { m -> keysOf(m).any { it in liveKeys } } +
+                            existing.filter { m -> keysOf(m).any { it in liveKeys } }
+                    }
+                    adapter.submitMessages(reconciled)
                     scrollToBottom()
-                    LogCollector.i(TAG, "parseAndLoadTranscript: adapter updated, adapterAfter=${adapter.getMessages().size}")
+                    LogCollector.i(TAG, "parseAndLoadTranscript: adapter updated, adapterAfter=${adapter.getMessages().size} liveKeys=${liveKeys.size}")
                 }
                 // Pending permissions are NOT queued from the transcript --
                 // only live re-sends from the orchestrator (via rcPermissionReceiver)

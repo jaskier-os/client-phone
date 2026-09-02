@@ -1622,6 +1622,12 @@ class OrchestratorClient(
                     // phone believes it is connected, the server has already
                     // forgotten it, and every message the user sends vanishes.
                     val sincePong = pingAtMs - lastHealthPongAtMs
+                    val sinceFrame = pingAtMs - lastWsFrameAt
+                    LogCollector.i(
+                        TAG,
+                        "heartbeat: sincePong=${sincePong}ms sinceAnyFrame=${sinceFrame}ms " +
+                            "transport=$activeTransportKind",
+                    )
                     if (lastHealthPongAtMs > 0 && sincePong > HEALTH_PONG_TIMEOUT_MS) {
                         onHeartbeatFailure("no health reply in ${sincePong}ms (half-open socket)")
                         return@use
