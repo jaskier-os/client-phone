@@ -61,18 +61,23 @@ class WsTransport(
 
     override fun connect(listener: RcTransport.Callbacks) {
         client = OkHttpClient.Builder()
-            // WebSocket-level pings, NOT application health pings. These are
-            // what keep a NAT/firewall mapping alive and what lets OkHttp
-            // notice a dead peer: it fails the call when a pong does not come
-            // back, closing the socket instead of leaving it half-open.
+            // Protocol-level pings are DISABLED on purpose.
             //
-            // This was previously 0 (disabled) on the grounds that the health
-            // check covers it -- but that check runs over a SEPARATE HTTP
-            // connection, so it proves the server is up while saying nothing
-            // about this socket. With pings off, the connection went silent at
-            // the protocol level and was dropped by something in the path
-            // roughly every 10-20s.
-            .pingInterval(20, TimeUnit.SECONDS)
+            // On this phone's path they are lost: the server sends pings and
+            // records pongs=0 for the life of the socket, and OkHttp sees at
+            // most one pong before timing out. Application frames on the very
+            // same socket flow fine the whole time -- health messages every 5s,
+            // acknowledged at TCP level in the capture. Something between the
+            // two drops WebSocket control frames while forwarding data frames.
+            //
+            // With pings on, OkHttp closed a perfectly working connection every
+            // ~40s (two missed 20s intervals) and reconnected in a loop. That
+            // is worse than not detecting a dead peer, because liveness is
+            // already covered: the app sends its own health ping every 5s and
+            // treats several unanswered ones as a dead socket
+            // (MAX_UNANSWERED_PINGS in OrchestratorClient). Those are ordinary
+            // data frames, so they survive this path.
+            .pingInterval(0, TimeUnit.SECONDS)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .writeTimeout(0, TimeUnit.MILLISECONDS)
