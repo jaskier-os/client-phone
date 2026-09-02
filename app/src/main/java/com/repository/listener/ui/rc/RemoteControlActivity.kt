@@ -429,6 +429,9 @@ class RemoteControlActivity : AppCompatActivity() {
                     // card had no running state, so an approved-but-still-running
                     // tool read as finished. upsertToolStatus routes the update
                     // to the permission card when one exists.
+                    // Logged because a status that arrives but renders wrong is
+                    // otherwise indistinguishable from one that never arrived.
+                    LogCollector.i(TAG, "rc_tool_status in: tool=$toolName status=$status seq=$seq callId=${toolCallId?.takeLast(8)} elapsed=$elapsedMs")
                     adapter.upsertToolStatus(toolName, status, result, toolArgs, toolCallId, isAgent, agentName, agentTask, agentToolCount, agentTokens, agentElapsedMs, elapsedMs, seq)
                     if (status == "calling" || status == "running") {
                         ensureToolTicker()

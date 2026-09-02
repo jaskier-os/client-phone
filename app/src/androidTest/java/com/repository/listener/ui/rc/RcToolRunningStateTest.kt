@@ -59,7 +59,10 @@ class RcToolRunningStateTest {
 
         /** Seconds the tool is held in flight. Long enough for two elapsed
          *  samples plus scheduling slack, short enough not to bore a recording. */
-        private const val SLEEP_SECONDS = 40
+        // Long enough that the whole sample sequence (first sample, 3s hold,
+        // 3.5s gap, second sample) fits well inside it even when the model takes
+        // several seconds to decide to call Bash.
+        private const val SLEEP_SECONDS = 75
 
         /** Unique-enough token so the tool row can be told apart from unrelated
          *  Bash rows in the same session. Kept short so it survives the 60-char
@@ -170,15 +173,32 @@ class RcToolRunningStateTest {
         //    buildToolPrimaryText suppresses the counter below 2s, so this also
         //    proves the counter appeared at all.
         // ------------------------------------------------------------------
+        // The in-flight row appears BEFORE its elapsed counter does (the counter
+        // is suppressed under 2s). Wait for the row first, and only then for the
+        // counter: polling for both at once let the whole 40s window pass
+        // unnoticed, after which the row is legitimately complete and the
+        // "still in flight" assertions were being made about a finished tool.
         val appearDeadline = System.currentTimeMillis() + TOOL_APPEAR_TIMEOUT_MS
+        var sawInFlight = false
+        while (System.currentTimeMillis() < appearDeadline) {
+            if (runningRows().any { it.contains(MARKER) }) { sawInFlight = true; break }
+            // Only meaningful before the row exists: a completed row appearing
+            // without any in-flight row ever showing IS the regression.
+            assertNotShownAsCompleted("waiting for in-flight row")
+            Thread.sleep(200)
+        }
+        assertTrue(
+            "No in-flight ([*]) row for our command ever appeared within " +
+                "${TOOL_APPEAR_TIMEOUT_MS}ms. In-flight tools are being suppressed or " +
+                "rendered as finished. ${renderedDump()}",
+            sawInFlight
+        )
+
         var first: Pair<String, Long>? = null
         while (System.currentTimeMillis() < appearDeadline) {
-            // Check the regression continuously, not just at sample points: if
-            // approval alone paints the row green we want to catch that frame.
-            assertNotShownAsCompleted("waiting for in-flight row")
             first = runningRowWithElapsed()
             if (first != null) break
-            Thread.sleep(500)
+            Thread.sleep(200)
         }
         val (firstText, firstElapsed) = first ?: throw AssertionError(
             "No in-flight tool row with an elapsed counter appeared within " +
@@ -188,11 +208,14 @@ class RcToolRunningStateTest {
         )
         val sampledAtMs = System.currentTimeMillis()
         ScreenshotHelper.take("02_tool_in_flight_first_sample")
+
+        // Assert BEFORE holding: the hold plus the sample gap is ~7s, which on a
+        // slow first sample can carry us past the end of the sleep, at which
+        // point a completed row is correct and asserting otherwise is wrong.
+        assertNotShownAsCompleted("first sample, elapsed=${firstElapsed}s")
+
         // Hold the in-flight state visible so a screen recording captures it.
         Thread.sleep(HOLD_MS)
-
-        // Still in flight (the sleep is nowhere near done) -- must NOT look done.
-        assertNotShownAsCompleted("first sample, elapsed=${firstElapsed}s")
 
         // ------------------------------------------------------------------
         // 2. The counter must ADVANCE. A frozen label would mean

@@ -20,6 +20,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.DiffUtil
+import com.repository.listener.util.LogCollector
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.repository.listener.R
@@ -59,6 +60,7 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
 
         fun friendlyToolName(raw: String): String = TOOL_DISPLAY_NAMES[raw] ?: raw
 
+        private const val TAG = "RcDetailAdapter"
         private const val MAX_PREVIEW_LINES = 10
         private const val COLOR_DIFF_RED = 0xFFCC241D.toInt()
         private const val COLOR_DIFF_GREEN = 0xFF98971A.toInt()
@@ -218,12 +220,7 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                 }
 
                 if (msg.status == "calling" || msg.status == "running") {
-                    val pulse = AlphaAnimation(1f, 0.3f).apply {
-                        duration = 800
-                        repeatCount = Animation.INFINITE
-                        repeatMode = Animation.REVERSE
-                    }
-                    holder.itemView.startAnimation(pulse)
+                    startPulse(holder.itemView)
                 } else {
                     holder.itemView.clearAnimation()
                 }
@@ -301,11 +298,7 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
 
                 // Pulse while running, matching the ToolStatus row treatment.
                 if (msg.approved && !msg.completed) {
-                    holder.itemView.startAnimation(AlphaAnimation(1f, 0.3f).apply {
-                        duration = 800
-                        repeatCount = Animation.INFINITE
-                        repeatMode = Animation.REVERSE
-                    })
+                    startPulse(holder.itemView)
                 } else {
                     holder.itemView.clearAnimation()
                 }
@@ -490,6 +483,23 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
         notifyItemRangeInserted(start, newer.size)
     }
 
+    /**
+     * Start the in-flight pulse, or leave it running if it already is.
+     *
+     * Rebinding used to call startAnimation unconditionally, which restarts the
+     * fade from full opacity. With a heartbeat every 2s that reads as a visible
+     * blink rather than a smooth pulse.
+     */
+    private fun startPulse(view: View) {
+        val existing = view.animation
+        if (existing != null && !existing.hasEnded()) return
+        view.startAnimation(AlphaAnimation(1f, 0.3f).apply {
+            duration = 800
+            repeatCount = Animation.INFINITE
+            repeatMode = Animation.REVERSE
+        })
+    }
+
     fun updateStreamingText(requestId: String, text: String) {
         for (i in messages.indices.reversed()) {
             val msg = messages[i]
@@ -557,8 +567,21 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                     // Same out-of-order guard as the permission card above, plus
                     // a hard rule: a row that reached a terminal status never
                     // goes back to running.
-                    if (seq > 0 && seq < msg.seq) return
-                    if (isTerminalStatus(msg.status) && !isTerminalStatus(status)) return
+                    if (seq > 0 && seq < msg.seq) {
+                        LogCollector.i(TAG, "upsert DROP stale: $toolName $status seq=$seq < row seq=${msg.seq}")
+                        return
+                    }
+                    if (isTerminalStatus(msg.status) && !isTerminalStatus(status)) {
+                        LogCollector.i(TAG, "upsert DROP downgrade: $toolName ${msg.status} -> $status")
+                        return
+                    }
+                    LogCollector.i(TAG, "upsert ToolStatus row: $toolName ${msg.status} -> $status seq=$seq")
+                    // A heartbeat only advances the elapsed counter; the status
+                    // and every other visible property are unchanged. Rebinding
+                    // the whole row for that restarts the pulse animation, which
+                    // at one heartbeat every 2s reads as a blink.
+                    val elapsedOnly = msg.status == status &&
+                        (status == "calling" || status == "running")
                     messages[i] = msg.copy(
                         status = status,
                         seq = if (seq > 0) seq else msg.seq,
@@ -577,12 +600,17 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                         agentTokens = agentTokens ?: msg.agentTokens,
                         agentElapsedMs = agentElapsedMs ?: msg.agentElapsedMs
                     )
-                    notifyItemChanged(i)
+                    if (elapsedOnly) {
+                        notifyItemChanged(i, PAYLOAD_AGENT_TICK)
+                    } else {
+                        notifyItemChanged(i)
+                    }
                     return
                 }
             }
         }
         // No matching card found, add new ToolStatus
+        LogCollector.i(TAG, "upsert NEW row: $toolName status=$status seq=$seq callId=${toolCallId?.takeLast(8)}")
         val msg = RcMessage.ToolStatus(
             id = java.util.UUID.randomUUID().toString(),
             timestamp = System.currentTimeMillis(),
@@ -1104,7 +1132,10 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
 
     private fun buildToolPrimaryTextBase(msg: RcMessage.ToolStatus): String {
         val statusIcon = when (msg.status) {
-            "running" -> "[*] "
+            // "calling" is in flight exactly like "running" -- it is the first
+            // event of an invocation, before any heartbeat. Leaving it iconless
+            // made an in-flight row visually indistinguishable from a plain one.
+            "calling", "running" -> "[*] "
             "complete" -> "[+] "
             "error" -> "[!] "
             else -> ""
