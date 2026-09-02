@@ -271,6 +271,17 @@ class OrchestratorClient(
         // Cancel any previous watchdog
         connectWatchdogRunnable?.let { handler.removeCallbacks(it) }
 
+        // Close any previous channel FIRST. Overwriting the field left the old
+        // WebSocket open with its own reader thread: two live sockets to the
+        // orchestrator, the server's device registration pointing at whichever
+        // identified last, and replies going to the socket the app was no
+        // longer reading. That looked exactly like a one-way network stall --
+        // pings went out on one socket, pongs came back on the other.
+        transport?.let { old ->
+            try { old.close() } catch (_: Exception) {}
+        }
+        transport = null
+
         // Which channel to use. `auto` starts on the WebSocket and latches to
         // SSE if the Upgrade handshake is refused -- the failure mode seen on
         // networks that single out WebSockets.

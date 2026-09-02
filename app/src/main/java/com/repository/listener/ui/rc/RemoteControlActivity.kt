@@ -1023,9 +1023,23 @@ class RemoteControlActivity : AppCompatActivity() {
                         t.toolCallId?.let { keys.add(it) }
                         return keys
                     }
+                    // Keys the transcript reports as FINISHED. The transcript is
+                    // the server's record, so it wins: a completion frame sent
+                    // while the socket was dead never reached us, and without
+                    // this the row would tick forever on a tool that ended
+                    // minutes ago.
+                    // Only a toolCallId is safe here. The (toolName, toolArgs)
+                    // fallback is NOT unique across invocations -- running the
+                    // same command twice produces the same key -- so using it
+                    // would let an OLD completed entry retire the row of a
+                    // freshly started, identical call.
+                    val finishedKeys = merged
+                        .filter { (it as? RcMessage.ToolStatus)?.status.let { s -> s == "complete" || s == "error" } }
+                        .mapNotNullTo(HashSet()) { (it as? RcMessage.ToolStatus)?.toolCallId }
                     val liveKeys = existing
                         .filter { (it as? RcMessage.ToolStatus)?.status.let { s -> s == "calling" || s == "running" } }
                         .flatMapTo(HashSet()) { keysOf(it) }
+                        .filterNotTo(HashSet()) { it in finishedKeys }
                     val reconciled = if (liveKeys.isEmpty()) merged else {
                         merged.filterNot { m -> keysOf(m).any { it in liveKeys } } +
                             existing.filter { m -> keysOf(m).any { it in liveKeys } }

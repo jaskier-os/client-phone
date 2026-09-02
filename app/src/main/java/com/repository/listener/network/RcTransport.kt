@@ -61,7 +61,18 @@ class WsTransport(
 
     override fun connect(listener: RcTransport.Callbacks) {
         client = OkHttpClient.Builder()
-            .pingInterval(0, TimeUnit.SECONDS) // health check is a separate HTTP stream
+            // WebSocket-level pings, NOT application health pings. These are
+            // what keep a NAT/firewall mapping alive and what lets OkHttp
+            // notice a dead peer: it fails the call when a pong does not come
+            // back, closing the socket instead of leaving it half-open.
+            //
+            // This was previously 0 (disabled) on the grounds that the health
+            // check covers it -- but that check runs over a SEPARATE HTTP
+            // connection, so it proves the server is up while saying nothing
+            // about this socket. With pings off, the connection went silent at
+            // the protocol level and was dropped by something in the path
+            // roughly every 10-20s.
+            .pingInterval(20, TimeUnit.SECONDS)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .writeTimeout(0, TimeUnit.MILLISECONDS)
