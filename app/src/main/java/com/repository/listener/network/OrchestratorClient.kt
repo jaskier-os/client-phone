@@ -1650,11 +1650,15 @@ class OrchestratorClient(
                     lastHealthPingAtMs = pingAtMs
                     unansweredPings++
                     wsRef.send("""{"type":"health","status":"ping"}""")
-                    LogCollector.i(
-                        TAG,
-                        "heartbeat: unanswered=$unansweredPings sincePong=${pingAtMs - lastHealthPongAtMs}ms " +
-                            "transport=$activeTransportKind",
-                    )
+                    // Only worth a line once replies start going missing. A log
+                    // every 5s per connection buried everything else.
+                    if (unansweredPings > 1) {
+                        LogCollector.w(
+                            TAG,
+                            "heartbeat: $unansweredPings pings unanswered " +
+                                "(${pingAtMs - lastHealthPongAtMs}ms since last reply, transport=$activeTransportKind)",
+                        )
+                    }
                     if (unansweredPings >= MAX_UNANSWERED_PINGS) {
                         // Do NOT reset the counter here. onHeartbeatFailure only
                         // acts once it has seen MAX_HEARTBEAT_FAILURES in a row,
