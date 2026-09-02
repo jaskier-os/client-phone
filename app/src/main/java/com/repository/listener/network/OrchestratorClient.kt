@@ -209,8 +209,18 @@ class OrchestratorClient(
     @Volatile
     private var lastHealthPongAtMs = 0L
 
-    /** Pings are 5s apart; three unanswered is a dead socket, not jitter. */
-    private val HEALTH_PONG_TIMEOUT_MS = 20_000L
+    /**
+     * Consecutive pings with no reply before the socket is declared dead.
+     *
+     * Counted in pings, NOT wall-clock: the heartbeat executor gets throttled,
+     * so ticks bunch together and an elapsed-time test condemns a healthy
+     * connection. Six at 5s apart tolerates a long stall while still catching a
+     * genuinely half-open socket well inside a minute.
+     */
+    private val MAX_UNANSWERED_PINGS = 6
+
+    @Volatile
+    private var unansweredPings = 0
 
     // ---- rc_user_message retry queue ----------------------------------------
     // Each phone-originated user message gets a client UUID. We hold it here
@@ -351,6 +361,7 @@ class OrchestratorClient(
                         // Without it a half-open connection looks healthy while
                         // everything the user sends is silently dropped.
                         lastHealthPongAtMs = System.currentTimeMillis()
+                        unansweredPings = 0
                     }
 
                     when (type) {
@@ -1581,6 +1592,7 @@ class OrchestratorClient(
         val now = System.currentTimeMillis()
         lastHealthPingAtMs = now
         lastHealthPongAtMs = now
+        unansweredPings = 0
         heartbeatExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
             Thread(r, "orchestrator-heartbeat").apply { isDaemon = true }
         }
@@ -1613,25 +1625,36 @@ class OrchestratorClient(
                     // a reply is proof the socket is alive END TO END -- unlike
                     // the HTTP check above, which only proves the server process
                     // is up, and which a half-open socket passes happily.
+                    // Count UNANSWERED pings rather than elapsed wall-clock. The
+                    // heartbeat runs on a scheduled executor that the OS
+                    // throttles: ticks bunch up, and a delayed tick makes a
+                    // perfectly healthy socket look like it went 25s without a
+                    // reply -- which then tears down a working connection and
+                    // reconnects in a loop.
+                    // The counter is cleared by the pong handler itself, so a
+                    // tick only ever increments: whether a reply arrived is the
+                    // receiver's business, not something to re-derive from
+                    // timestamps on a thread the OS delays.
                     val pingAtMs = System.currentTimeMillis()
                     lastHealthPingAtMs = pingAtMs
+                    unansweredPings++
                     wsRef.send("""{"type":"health","status":"ping"}""")
-
-                    // A ping that went unanswered while later pings were sent
-                    // means the socket is dead in the inbound direction: the
-                    // phone believes it is connected, the server has already
-                    // forgotten it, and every message the user sends vanishes.
-                    val sincePong = pingAtMs - lastHealthPongAtMs
-                    val sinceFrame = pingAtMs - lastWsFrameAt
                     LogCollector.i(
                         TAG,
-                        "heartbeat: sincePong=${sincePong}ms sinceAnyFrame=${sinceFrame}ms " +
+                        "heartbeat: unanswered=$unansweredPings sincePong=${pingAtMs - lastHealthPongAtMs}ms " +
                             "transport=$activeTransportKind",
                     )
-                    if (lastHealthPongAtMs > 0 && sincePong > HEALTH_PONG_TIMEOUT_MS) {
-                        onHeartbeatFailure("no health reply in ${sincePong}ms (half-open socket)")
+                    if (unansweredPings >= MAX_UNANSWERED_PINGS) {
+                        // Do NOT reset the counter here. onHeartbeatFailure only
+                        // acts once it has seen MAX_HEARTBEAT_FAILURES in a row,
+                        // so zeroing this made every failure look like the first
+                        // and the threshold was never reached -- the socket sat
+                        // dead for minutes with no reconnect.
+                        onHeartbeatFailure("$unansweredPings health pings unanswered (half-open socket)")
                         return@use
                     }
+                    // Reached only on a tick that was actually answered, so a
+                    // dead socket cannot keep clearing its own failure count.
                     consecutiveHeartbeatFailures = 0
                 }
             } catch (e: Exception) {
