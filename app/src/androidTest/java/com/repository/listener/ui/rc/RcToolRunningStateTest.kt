@@ -62,7 +62,7 @@ class RcToolRunningStateTest {
         // Long enough that the whole sample sequence (first sample, 3s hold,
         // 3.5s gap, second sample) fits well inside it even when the model takes
         // several seconds to decide to call Bash.
-        private const val SLEEP_SECONDS = 75
+        private const val SLEEP_SECONDS = 150
 
         /** Unique-enough token so the tool row can be told apart from unrelated
          *  Bash rows in the same session. Kept short so it survives the 60-char
@@ -213,6 +213,20 @@ class RcToolRunningStateTest {
         // slow first sample can carry us past the end of the sleep, at which
         // point a completed row is correct and asserting otherwise is wrong.
         assertNotShownAsCompleted("first sample, elapsed=${firstElapsed}s")
+
+        // The counter is the authority on how much sleep is left. Polling can
+        // land late (the row has to exist AND carry a counter before we see it),
+        // and continuing with less than the sample sequence's own duration
+        // remaining would assert "still running" about a tool that finished --
+        // failing the test for the app behaving correctly.
+        val neededSeconds = (HOLD_MS + SAMPLE_GAP_MS) / 1000 + 5
+        assertTrue(
+            "Sampling started ${firstElapsed}s into a ${SLEEP_SECONDS}s sleep, leaving " +
+                "less than ${neededSeconds}s -- not enough to sample twice inside the " +
+                "in-flight window. This is a harness timing problem, not an app bug: " +
+                "raise SLEEP_SECONDS. ${renderedDump()}",
+            SLEEP_SECONDS - firstElapsed >= neededSeconds
+        )
 
         // Hold the in-flight state visible so a screen recording captures it.
         Thread.sleep(HOLD_MS)
