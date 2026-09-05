@@ -3864,6 +3864,13 @@ class ListenerService : LifecycleService(),
         // Connect to orchestrator
         orchestratorClient.connect()
 
+        // Keep the live-CLI list fresh for the phone's own chat list. This used
+        // to be armed only when the glasses connected, so with no glasses the
+        // list was never fetched and every chat fell back to its stored status
+        // -- which reads "ended" whenever the desktop WebSocket dropped, showing
+        // a session that is still running on the PC as stopped.
+        startRcLiveListPolling()
+
         // Start listening for wake word
         audioRecorder.start()
 
@@ -9401,7 +9408,10 @@ class ListenerService : LifecycleService(),
      * while the glasses were already connected. Two minutes is the latency ceiling for that one
      * case; one HTTPS GET per two minutes is negligible next to the RFCOMM link it accompanies.
      */
-    private val rcLiveListPollMs = 120_000L
+    // 120s was too coarse for "is this chat running": a session whose desktop
+    // WebSocket dropped kept showing its stale stored status for up to two
+    // minutes, and a turn that started in that window went unnoticed.
+    private val rcLiveListPollMs = 20_000L
 
     /** Serializes reconcile writes against each other; WS writers race them via CAS instead. */
     private val rcLiveMergeLock = Any()
@@ -9431,6 +9441,11 @@ class ListenerService : LifecycleService(),
     /** Arms the poll. Idempotent: a second call does not stack a second chain of runnables. */
     private fun startRcLiveListPolling() {
         mainHandler.removeCallbacks(rcLiveListPoll)
+        // Reconcile once immediately. Waiting a full interval left the live-CLI
+        // set empty for the first two minutes after start, so every chat fell
+        // back to its stored status -- which reads "ended" whenever the desktop
+        // WebSocket dropped, and showed a running session as stopped.
+        reconcileLiveRcSessions("startup")
         mainHandler.postDelayed(rcLiveListPoll, rcLiveListPollMs)
         LogCollector.i(TAG, "[RCLIST] poll armed every ${rcLiveListPollMs}ms")
     }
@@ -11330,8 +11345,12 @@ class ListenerService : LifecycleService(),
         // phone refuses to open its transcriber, feed its VAD or arm its watchdog
         // for the next session -- and nobody transcribes at all.
         glassesSttGate = GlassesSttGate.default()
-        // Nothing renders the snapshot with the link down, so the poll is pure battery cost.
-        stopRcLiveListPolling()
+        // The poll is NOT stopped here any more. It used to be glasses-only, on
+        // the reasoning that nothing renders the snapshot with the link down --
+        // but the phone's own chat list now depends on it to tell a running
+        // session from a stopped one. Stopping it left every chat showing its
+        // stale stored status, which reads "ended" whenever the desktop
+        // WebSocket dropped. It stops with the service (see onDestroy).
         // Without this the byte-identical dedup would permanently suppress the corrective resync
         // the next link-up owes: the glasses come back holding nothing. Under the push lock so it
         // cannot be overwritten by a push already past its own send.

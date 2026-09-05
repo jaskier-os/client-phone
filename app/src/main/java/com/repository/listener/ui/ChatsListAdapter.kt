@@ -736,12 +736,13 @@ class ChatsListAdapter(
 
                 // The decision lives in rcDotState (pure, unit-tested); this only
                 // maps it to a colour and drives the pulse animation.
-                when (rcDotState(
+                val dotState = rcDotState(
                     status = item.status,
                     turning = item.turning,
                     unread = item.unread,
                     isLive = liveRcSessionIds.contains(item.sessionId),
-                )) {
+                )
+                when (dotState) {
                     RcDotState.ENDED -> {
                         h.pulseAnimator?.cancel()
                         h.pulseAnimator = null

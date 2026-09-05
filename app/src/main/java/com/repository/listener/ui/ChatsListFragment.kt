@@ -820,6 +820,14 @@ class ChatsListFragment : Fragment() {
                 emptyContainer.visibility = View.GONE
                 recyclerView.visibility = View.VISIBLE
                 adapter.pinnedIds = context?.let { AppConfig.getPinnedChatIds(it) } ?: emptySet()
+                // Without this the search results render every dot as if nothing
+                // were running: the adapter keeps whatever set the main list left
+                // behind, and on a cold search that is empty.
+                adapter.liveRcSessionIds =
+                    liveSessions.filter { it.alive }.map { it.sessionId }.toSet()
+                adapter.thinkingRcSessionIds =
+                    ListenerService.thinkingRcStartTimes.keys.toSet() +
+                        liveSessions.filter { it.thinking }.map { it.sessionId }.toSet()
                 adapter.submitList(items)
             }
         }
@@ -1080,13 +1088,15 @@ class ChatsListFragment : Fragment() {
                             isoFmt.parse(rc.createdAt.replace("Z", "").substringBefore("."))?.time ?: System.currentTimeMillis()
                         } catch (_: Exception) { System.currentTimeMillis() }
 
-                        // Default to "ended" for REST-ingested sessions; the
-                        // rcDumpState reconciliation pass below promotes any
-                        // session that the service knows is genuinely active.
+                        // Trust the status the server sent. This used to hardcode
+                        // "ended" and rely on a later pass to promote whatever
+                        // the SERVICE happened to know about -- so a session the
+                        // service had never seen rendered as stopped even though
+                        // the very response being parsed said it was active.
                         rcSessions[rc.sessionId] = ChatListItem.RemoteControlSession(
                             sessionId = rc.sessionId,
                             workDir = rc.workDir,
-                            status = "ended",
+                            status = rc.status,
                             lastMessage = null,
                             startedAt = startedAt,
                             sessionName = rc.title
