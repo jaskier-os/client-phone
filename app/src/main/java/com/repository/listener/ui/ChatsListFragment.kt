@@ -481,6 +481,7 @@ class ChatsListFragment : Fragment() {
                 @Suppress("DEPRECATION")
                 val pos = vh.adapterPosition
                 LogCollector.i(TAG, "onSwiped: pos=$pos direction=$direction")
+                if (pos == RecyclerView.NO_POSITION) return
                 val item = adapter.getItemAt(pos) as? ChatListItem.RemoteControlSession
                 if (item == null) {
                     adapter.notifyItemChanged(pos)
@@ -1152,6 +1153,23 @@ class ChatsListFragment : Fragment() {
         }
     }
 
+    /**
+     * Epoch millis for a LiveSession.startedAt, which the orchestrator sends as
+     * a number but which may also arrive as an ISO string. Falls back to "now"
+     * so an unparseable value sorts as recent rather than vanishing to the
+     * bottom of the list.
+     */
+    private fun startedAtMillis(raw: String): Long {
+        raw.toLongOrNull()?.let { return it }
+        return try {
+            java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US).apply {
+                timeZone = java.util.TimeZone.getTimeZone("UTC")
+            }.parse(raw.replace("Z", "").substringBefore("."))?.time ?: System.currentTimeMillis()
+        } catch (_: Exception) {
+            System.currentTimeMillis()
+        }
+    }
+
     private fun buildMergedList(
         chats: List<ChatSummary>,
         sessions: List<LiveSession>
@@ -1201,7 +1219,11 @@ class ChatsListFragment : Fragment() {
         val sessionItems = if (filterType == "chats") emptyList() else {
             sessions
                 .filter { session -> !rcSessions.containsKey(session.sessionId) }
-                .map { ChatListItem.RemoteSession(it) to it.startedAt }
+                // Sort key must be the same ISO scale as every other row. The
+                // orchestrator reports startedAt as epoch millis, so comparing it
+                // raw put "1788..." against "2026-..." and sank every live-only
+                // row to the bottom of the list, where it was easy to miss.
+                .map { ChatListItem.RemoteSession(it) to isoFmt.format(java.util.Date(startedAtMillis(it.startedAt))) }
         }
         // Copilot sessions interleave with chats by recency. They are
         // conversation-like, so they show under "All" and "Chats" but not the

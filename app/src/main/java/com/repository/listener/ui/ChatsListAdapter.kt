@@ -802,13 +802,6 @@ class ChatsListAdapter(
     fun getItemAt(position: Int): ChatListItem? =
         if (position in items.indices) items[position] else null
 
-    fun removeItemAt(position: Int) {
-        if (position in items.indices) {
-            items.removeAt(position)
-            notifyItemRemoved(position)
-        }
-    }
-
     fun submitList(newItems: List<ChatListItem>) {
         items.clear()
         items.addAll(newItems)
@@ -816,6 +809,11 @@ class ChatsListAdapter(
     }
 
     private fun formatRelativeTime(isoTimestamp: String): String {
+        // Live sessions carry startedAt as epoch millis, not ISO. Without this
+        // the parse failed and the raw number was rendered as the subtitle.
+        isoTimestamp.toLongOrNull()?.let { millis ->
+            return formatRelativeMillis(millis)
+        }
         return try {
             val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
                 timeZone = TimeZone.getTimeZone("UTC")
@@ -835,6 +833,21 @@ class ChatsListAdapter(
             }
         } catch (e: Exception) {
             isoTimestamp
+        }
+    }
+
+    /** Relative label for an epoch-millis instant. */
+    private fun formatRelativeMillis(millis: Long): String {
+        val diffMs = System.currentTimeMillis() - millis
+        val diffMin = diffMs / 60_000
+        val diffHour = diffMs / 3_600_000
+        val diffDay = diffMs / 86_400_000
+        return when {
+            diffMin < 1 -> "just now"
+            diffMin < 60 -> "${diffMin}m ago"
+            diffHour < 24 -> "${diffHour}h ago"
+            diffDay < 7 -> "${diffDay}d ago"
+            else -> SimpleDateFormat("MMM d", Locale.US).format(java.util.Date(millis))
         }
     }
 

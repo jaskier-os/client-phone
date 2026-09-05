@@ -102,11 +102,24 @@ class ChatsListLiveStatusTest {
     }
 
     private fun navigateToChatTab() {
-        val tabs = device.findObject(By.res(PKG, "tabLayout")) ?: error("tabLayout missing")
-        val bounds = tabs.visibleBounds
-        val tabWidth = bounds.width() / 7
-        device.click(bounds.left + tabWidth + (tabWidth / 2), bounds.centerY())
+        // Select the tab by its content description, not by dividing the
+        // TabLayout's bounds: those bounds can report the whole screen, which
+        // put the tap in the middle of the content and silently left the app on
+        // whatever tab it was already showing.
+        val chats = device.wait(Until.findObject(By.desc("Chats")), UI_TIMEOUT)
+            ?: error("Chats tab not found")
+        chats.click()
         Thread.sleep(1_500)
+        // A previous test may have left the list scrolled; every test here reads
+        // rows by text, so start from the top or the reads silently see nothing.
+        val rv = device.findObject(By.res(PKG, "chatsRecycler"))
+        if (rv != null) {
+            val b = rv.visibleBounds
+            repeat(10) {
+                device.swipe(b.centerX(), b.top + 100, b.centerX(), b.bottom - 100, 8)
+            }
+            Thread.sleep(800)
+        }
     }
 
     @Test
@@ -243,13 +256,23 @@ class ChatsListLiveStatusTest {
         device.wait(Until.hasObject(By.res(PKG, "chatsRecycler")), UI_TIMEOUT)
         Thread.sleep(3_000)
 
-        // The live-only row titles as "> <dirName>".
-        val row = device.wait(Until.findObject(By.textContains(dirName)), UI_TIMEOUT)
+        // The live-only row titles as "> <dirName>". It may be below the fold in
+        // a long list, so scroll the list looking for it before failing.
+        var row = device.findObject(By.textContains(dirName))
+        var scrolls = 0
+        while (row == null && scrolls < 8) {
+            val rv = device.findObject(By.res(PKG, "chatsRecycler")) ?: break
+            val rb = rv.visibleBounds
+            device.swipe(rb.centerX(), rb.bottom - 100, rb.centerX(), rb.top + 100, 12)
+            Thread.sleep(800)
+            row = device.findObject(By.textContains(dirName))
+            scrolls++
+        }
         assertTrue("Live session row for '$dirName' must be present", row != null)
 
         // Walk up: the click listener lives on the row container, not on the
         // TextView the text matched, and the container may be several levels up.
-        var node = row
+        var node: androidx.test.uiautomator.UiObject2? = row
         var clickable = false
         var depth = 0
         val chain = StringBuilder()
