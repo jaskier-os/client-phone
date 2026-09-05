@@ -1075,9 +1075,22 @@ class ChatsListFragment : Fragment() {
     ): List<ChatListItem> {
         val pinnedIds = context?.let { AppConfig.getPinnedChatIds(it) } ?: emptySet()
 
+        // A conversation the user started in a terminal on the PC has no
+        // orchestrator store row, so /remote-control/sessions reports it
+        // "ended" (red) even while its CLI is running. The live-session list is
+        // the authority on what is actually running, so promote any row it
+        // covers to active. Without this the list shows red dots for chats that
+        // are demonstrably alive.
+        val liveIds = sessions.filter { it.alive }.mapTo(HashSet()) { it.sessionId }
+        val rcValues = rcSessions.values.map { rc ->
+            if (rc.status != "active" && liveIds.contains(rc.sessionId)) {
+                rc.copy(status = "active")
+            } else rc
+        }
+
         if (showOnlyOpen) {
             // "Only open" chip: show active RC sessions grouped by folder.
-            return groupActiveByFolder(rcSessions.values)
+            return groupActiveByFolder(rcValues)
         }
 
         // "All" chip: include every RC session (active AND ended). Format
@@ -1087,7 +1100,7 @@ class ChatsListFragment : Fragment() {
             timeZone = java.util.TimeZone.getTimeZone("UTC")
         }
         val allRcItems = if (filterType == "chats") emptyList() else {
-            rcSessions.values
+            rcValues
                 .sortedByDescending { it.startedAt }
                 .map { rc -> (rc as ChatListItem) to isoFmt.format(java.util.Date(rc.startedAt)) }
         }
@@ -1141,7 +1154,7 @@ class ChatsListFragment : Fragment() {
 
         // Append VS Code project shortcuts at the bottom (excluding dirs
         // that have an active RC session, since those already appear above).
-        val activeRcWorkDirs = rcSessions.values
+        val activeRcWorkDirs = rcValues
             .filter { it.status == "active" }
             .map { it.workDir }.toSet()
         val projectItems: List<ChatListItem> = if (filterType == "chats" || vscodeProjects.isEmpty()) {
