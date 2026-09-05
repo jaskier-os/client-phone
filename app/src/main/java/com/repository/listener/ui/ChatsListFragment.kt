@@ -939,6 +939,8 @@ class ChatsListFragment : Fragment() {
                 .keys.toSet()
             adapter.thinkingRcSessionIds =
                 wsThinking + sessions.filter { it.thinking }.map { it.sessionId }.toSet()
+            adapter.liveRcSessionIds =
+                sessions.filter { it.alive }.map { it.sessionId }.toSet()
             val scrollState = recyclerView.layoutManager?.onSaveInstanceState()
             adapter.submitList(items)
             scrollState?.let { recyclerView.layoutManager?.onRestoreInstanceState(it) }

@@ -68,6 +68,14 @@ class ChatsListAdapter(
     var respondingChatIds: Set<String> = emptySet()
     var thinkingRcSessionIds: Set<String> = emptySet()
 
+    /**
+     * Sessions whose CLI is running on the PC right now. Needed because
+     * `turning`/`unread` are set only by live WebSocket events, so an idle
+     * session the phone has not been watching looks identical to a finished
+     * one and would otherwise show a red dot while it is actually alive.
+     */
+    var liveRcSessionIds: Set<String> = emptySet()
+
     class ChatViewHolder(
         val container: LinearLayout,
         val aliveIndicator: View,
@@ -746,6 +754,16 @@ class ChatsListAdapter(
                     h.pulseAnimator?.start()
                 } else if (item.unread) {
                     // Finished turn, user hasn't opened it yet -- green solid.
+                    h.pulseAnimator?.cancel()
+                    h.pulseAnimator = null
+                    h.statusDot.alpha = 1f
+                    (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_green))
+                } else if (liveRcSessionIds.contains(item.sessionId)) {
+                    // Idle, but its CLI is running on the PC -- green solid.
+                    // `turning` and `unread` are only ever set by live WebSocket
+                    // events, so a session the phone has not been watching has
+                    // both false and used to fall through to red, which reads as
+                    // "not running" for a session that demonstrably is.
                     h.pulseAnimator?.cancel()
                     h.pulseAnimator = null
                     h.statusDot.alpha = 1f
