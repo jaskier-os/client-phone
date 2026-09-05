@@ -276,7 +276,6 @@ class ChatsListLiveStatusTest {
             promoted.isNotEmpty()
         )
         val target = promoted.first()
-        val dirName = liveWorkDirById[target]!!.trimEnd('/').substringAfterLast('/')
 
         navigateToChatTab()
         device.wait(Until.hasObject(By.res(PKG, "chatsRecycler")), UI_TIMEOUT)
@@ -343,8 +342,17 @@ class ChatsListLiveStatusTest {
         search!!.text = dirName
         Thread.sleep(4_000)
 
-        val hit = device.wait(Until.findObject(By.textContains(dirName)), UI_TIMEOUT)
-        assertTrue("A live store-less session must be findable by search", hit != null)
+        // Scope the match to the RESULT LIST. By.textContains(dirName) alone
+        // also matches the search field we just typed into, so it would pass
+        // with zero results.
+        val results = device.wait(Until.findObject(By.res(PKG, "chatsRecycler")), UI_TIMEOUT)
+        assertTrue("Results list must be present", results != null)
+        val hit = results!!.findObject(By.textContains(dirName))
+        assertTrue(
+            "A live store-less session must be findable by search (no matching " +
+                "row inside chatsRecycler for '$dirName')",
+            hit != null
+        )
         Thread.sleep(2_000)
 
         // Leave the search box clean for the next test.
@@ -412,8 +420,11 @@ class ChatsListLiveStatusTest {
         // Opening it must actually reach the RC chat screen, which is what
         // triggers the adopt.
         row.click()
+        // Assert on the RC screen only. The old OR fell back to "the folder name
+        // is on screen", which is still true from the list row when the click
+        // does nothing -- so it passed whether or not the row opened.
         val opened = device.wait(Until.hasObject(By.res(PKG, "rcLoadingOverlay")), UI_TIMEOUT) ||
-            device.wait(Until.hasObject(By.textContains(dirName)), UI_TIMEOUT)
+            device.wait(Until.hasObject(By.res(PKG, "rcInput")), UI_TIMEOUT)
         assertTrue("Tapping a live session row must open the RC chat", opened)
         Thread.sleep(2_000)
         device.pressBack()

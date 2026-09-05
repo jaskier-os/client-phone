@@ -47,6 +47,13 @@ class ChatsListFragment : Fragment() {
         private const val TAG = "ChatsListFragment"
         private const val RETRY_DELAY_MS = 5000L
         private const val POLL_INTERVAL_MS = 10000L
+
+        /**
+         * A WS-driven "thinking" marker older than this is treated as stale.
+         * Matches the orchestrator's RC_TURN_TIMEOUT_MS: it abandons a turn after
+         * 10 minutes, so nothing legitimately thinks for longer.
+         */
+        private const val THINKING_MAX_AGE_MS = 10 * 60 * 1000L
         private const val COLOR_ERROR_TEXT = 0xFFfb4934.toInt()
         private val TYPE_LABELS = arrayOf("All", "Chats", "Remote Sessions")
         private val TYPE_VALUES = arrayOf("all", "chats", "rc")
@@ -905,9 +912,18 @@ class ChatsListFragment : Fragment() {
             // Union of both sources: WS events catch turns that start while the
             // app is watching; the polled live list catches a turn that was
             // already running before it started listening (cold open).
+            //
+            // The WS half is cleared by a message/end/permission event, so a
+            // dropped frame would otherwise leave a spinner up for the life of
+            // the process. The orchestrator abandons a turn after 10 minutes, so
+            // anything older than that is stale by definition -- age it out and
+            // the union becomes self-correcting.
+            val staleBefore = System.currentTimeMillis() - THINKING_MAX_AGE_MS
+            val wsThinking = ListenerService.thinkingRcStartTimes
+                .filterValues { it > staleBefore }
+                .keys.toSet()
             adapter.thinkingRcSessionIds =
-                ListenerService.thinkingRcStartTimes.keys.toSet() +
-                    sessions.filter { it.thinking }.map { it.sessionId }.toSet()
+                wsThinking + sessions.filter { it.thinking }.map { it.sessionId }.toSet()
             val scrollState = recyclerView.layoutManager?.onSaveInstanceState()
             adapter.submitList(items)
             scrollState?.let { recyclerView.layoutManager?.onRestoreInstanceState(it) }
@@ -1225,7 +1241,22 @@ class ChatsListFragment : Fragment() {
 
         if (showOnlyOpen) {
             // "Only open" chip: show active RC sessions grouped by folder.
-            return groupActiveByFolder(rcValues)
+            // A terminal-started CLI has no store row at all, so it would be
+            // absent from exactly the view meant to list what is running. Give
+            // it a row built from the live-session record.
+            val storeLess = sessions
+                .filter { it.alive && !rcSessions.containsKey(it.sessionId) }
+                .map {
+                    ChatListItem.RemoteControlSession(
+                        sessionId = it.sessionId,
+                        workDir = it.workDir,
+                        status = "active",
+                        lastMessage = null,
+                        startedAt = startedAtMillis(it.startedAt),
+                        sessionName = it.title
+                    )
+                }
+            return groupActiveByFolder(rcValues + storeLess)
         }
 
         // "All" chip: include every RC session (active AND ended). Format
