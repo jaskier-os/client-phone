@@ -59,8 +59,59 @@ class ChatsListLiveStatusTest {
         Thread.sleep(1_000)
     }
 
+    @org.junit.After
+    fun teardown() {
+        // Kill only a CLI this test started; never touch the user's own.
+        fixturePid?.let { runCatching { PcTuiDriver().killTui("SIGTERM") } }
+        fixturePid = null
+    }
+
     /** workDir per live session id, filled by [liveSessionIds]. */
     private var liveWorkDirById: Map<String, String> = emptyMap()
+
+    /** A CLI this test started on the PC, torn down in [teardown]. */
+    private var fixturePid: Int? = null
+
+    /**
+     * Start a real interactive CLI on the PC that the orchestrator has never
+     * seen, so it has no store row -- the exact state a user creates by running
+     * the CLI in their own terminal.
+     *
+     * Created as a fixture rather than assumed from ambient state: opening such
+     * a session ADOPTS it and gives it a store row, so the condition destroys
+     * itself and an assumption-based test would silently skip on every run after
+     * the first, reporting green while asserting nothing.
+     *
+     * Returns the sessionId, or null when the PC driver is unreachable.
+     */
+    private fun startStoreLessCli(): String? {
+        val pc = PcTuiDriver()
+        return try {
+            pc.requireReachable()
+            // The driver holds one TUI at a time and rejects a second start;
+            // clear any session left by an earlier test before claiming it.
+            pc.reset()
+            Thread.sleep(1_000)
+            val tui = pc.startTui(
+                workDir = "/media/varingait/Lobotomite/.cache/rc-live-attach-test",
+                permissionMode = "bypassPermissions"
+            )
+            fixturePid = tui.pid
+            // Let pc-agent publish it into the live-session registry.
+            val deadline = System.currentTimeMillis() + 60_000
+            while (System.currentTimeMillis() < deadline) {
+                if (liveSessionIds().contains(tui.sessionId)) return tui.sessionId
+                Thread.sleep(2_000)
+            }
+            tui.sessionId
+        } catch (e: Throwable) {
+            fixtureError = "${e.javaClass.simpleName}: ${e.message}"
+            null
+        }
+    }
+
+    /** Why [startStoreLessCli] failed, so the assertion can say so. */
+    private var fixtureError: String? = null
 
     /** Live CLIs on the PC, straight from the orchestrator. */
     private fun liveSessionIds(): Set<String> {
@@ -155,8 +206,19 @@ class ChatsListLiveStatusTest {
         // is the strongest claim this screen-scrape can honestly support.
         val liveWithRow = live.filter { stored.containsKey(it) }
         val expectedFolders = liveWithRow.mapNotNull { sid -> liveWorkDirById[sid] }.toSet()
-        val activeRows = device.findObjects(By.textContains("- active"))
-            .mapNotNull { runCatching { it.text }.getOrNull() }
+        // Collect while scrolling: findObjects only sees rendered rows, and a
+        // long list keeps some active sessions below the fold. Reading only the
+        // first screen would report them missing.
+        val activeRows = mutableSetOf<String>()
+        repeat(6) {
+            device.findObjects(By.textContains("- active"))
+                .mapNotNull { runCatching { it.text }.getOrNull() }
+                .forEach { activeRows.add(it) }
+            val rv = device.findObject(By.res(PKG, "chatsRecycler")) ?: return@repeat
+            val rb = rv.visibleBounds
+            device.swipe(rb.centerX(), rb.bottom - 120, rb.centerX(), rb.top + 120, 12)
+            Thread.sleep(700)
+        }
         val activeFolders = activeRows.map { it.substringBefore(" - ") }.toSet()
 
         val missing = expectedFolders - activeFolders
@@ -245,16 +307,16 @@ class ChatsListLiveStatusTest {
     fun aStoreLessLiveSessionIsFindableBySearch() {
         val live = liveSessionIds()
         val stored = storedStatuses()
-        // Opening such a session ADOPTS it, which gives it a store row -- so this
-        // condition destroys itself once exercised. Skip rather than fail when no
-        // store-less CLI is currently running; a hard failure here would just mean
-        // "a previous test already adopted the only candidate".
-        val storeless = live.filter { !stored.containsKey(it) }
-        assumeTrue(
-            "No live CLI without a store row right now; nothing to exercise",
-            storeless.isNotEmpty()
+        // Start our own store-less CLI rather than hoping one exists: opening a
+        // session adopts it, so an ambient candidate is consumed by the first
+        // test that runs and every later run would silently skip.
+        val target = live.firstOrNull { !stored.containsKey(it) } ?: startStoreLessCli()
+        assertTrue(
+            "Could not obtain a live CLI without a store row. driverError=$fixtureError",
+            target != null
         )
-        val dirName = liveWorkDirById[storeless.first()]!!
+        liveSessionIds() // refresh liveWorkDirById for a freshly started fixture
+        val dirName = liveWorkDirById[target]!!
             .trimEnd('/').substringAfterLast('/')
 
         navigateToChatTab()
@@ -283,14 +345,14 @@ class ChatsListLiveStatusTest {
         val live = liveSessionIds()
         val stored = storedStatuses()
 
-        // Same self-destroying condition as the search test: opening the row
-        // adopts the session and gives it a store row.
-        val storeless = live.filter { !stored.containsKey(it) }
-        assumeTrue(
-            "No live CLI without a store row right now; nothing to exercise",
-            storeless.isNotEmpty()
+        // Same self-destroying condition as the search test, so start a fixture
+        // rather than assuming one is lying around.
+        val target = live.firstOrNull { !stored.containsKey(it) } ?: startStoreLessCli()
+        assertTrue(
+            "Could not obtain a live CLI without a store row. driverError=$fixtureError",
+            target != null
         )
-        val target = storeless.first()
+        liveSessionIds() // refresh liveWorkDirById for a freshly started fixture
         val dirName = liveWorkDirById[target]!!.trimEnd('/').substringAfterLast('/')
 
         navigateToChatTab()

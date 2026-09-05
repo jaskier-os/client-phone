@@ -789,7 +789,7 @@ class ChatsListFragment : Fragment() {
             val rcList = rcResults ?: emptyList()
             val searchRcSessions = mutableMapOf<String, ChatListItem.RemoteControlSession>()
             for (rc in rcList) searchRcSessions[rc.sessionId] = rc
-            val items = buildSearchResults(chats, searchRcSessions)
+            val items = buildSearchResults(chats, searchRcSessions, query)
             loadingContainer.visibility = View.GONE
             if (items.isEmpty()) {
                 recyclerView.visibility = View.GONE
@@ -851,7 +851,8 @@ class ChatsListFragment : Fragment() {
 
     private fun buildSearchResults(
         chats: List<ChatSummary>,
-        searchRcSessions: Map<String, ChatListItem.RemoteControlSession>
+        searchRcSessions: Map<String, ChatListItem.RemoteControlSession>,
+        query: String
     ): List<ChatListItem> {
         val chatItems = chats.map { ChatListItem.Conversation(it) to it.lastActivityAt }
         val isoFmt = isoSortFormat()
@@ -869,13 +870,16 @@ class ChatsListFragment : Fragment() {
         // A live CLI with no store row exists only as a live-session row, so
         // without this it was visible in the list but impossible to find by
         // searching for it -- the same invisibility the sort-key fix removed.
-        val query = searchInput.text.toString().trim().lowercase()
+        // Use the query these results were fetched for, not the current field
+        // value: the fetch is async, so re-reading could filter live rows by a
+        // newer query than the chats and RC rows beside them.
+        val q = query.trim().lowercase()
         val liveItems = live
             .filter { !searchRcSessions.containsKey(it.sessionId) }
             .filter {
-                query.isEmpty() ||
-                    it.workDir.lowercase().contains(query) ||
-                    (it.title?.lowercase()?.contains(query) == true)
+                q.isEmpty() ||
+                    it.workDir.lowercase().contains(q) ||
+                    (it.title?.lowercase()?.contains(q) == true)
             }
             .map {
                 ChatListItem.RemoteSession(it) to
