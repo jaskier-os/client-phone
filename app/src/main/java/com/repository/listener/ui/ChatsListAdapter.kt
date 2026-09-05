@@ -734,46 +734,44 @@ class ChatsListAdapter(
                 h.statusDot.visibility = View.VISIBLE
                 h.titleView.setTextColor(color(ctx, R.color.gbx_purple))
 
-                if (item.status != "active") {
-                    // Ended sessions: gray, no pulse.
-                    h.pulseAnimator?.cancel()
-                    h.pulseAnimator = null
-                    h.statusDot.alpha = 1f
-                    (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_gray))
-                    h.titleView.setTextColor(color(ctx, R.color.gbx_gray))
-                } else if (item.turning) {
-                    // AI is still producing output -- orange + pulsing.
-                    (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_orange))
-                    if (h.pulseAnimator == null) {
-                        h.pulseAnimator = ObjectAnimator.ofFloat(h.statusDot, "alpha", 1f, 0.4f).apply {
-                            duration = 750
-                            repeatCount = ValueAnimator.INFINITE
-                            repeatMode = ValueAnimator.REVERSE
-                        }
+                // The decision lives in rcDotState (pure, unit-tested); this only
+                // maps it to a colour and drives the pulse animation.
+                when (rcDotState(
+                    status = item.status,
+                    turning = item.turning,
+                    unread = item.unread,
+                    isLive = liveRcSessionIds.contains(item.sessionId),
+                )) {
+                    RcDotState.ENDED -> {
+                        h.pulseAnimator?.cancel()
+                        h.pulseAnimator = null
+                        h.statusDot.alpha = 1f
+                        (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_gray))
+                        h.titleView.setTextColor(color(ctx, R.color.gbx_gray))
                     }
-                    h.pulseAnimator?.start()
-                } else if (item.unread) {
-                    // Finished turn, user hasn't opened it yet -- green solid.
-                    h.pulseAnimator?.cancel()
-                    h.pulseAnimator = null
-                    h.statusDot.alpha = 1f
-                    (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_green))
-                } else if (liveRcSessionIds.contains(item.sessionId)) {
-                    // Idle, but its CLI is running on the PC -- green solid.
-                    // `turning` and `unread` are only ever set by live WebSocket
-                    // events, so a session the phone has not been watching has
-                    // both false and used to fall through to red, which reads as
-                    // "not running" for a session that demonstrably is.
-                    h.pulseAnimator?.cancel()
-                    h.pulseAnimator = null
-                    h.statusDot.alpha = 1f
-                    (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_green))
-                } else {
-                    // Finished + already read -- red solid.
-                    h.pulseAnimator?.cancel()
-                    h.pulseAnimator = null
-                    h.statusDot.alpha = 1f
-                    (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_red))
+                    RcDotState.TURNING -> {
+                        (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_orange))
+                        if (h.pulseAnimator == null) {
+                            h.pulseAnimator = ObjectAnimator.ofFloat(h.statusDot, "alpha", 1f, 0.4f).apply {
+                                duration = 750
+                                repeatCount = ValueAnimator.INFINITE
+                                repeatMode = ValueAnimator.REVERSE
+                            }
+                        }
+                        h.pulseAnimator?.start()
+                    }
+                    RcDotState.UNREAD, RcDotState.RUNNING -> {
+                        h.pulseAnimator?.cancel()
+                        h.pulseAnimator = null
+                        h.statusDot.alpha = 1f
+                        (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_green))
+                    }
+                    RcDotState.IDLE -> {
+                        h.pulseAnimator?.cancel()
+                        h.pulseAnimator = null
+                        h.statusDot.alpha = 1f
+                        (h.statusDot.background as? GradientDrawable)?.setColor(color(ctx, R.color.gbx_red))
+                    }
                 }
 
                 h.container.setOnClickListener {
