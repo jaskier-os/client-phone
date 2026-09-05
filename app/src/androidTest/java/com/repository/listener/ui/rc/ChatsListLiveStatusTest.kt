@@ -165,6 +165,45 @@ class ChatsListLiveStatusTest {
     }
 
     /**
+     * Promoting a row to "active" must not make it swipeable to END SESSION.
+     * Those CLIs are typically ones the user started in their own terminal, and
+     * the swipe kills the process outright with no confirmation. Swiping a
+     * promoted row must leave the session alive on the PC.
+     */
+    @Test
+    fun promotedRowsCannotBeSwipedToEndTheUsersOwnCli() {
+        val live = liveSessionIds()
+        val stored = storedStatuses()
+        val promoted = live.filter { stored[it] != null && stored[it] != "active" }
+        assertTrue(
+            "Precondition: need a live CLI whose store row is not active. live=$live",
+            promoted.isNotEmpty()
+        )
+        val target = promoted.first()
+        val dirName = liveWorkDirById[target]!!.trimEnd('/').substringAfterLast('/')
+
+        navigateToChatTab()
+        device.wait(Until.hasObject(By.res(PKG, "chatsRecycler")), UI_TIMEOUT)
+        Thread.sleep(3_000)
+
+        val row = device.wait(Until.findObject(By.textContains(dirName)), UI_TIMEOUT)
+        assertTrue("Promoted row for '$dirName' must be visible", row != null)
+
+        // Try to swipe it away, the gesture that ends a session.
+        val b = row!!.visibleBounds
+        device.swipe(b.centerX(), b.centerY(), b.left + 10, b.centerY(), 20)
+        Thread.sleep(3_000)
+
+        // Ground truth: the CLI must still be alive on the PC afterwards.
+        assertTrue(
+            "Swiping a promoted row must NOT end the user's own terminal CLI " +
+                "($target should still be live)",
+            liveSessionIds().contains(target)
+        )
+        Thread.sleep(2_000)
+    }
+
+    /**
      * A live CLI the orchestrator has no store row for surfaces only as a
      * live-session row. That row used to have its click listener explicitly set
      * to null, so the user could see the session running but had no way to open

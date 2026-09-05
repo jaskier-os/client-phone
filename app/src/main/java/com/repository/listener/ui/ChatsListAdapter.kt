@@ -35,7 +35,14 @@ sealed class ChatListItem {
         val turning: Boolean = false,
         // True when the AI just finished a turn and the user hasn't yet opened
         // the row. Drives the green dot color and folder-chip badge count.
-        val unread: Boolean = false
+        val unread: Boolean = false,
+        // True when `status` was raised to "active" because a live CLI exists on
+        // the PC, rather than because the orchestrator owns the session. Such a
+        // CLI is usually one the user started in their own terminal, so the
+        // swipe-to-end affordance must stay off for it: ending would kill a
+        // process the phone never started. Status alone cannot express this --
+        // it drives both the dot colour and what may be killed.
+        val promotedFromLive: Boolean = false
     ) : ChatListItem()
     data class DateHeader(val label: String) : ChatListItem()
     data class FolderHeader(val label: String) : ChatListItem()

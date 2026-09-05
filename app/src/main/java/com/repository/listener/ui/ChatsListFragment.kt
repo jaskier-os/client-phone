@@ -398,7 +398,14 @@ class ChatsListFragment : Fragment() {
 
             override fun getSwipeDirs(rv: RecyclerView, vh: RecyclerView.ViewHolder): Int {
                 val item = adapter.getItemAt(vh.adapterPosition)
-                if (item is ChatListItem.RemoteControlSession && item.status == "active") {
+                // Never offer swipe-to-end on a row that only looks active
+                // because a CLI is alive on the PC: that process is usually one
+                // the user started in a terminal, and the swipe ends it outright
+                // with no confirmation.
+                if (item is ChatListItem.RemoteControlSession &&
+                    item.status == "active" &&
+                    !item.promotedFromLive
+                ) {
                     return super.getSwipeDirs(rv, vh)
                 }
                 return 0
@@ -1109,7 +1116,10 @@ class ChatsListFragment : Fragment() {
         val liveIds = sessions.filter { it.alive }.mapTo(HashSet()) { it.sessionId }
         val rcValues = rcSessions.values.map { rc ->
             if (rc.status != "active" && liveIds.contains(rc.sessionId)) {
-                rc.copy(status = "active")
+                // Mark it promoted: the row shows as running, but swipe-to-end
+                // stays disabled so a stray swipe cannot kill a CLI the user
+                // started in their own terminal.
+                rc.copy(status = "active", promotedFromLive = true)
             } else rc
         }
 
