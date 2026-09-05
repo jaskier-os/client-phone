@@ -854,20 +854,34 @@ class ChatsListFragment : Fragment() {
         searchRcSessions: Map<String, ChatListItem.RemoteControlSession>
     ): List<ChatListItem> {
         val chatItems = chats.map { ChatListItem.Conversation(it) to it.lastActivityAt }
-        val isoFmt = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US).apply {
-            timeZone = java.util.TimeZone.getTimeZone("UTC")
-        }
+        val isoFmt = isoSortFormat()
         // Apply the same live-CLI promotion the main list does, so a running
         // chat does not flip back to a red "ended" dot the moment the user
         // searches for it.
-        val liveIds = liveSessions.filter { it.alive }.mapTo(HashSet()) { it.sessionId }
+        val live = liveSessions.filter { it.alive }
+        val liveIds = live.mapTo(HashSet()) { it.sessionId }
         val rcItems = searchRcSessions.values.map { rc ->
             val row = if (rc.status != "active" && liveIds.contains(rc.sessionId)) {
                 rc.copy(status = "active")
             } else rc
             row to isoFmt.format(java.util.Date(row.startedAt))
         }
-        return (chatItems + rcItems)
+        // A live CLI with no store row exists only as a live-session row, so
+        // without this it was visible in the list but impossible to find by
+        // searching for it -- the same invisibility the sort-key fix removed.
+        val query = searchInput.text.toString().trim().lowercase()
+        val liveItems = live
+            .filter { !searchRcSessions.containsKey(it.sessionId) }
+            .filter {
+                query.isEmpty() ||
+                    it.workDir.lowercase().contains(query) ||
+                    (it.title?.lowercase()?.contains(query) == true)
+            }
+            .map {
+                ChatListItem.RemoteSession(it) to
+                    isoFmt.format(java.util.Date(startedAtMillis(it.startedAt)))
+            }
+        return (chatItems + rcItems + liveItems)
             .sortedByDescending { it.second }
             .map { it.first }
     }
@@ -1162,13 +1176,29 @@ class ChatsListFragment : Fragment() {
     private fun startedAtMillis(raw: String): Long {
         raw.toLongOrNull()?.let { return it }
         return try {
-            java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", java.util.Locale.US).apply {
-                timeZone = java.util.TimeZone.getTimeZone("UTC")
-            }.parse(raw.replace("Z", "").substringBefore("."))?.time ?: System.currentTimeMillis()
+            // Strip a trailing Z or +HH:MM offset before parsing as UTC; without
+            // the offset case an ISO stamp from a non-UTC producer fell through
+            // to the "now" fallback below.
+            val trimmed = raw.substringBefore(".")
+                .replace("Z", "")
+                .replace(Regex("[+-]\\d{2}:?\\d{2}$"), "")
+            isoSortFormat("yyyy-MM-dd'T'HH:mm:ss").parse(trimmed)?.time
+                ?: System.currentTimeMillis()
         } catch (_: Exception) {
+            // Not a stable key: a row that cannot be parsed re-sorts as "now" on
+            // every rebuild. Preferred to sorting it oldest, which is exactly how
+            // these rows became invisible at the bottom of the list.
             System.currentTimeMillis()
         }
     }
+
+    /** UTC formatter for the list's sort keys. */
+    private fun isoSortFormat(
+        pattern: String = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
+    ): java.text.SimpleDateFormat =
+        java.text.SimpleDateFormat(pattern, java.util.Locale.US).apply {
+            timeZone = java.util.TimeZone.getTimeZone("UTC")
+        }
 
     private fun buildMergedList(
         chats: List<ChatSummary>,
@@ -1197,9 +1227,7 @@ class ChatsListFragment : Fragment() {
         // "All" chip: include every RC session (active AND ended). Format
         // startedAt as an ISO string so it sorts next to chats/session items,
         // whose timestamps are already ISO strings.
-        val isoFmt = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US).apply {
-            timeZone = java.util.TimeZone.getTimeZone("UTC")
-        }
+        val isoFmt = isoSortFormat()
         val allRcItems = if (filterType == "chats") emptyList() else {
             rcValues
                 .sortedByDescending { it.startedAt }

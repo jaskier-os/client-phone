@@ -819,18 +819,7 @@ class ChatsListAdapter(
                 timeZone = TimeZone.getTimeZone("UTC")
             }
             val date = fmt.parse(isoTimestamp) ?: return isoTimestamp
-            val diffMs = System.currentTimeMillis() - date.time
-            val diffMin = diffMs / 60_000
-            val diffHour = diffMs / 3_600_000
-            val diffDay = diffMs / 86_400_000
-
-            when {
-                diffMin < 1 -> "just now"
-                diffMin < 60 -> "${diffMin}m ago"
-                diffHour < 24 -> "${diffHour}h ago"
-                diffDay < 7 -> "${diffDay}d ago"
-                else -> SimpleDateFormat("MMM d", Locale.US).format(date)
-            }
+            formatRelativeMillis(date.time)
         } catch (e: Exception) {
             isoTimestamp
         }

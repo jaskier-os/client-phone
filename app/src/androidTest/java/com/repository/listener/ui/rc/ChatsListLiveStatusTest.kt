@@ -10,6 +10,7 @@ import com.repository.listener.config.AppConfig
 import com.repository.listener.network.RemoteSessionClient
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -165,14 +166,16 @@ class ChatsListLiveStatusTest {
                 "(promotion candidates=$mismatched)",
             missing.isEmpty()
         )
-        // And specifically: the sessions that were stored-as-ended got promoted,
-        // i.e. the active rows outnumber what the store alone would have shown.
-        val storeOnlyActive = stored.values.count { it == "active" }
+        // Specifically: each session the STORE calls ended, but whose CLI is
+        // live, must still render active. Counting rows cannot express this --
+        // two live sessions can share a workDir and produce identical text --
+        // so assert per-folder, which is what the store alone could never do.
+        val promotedFolders = mismatched.mapNotNull { liveWorkDirById[it] }.toSet()
+        val notPromoted = promotedFolders - activeFolders
         assertTrue(
-            "Promotion did not happen: rendered active=${activeRows.size} is not " +
-                "more than the store's own active count=$storeOnlyActive despite " +
-                "${mismatched.size} live-but-ended session(s)",
-            activeRows.size > storeOnlyActive || mismatched.isEmpty()
+            "Sessions the store calls ended, whose CLI is live, must render " +
+                "active. notPromoted=$notPromoted rendered=$activeFolders",
+            notPromoted.isEmpty()
         )
         Thread.sleep(2_000) // hold the rendered state for the recording
     }
@@ -234,6 +237,42 @@ class ChatsListLiveStatusTest {
     }
 
     /**
+     * A live CLI with no store row exists only as a live-session row, and the
+     * search screen used to omit those rows entirely -- so a running session was
+     * visible in the list but impossible to find by searching for it.
+     */
+    @Test
+    fun aStoreLessLiveSessionIsFindableBySearch() {
+        val live = liveSessionIds()
+        val stored = storedStatuses()
+        // Opening such a session ADOPTS it, which gives it a store row -- so this
+        // condition destroys itself once exercised. Skip rather than fail when no
+        // store-less CLI is currently running; a hard failure here would just mean
+        // "a previous test already adopted the only candidate".
+        val storeless = live.filter { !stored.containsKey(it) }
+        assumeTrue(
+            "No live CLI without a store row right now; nothing to exercise",
+            storeless.isNotEmpty()
+        )
+        val dirName = liveWorkDirById[storeless.first()]!!
+            .trimEnd('/').substringAfterLast('/')
+
+        navigateToChatTab()
+        val search = device.wait(Until.findObject(By.res(PKG, "searchInput")), UI_TIMEOUT)
+        assertTrue("Search field must be present", search != null)
+        search!!.text = dirName
+        Thread.sleep(4_000)
+
+        val hit = device.wait(Until.findObject(By.textContains(dirName)), UI_TIMEOUT)
+        assertTrue("A live store-less session must be findable by search", hit != null)
+        Thread.sleep(2_000)
+
+        // Leave the search box clean for the next test.
+        search.text = ""
+        Thread.sleep(1_000)
+    }
+
+    /**
      * A live CLI the orchestrator has no store row for surfaces only as a
      * live-session row. That row used to have its click listener explicitly set
      * to null, so the user could see the session running but had no way to open
@@ -244,9 +283,11 @@ class ChatsListLiveStatusTest {
         val live = liveSessionIds()
         val stored = storedStatuses()
 
+        // Same self-destroying condition as the search test: opening the row
+        // adopts the session and gives it a store row.
         val storeless = live.filter { !stored.containsKey(it) }
-        assertTrue(
-            "Precondition: need a live CLI with no store row. live=$live",
+        assumeTrue(
+            "No live CLI without a store row right now; nothing to exercise",
             storeless.isNotEmpty()
         )
         val target = storeless.first()
