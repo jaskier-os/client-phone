@@ -88,22 +88,34 @@ class ChatsListLiveStatusTest {
         val pc = PcTuiDriver()
         return try {
             pc.requireReachable()
-            // The driver holds one TUI at a time and rejects a second start;
-            // clear any session left by an earlier test before claiming it.
-            pc.reset()
-            Thread.sleep(1_000)
-            val tui = pc.startTui(
-                workDir = "/media/varingait/Lobotomite/.cache/rc-live-attach-test",
-                permissionMode = "bypassPermissions"
-            )
-            fixturePid = tui.pid
+            // The driver holds one TUI at a time and rejects a second start, so
+            // clear any session an earlier test left behind. The teardown of that
+            // session is not instant -- the CLI has to exit and release its
+            // attach socket -- so retry rather than failing the first attempt.
+            var tui: PcTuiDriver.TuiSession? = null
+            var lastErr: Throwable? = null
+            repeat(3) { attempt ->
+                if (tui == null) {
+                    runCatching { pc.reset() }
+                    Thread.sleep(3_000L * (attempt + 1))
+                    runCatching {
+                        pc.startTui(
+                            workDir = "/media/varingait/Lobotomite/.cache/rc-live-attach-test",
+                            permissionMode = "bypassPermissions"
+                        )
+                    }.onSuccess { tui = it }.onFailure { lastErr = it }
+                }
+            }
+            if (tui == null) throw (lastErr ?: IllegalStateException("startTui failed"))
+            val tuiSession = tui!!
+            fixturePid = tuiSession.pid
             // Let pc-agent publish it into the live-session registry.
             val deadline = System.currentTimeMillis() + 60_000
             while (System.currentTimeMillis() < deadline) {
-                if (liveSessionIds().contains(tui.sessionId)) return tui.sessionId
+                if (liveSessionIds().contains(tuiSession.sessionId)) return tuiSession.sessionId
                 Thread.sleep(2_000)
             }
-            tui.sessionId
+            tuiSession.sessionId
         } catch (e: Throwable) {
             fixtureError = "${e.javaClass.simpleName}: ${e.message}"
             null
@@ -283,9 +295,17 @@ class ChatsListLiveStatusTest {
         device.wait(Until.hasObject(By.res(PKG, "chatsRecycler")), UI_TIMEOUT)
         Thread.sleep(3_000)
 
+        // Search for the row rather than expecting it on the first screen: the
+        // list is long and the target often sits below the fold, where
+        // findObject simply does not see it.
+        val workDir = liveWorkDirById[target]!!
+        val search = device.wait(Until.findObject(By.res(PKG, "searchInput")), UI_TIMEOUT)
+            ?: error("searchInput not found")
+        search.text = workDir
+        Thread.sleep(4_000)
+
         // Match the RC row's own subtitle ("<workDir> - active"), not any text
         // containing the folder name: only that identifies the swipeable row.
-        val workDir = liveWorkDirById[target]!!
         val row = device.wait(Until.findObject(By.text("$workDir - active")), UI_TIMEOUT)
         assertTrue("Promoted row for '$workDir' must render as active", row != null)
 
@@ -317,7 +337,8 @@ class ChatsListLiveStatusTest {
                 "($target should still be live)",
             liveSessionIdsStable(expect = target).contains(target)
         )
-        Thread.sleep(2_000)
+        search.text = ""
+        Thread.sleep(1_500)
     }
 
     /**
