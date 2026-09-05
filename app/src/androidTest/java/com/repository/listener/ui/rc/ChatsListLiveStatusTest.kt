@@ -113,6 +113,22 @@ class ChatsListLiveStatusTest {
     /** Why [startStoreLessCli] failed, so the assertion can say so. */
     private var fixtureError: String? = null
 
+    /**
+     * Live CLIs on the PC, retrying briefly: pc-agent reconnects to the
+     * orchestrator from time to time, and a poll landing in that window returns
+     * an empty list, which would fail a precondition for no real reason.
+     */
+    private fun liveSessionIdsStable(): Set<String> {
+        var ids = liveSessionIds()
+        var tries = 0
+        while (ids.isEmpty() && tries < 5) {
+            Thread.sleep(4_000)
+            ids = liveSessionIds()
+            tries++
+        }
+        return ids
+    }
+
     /** Live CLIs on the PC, straight from the orchestrator. */
     private fun liveSessionIds(): Set<String> {
         val ctx = InstrumentationRegistry.getInstrumentation().targetContext
@@ -176,7 +192,7 @@ class ChatsListLiveStatusTest {
 
     @Test
     fun aLiveCliIsNeverShownAsEndedInTheChatList() {
-        val live = liveSessionIds()
+        val live = liveSessionIdsStable()
         val stored = storedStatuses()
 
         // The exact reported condition: a CLI is running but the store row is not
@@ -206,20 +222,22 @@ class ChatsListLiveStatusTest {
         // is the strongest claim this screen-scrape can honestly support.
         val liveWithRow = live.filter { stored.containsKey(it) }
         val expectedFolders = liveWithRow.mapNotNull { sid -> liveWorkDirById[sid] }.toSet()
-        // Collect while scrolling: findObjects only sees rendered rows, and a
-        // long list keeps some active sessions below the fold. Reading only the
-        // first screen would report them missing.
-        val activeRows = mutableSetOf<String>()
-        repeat(6) {
-            device.findObjects(By.textContains("- active"))
-                .mapNotNull { runCatching { it.text }.getOrNull() }
-                .forEach { activeRows.add(it) }
-            val rv = device.findObject(By.res(PKG, "chatsRecycler")) ?: return@repeat
-            val rb = rv.visibleBounds
-            device.swipe(rb.centerX(), rb.bottom - 120, rb.centerX(), rb.top + 120, 12)
-            Thread.sleep(700)
+        // Search for each folder rather than scrolling the list: findObjects
+        // only sees rendered rows, and in a long list an active session sits
+        // below the fold, which a scroll-and-collect loop reports as missing.
+        // Search narrows to the row directly and is deterministic.
+        val search = device.wait(Until.findObject(By.res(PKG, "searchInput")), UI_TIMEOUT)
+            ?: error("searchInput not found")
+        val activeFolders = mutableSetOf<String>()
+        for (folder in expectedFolders) {
+            search.text = folder
+            Thread.sleep(3_500)
+            if (device.findObject(By.text("$folder - active")) != null) {
+                activeFolders.add(folder)
+            }
         }
-        val activeFolders = activeRows.map { it.substringBefore(" - ") }.toSet()
+        search.text = ""
+        Thread.sleep(1_500)
 
         val missing = expectedFolders - activeFolders
         assertTrue(
@@ -250,7 +268,7 @@ class ChatsListLiveStatusTest {
      */
     @Test
     fun swipingARunningSessionRequiresConfirmation() {
-        val live = liveSessionIds()
+        val live = liveSessionIdsStable()
         val stored = storedStatuses()
         val promoted = live.filter { stored[it] != null && stored[it] != "active" }
         assertTrue(
@@ -305,7 +323,7 @@ class ChatsListLiveStatusTest {
      */
     @Test
     fun aStoreLessLiveSessionIsFindableBySearch() {
-        val live = liveSessionIds()
+        val live = liveSessionIdsStable()
         val stored = storedStatuses()
         // Start our own store-less CLI rather than hoping one exists: opening a
         // session adopts it, so an ambient candidate is consumed by the first
@@ -342,7 +360,7 @@ class ChatsListLiveStatusTest {
      */
     @Test
     fun aStoreLessLiveSessionRowCanBeOpened() {
-        val live = liveSessionIds()
+        val live = liveSessionIdsStable()
         val stored = storedStatuses()
 
         // Same self-destroying condition as the search test, so start a fixture
