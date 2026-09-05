@@ -34,7 +34,13 @@ data class LiveSession(
     val startedAt: String,
     val alive: Boolean,
     val title: String? = null,
-    val permissionMode: String? = null
+    val permissionMode: String? = null,
+    /**
+     * True when the session is running a turn right now. Sourced from the
+     * orchestrator's live state rather than WS events, so the chat list can show
+     * the indicator for a turn that started before the app was listening.
+     */
+    val thinking: Boolean = false
 )
 
 class RemoteSessionClient(
@@ -197,7 +203,8 @@ class RemoteSessionClient(
                                     startedAt = obj.getString("startedAt"),
                                     alive = obj.optBoolean("alive", true),
                                     title = obj.optString("title", null).takeIf { !it.isNullOrEmpty() },
-                                    permissionMode = obj.optString("permissionMode", null).takeIf { !it.isNullOrEmpty() }
+                                    permissionMode = obj.optString("permissionMode", null).takeIf { !it.isNullOrEmpty() },
+                                    thinking = obj.optBoolean("thinking", false)
                                 ))
                             }
                         }

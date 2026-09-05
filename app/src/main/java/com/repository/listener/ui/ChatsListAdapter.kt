@@ -47,6 +47,7 @@ class ChatsListAdapter(
     private val onChatClick: (ChatSummary) -> Unit,
     private val onChatLongClick: (ChatSummary) -> Unit,
     private val onSessionLongClick: (LiveSession) -> Unit,
+    private val onSessionClick: (LiveSession) -> Unit,
     private val onRcSessionClick: ((ChatListItem.RemoteControlSession) -> Unit)? = null,
     private val onCopilotClick: ((CopilotSummary) -> Unit)? = null,
     private val onVscodeProjectClick: ((ChatListItem.VscodeProject) -> Unit)? = null
@@ -696,7 +697,11 @@ class ChatsListAdapter(
                     h.pulseAnimator?.cancel()
                 }
 
-                h.container.setOnClickListener(null)
+                // A live CLI the orchestrator has no store row for (started in a
+                // terminal on the PC) surfaces ONLY as this row. Leaving it
+                // unclickable meant the user could see the session running but
+                // had no way to open it -- and opening is what adopts it.
+                h.container.setOnClickListener { onSessionClick(item.session) }
                 h.container.setOnLongClickListener {
                     onSessionLongClick(item.session)
                     true

@@ -283,6 +283,26 @@ class ChatsListFragment : Fragment() {
             onSessionLongClick = { session ->
                 showSessionMenu(session)
             },
+            onSessionClick = { session ->
+                // A live CLI with no orchestrator store row appears only as this
+                // row. Open it the same way an RC chat opens: the activity sends
+                // rc_transcript_request, which is what makes the orchestrator
+                // adopt the running CLI and hand it to the phone.
+                val intent = Intent(requireContext(), RemoteControlActivity::class.java).apply {
+                    putExtra(RemoteControlActivity.EXTRA_SESSION_ID, session.sessionId)
+                    putExtra(RemoteControlActivity.EXTRA_WORK_DIR, session.workDir)
+                    putExtra(RemoteControlActivity.EXTRA_SESSION_STATUS, "active")
+                    session.permissionMode?.let { mode ->
+                        val phoneMode = when (mode) {
+                            "ask_on_potentially_safe" -> "default"
+                            "acceptAll" -> "acceptEdits"
+                            else -> mode
+                        }
+                        putExtra(RemoteControlActivity.EXTRA_PERMISSION_MODE, phoneMode)
+                    }
+                }
+                startActivity(intent)
+            },
             onCopilotClick = { summary ->
                 // The detail screen is owned by another module; launch by class
                 // name + string-literal extras to avoid a compile dependency.
@@ -805,7 +825,12 @@ class ChatsListFragment : Fragment() {
             recyclerView.visibility = View.VISIBLE
             adapter.pinnedIds = context?.let { AppConfig.getPinnedChatIds(it) } ?: emptySet()
             adapter.respondingChatIds = ListenerService.respondingChatIds.toSet()
-            adapter.thinkingRcSessionIds = ListenerService.thinkingRcStartTimes.keys.toSet()
+            // Union of both sources: WS events catch turns that start while the
+            // app is watching; the polled live list catches a turn that was
+            // already running before it started listening (cold open).
+            adapter.thinkingRcSessionIds =
+                ListenerService.thinkingRcStartTimes.keys.toSet() +
+                    sessions.filter { it.thinking }.map { it.sessionId }.toSet()
             val scrollState = recyclerView.layoutManager?.onSaveInstanceState()
             adapter.submitList(items)
             scrollState?.let { recyclerView.layoutManager?.onRestoreInstanceState(it) }

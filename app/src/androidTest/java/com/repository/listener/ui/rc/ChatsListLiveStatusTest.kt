@@ -163,4 +163,59 @@ class ChatsListLiveStatusTest {
         )
         Thread.sleep(2_000) // hold the rendered state for the recording
     }
+
+    /**
+     * A live CLI the orchestrator has no store row for surfaces only as a
+     * live-session row. That row used to have its click listener explicitly set
+     * to null, so the user could see the session running but had no way to open
+     * it -- and opening is what adopts it. It must now be clickable.
+     */
+    @Test
+    fun aStoreLessLiveSessionRowCanBeOpened() {
+        val live = liveSessionIds()
+        val stored = storedStatuses()
+
+        val storeless = live.filter { !stored.containsKey(it) }
+        assertTrue(
+            "Precondition: need a live CLI with no store row. live=$live",
+            storeless.isNotEmpty()
+        )
+        val target = storeless.first()
+        val dirName = liveWorkDirById[target]!!.trimEnd('/').substringAfterLast('/')
+
+        navigateToChatTab()
+        device.wait(Until.hasObject(By.res(PKG, "chatsRecycler")), UI_TIMEOUT)
+        Thread.sleep(3_000)
+
+        // The live-only row titles as "> <dirName>".
+        val row = device.wait(Until.findObject(By.textContains(dirName)), UI_TIMEOUT)
+        assertTrue("Live session row for '$dirName' must be present", row != null)
+
+        // Walk up: the click listener lives on the row container, not on the
+        // TextView the text matched, and the container may be several levels up.
+        var node = row
+        var clickable = false
+        var depth = 0
+        val chain = StringBuilder()
+        while (node != null && depth < 6) {
+            chain.append("${node.className}(clickable=${node.isClickable}) <- ")
+            if (node.isClickable) { clickable = true; break }
+            node = runCatching { node!!.parent }.getOrNull()
+            depth++
+        }
+        assertTrue(
+            "The row for a live store-less session must be clickable so it can " +
+                "be opened (it used to have a null click listener). chain=$chain",
+            clickable
+        )
+
+        // Opening it must actually reach the RC chat screen, which is what
+        // triggers the adopt.
+        row.click()
+        val opened = device.wait(Until.hasObject(By.res(PKG, "rcLoadingOverlay")), UI_TIMEOUT) ||
+            device.wait(Until.hasObject(By.textContains(dirName)), UI_TIMEOUT)
+        assertTrue("Tapping a live session row must open the RC chat", opened)
+        Thread.sleep(2_000)
+        device.pressBack()
+    }
 }
