@@ -662,7 +662,7 @@ class ChatsListFragment : Fragment() {
      */
     private fun endRcSessionRow(item: ChatListItem.RemoteControlSession) {
         val ctx = context ?: return
-        rcSessions.remove(item.sessionId)
+        val hadStoreRow = rcSessions.remove(item.sessionId) != null
         displayList(lastChats, liveSessions)
 
         val remoteClient = RemoteSessionClient(
@@ -670,6 +670,21 @@ class ChatsListFragment : Fragment() {
             AppConfig.getApiKey(ctx),
             AppConfig.getDeviceId(ctx)
         )
+        // A row built from the live list has no orchestrator session to end --
+        // endRcSession would 404. Stop the process by pid instead, the same way
+        // the live-session menu does.
+        if (!hadStoreRow) {
+            val live = liveSessions.firstOrNull { it.sessionId == item.sessionId }
+            if (live != null) {
+                remoteClient.stopSession(live.pid) { result ->
+                    result.onSuccess { loadSessions() }
+                    result.onFailure { err ->
+                        LogCollector.e(TAG, "Stop session failed: ${err.message}")
+                    }
+                }
+                return
+            }
+        }
         remoteClient.endRcSession(item.sessionId) { result ->
             result.onFailure { err ->
                 LogCollector.e(TAG, "End RC session failed: ${err.message}")

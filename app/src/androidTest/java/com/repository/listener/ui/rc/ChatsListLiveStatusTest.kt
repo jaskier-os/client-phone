@@ -118,10 +118,12 @@ class ChatsListLiveStatusTest {
      * orchestrator from time to time, and a poll landing in that window returns
      * an empty list, which would fail a precondition for no real reason.
      */
-    private fun liveSessionIdsStable(): Set<String> {
+    private fun liveSessionIdsStable(expect: String? = null): Set<String> {
         var ids = liveSessionIds()
         var tries = 0
-        while (ids.isEmpty() && tries < 5) {
+        // Retry while the list is empty, or while a session we expect to see is
+        // absent -- both are symptoms of a reconnect rather than a dead CLI.
+        while ((ids.isEmpty() || (expect != null && !ids.contains(expect))) && tries < 5) {
             Thread.sleep(4_000)
             ids = liveSessionIds()
             tries++
@@ -307,10 +309,13 @@ class ChatsListLiveStatusTest {
         // Decline, and the CLI must still be alive on the PC.
         device.findObject(By.text("Cancel"))?.click()
         Thread.sleep(3_000)
+        // Retry: pc-agent reconnects periodically and a poll landing in that
+        // window returns an empty list, which would read as "the session died"
+        // when it is simply not being reported for a moment.
         assertTrue(
             "Cancelling must leave the user's own terminal CLI running " +
                 "($target should still be live)",
-            liveSessionIds().contains(target)
+            liveSessionIdsStable(expect = target).contains(target)
         )
         Thread.sleep(2_000)
     }
