@@ -171,7 +171,7 @@ class ChatsListLiveStatusTest {
      * promoted row must leave the session alive on the PC.
      */
     @Test
-    fun promotedRowsCannotBeSwipedToEndTheUsersOwnCli() {
+    fun swipingARunningSessionRequiresConfirmation() {
         val live = liveSessionIds()
         val stored = storedStatuses()
         val promoted = live.filter { stored[it] != null && stored[it] != "active" }
@@ -186,17 +186,34 @@ class ChatsListLiveStatusTest {
         device.wait(Until.hasObject(By.res(PKG, "chatsRecycler")), UI_TIMEOUT)
         Thread.sleep(3_000)
 
-        val row = device.wait(Until.findObject(By.textContains(dirName)), UI_TIMEOUT)
-        assertTrue("Promoted row for '$dirName' must be visible", row != null)
+        // Match the RC row's own subtitle ("<workDir> - active"), not any text
+        // containing the folder name: only that identifies the swipeable row.
+        val workDir = liveWorkDirById[target]!!
+        val row = device.wait(Until.findObject(By.text("$workDir - active")), UI_TIMEOUT)
+        assertTrue("Promoted row for '$workDir' must render as active", row != null)
 
-        // Try to swipe it away, the gesture that ends a session.
+        // Swipe across the full list width at the row's height, so the gesture
+        // lands on the row container rather than on a narrow text node.
         val b = row!!.visibleBounds
-        device.swipe(b.centerX(), b.centerY(), b.left + 10, b.centerY(), 20)
-        Thread.sleep(3_000)
+        val recycler = device.findObject(By.res(PKG, "chatsRecycler"))!!.visibleBounds
+        device.swipe(recycler.right - 20, b.centerY(), recycler.left + 20, b.centerY(), 25)
+        Thread.sleep(2_000)
 
-        // Ground truth: the CLI must still be alive on the PC afterwards.
+        // The swipe must never act on its own: a confirmation naming the
+        // directory has to appear first. This is the guard that stops a stray
+        // gesture from killing a terminal-started CLI.
+        val confirm = device.wait(Until.findObject(By.textContains("End session in")), UI_TIMEOUT)
         assertTrue(
-            "Swiping a promoted row must NOT end the user's own terminal CLI " +
+            "Swiping a running session must ask for confirmation before ending it",
+            confirm != null
+        )
+        Thread.sleep(2_000) // hold the dialog so a recording shows it
+
+        // Decline, and the CLI must still be alive on the PC.
+        device.findObject(By.text("Cancel"))?.click()
+        Thread.sleep(3_000)
+        assertTrue(
+            "Cancelling must leave the user's own terminal CLI running " +
                 "($target should still be live)",
             liveSessionIds().contains(target)
         )

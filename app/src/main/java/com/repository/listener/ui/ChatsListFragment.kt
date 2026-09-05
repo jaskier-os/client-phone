@@ -223,6 +223,17 @@ class ChatsListFragment : Fragment() {
             // rcMessageReceiver (listening to the same action) already drives
             // the turning flag off of isFinal; this is kept purely to trigger
             // a redraw in case message parsing threw.
+            //
+            // Also clear the polled `thinking` flag for this session. The chip
+            // is a union of WS state and the last polled snapshot, so leaving
+            // the snapshot set would keep the spinner up until the next poll
+            // even though the turn has demonstrably ended.
+            val sessionId = intent.getStringExtra(ListenerService.EXTRA_RC_SESSION_ID)
+            if (sessionId != null) {
+                liveSessions = liveSessions.map {
+                    if (it.sessionId == sessionId && it.thinking) it.copy(thinking = false) else it
+                }
+            }
             if (loaded && !isSearching) {
                 displayList(lastChats, liveSessions)
             }
@@ -398,14 +409,10 @@ class ChatsListFragment : Fragment() {
 
             override fun getSwipeDirs(rv: RecyclerView, vh: RecyclerView.ViewHolder): Int {
                 val item = adapter.getItemAt(vh.adapterPosition)
-                // Never offer swipe-to-end on a row that only looks active
-                // because a CLI is alive on the PC: that process is usually one
-                // the user started in a terminal, and the swipe ends it outright
-                // with no confirmation.
-                if (item is ChatListItem.RemoteControlSession &&
-                    item.status == "active" &&
-                    !item.promotedFromLive
-                ) {
+                // Swiping any running session is allowed, but onSwiped always
+                // confirms first: ending kills the CLI process on the PC, which
+                // for a terminal-started session is work the phone never began.
+                if (item is ChatListItem.RemoteControlSession && item.status == "active") {
                     return super.getSwipeDirs(rv, vh)
                 }
                 return 0
@@ -480,38 +487,22 @@ class ChatsListFragment : Fragment() {
                     return
                 }
                 val ctx = context ?: return
-                // Remove from adapter with animation first, then from local state.
-                adapter.removeItemAt(pos)
-                rcSessions.remove(item.sessionId)
-                // Also remove the folder header if this was the last session in its group.
-                if (showOnlyOpen) {
-                    // Check if the preceding item is a FolderHeader with no sessions after it.
-                    val prevPos = pos - 1
-                    if (prevPos > -1) {
-                        val prev = adapter.getItemAt(prevPos)
-                        if (prev is ChatListItem.FolderHeader) {
-                            val next = adapter.getItemAt(pos) // pos now points to what was after the removed item
-                            if (next == null || next is ChatListItem.FolderHeader) {
-                                adapter.removeItemAt(prevPos)
-                            }
-                        }
-                    }
-                }
-                // Call orchestrator HTTP DELETE to properly end the session.
-                val wsUrl = AppConfig.getOrchestratorUrl(ctx)
-                val apiKey = AppConfig.getApiKey(ctx)
-                val deviceId = AppConfig.getDeviceId(ctx)
-                val remoteClient = RemoteSessionClient(wsUrl, apiKey, deviceId)
-                remoteClient.endRcSession(item.sessionId) { result ->
-                    result.onFailure { err ->
-                        LogCollector.e(TAG, "End RC session failed: ${err.message}")
-                        val rootView = view ?: return@onFailure
-                        Snackbar.make(rootView, "End session failed: ${err.message}", Snackbar.LENGTH_LONG)
-                            .setBackgroundTint(ContextCompat.getColor(ctx, R.color.gbx_bg1))
-                            .setTextColor(COLOR_ERROR_TEXT)
-                            .show()
-                    }
-                }
+                // Ending kills the CLI process on the PC, and a terminal-started
+                // session that has been adopted is indistinguishable here from a
+                // chat the phone started -- so confirm before destroying either.
+                // The row is restored first, so cancelling leaves it untouched.
+                adapter.notifyItemChanged(pos)
+                val dirName = item.workDir.trimEnd('/').substringAfterLast('/')
+                    .ifEmpty { item.workDir }
+                MaterialAlertDialogBuilder(ctx)
+                    .setTitle("End session in $dirName?")
+                    .setMessage(
+                        "This terminates the running CLI on the PC. If you started " +
+                            "it in a terminal, that session is lost."
+                    )
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("End session") { _, _ -> endRcSessionRow(item) }
+                    .show()
             }
         }
         androidx.recyclerview.widget.ItemTouchHelper(swipeCallback).attachToRecyclerView(recyclerView)
@@ -570,6 +561,11 @@ class ChatsListFragment : Fragment() {
         loaded = false
         showLoading("Loading...")
         loadChats()
+        // Refresh the live list immediately, not only after the first poll
+        // delay: the cached snapshot may still say a session is thinking from
+        // before the app was backgrounded, which would show a phantom spinner
+        // for a full poll interval.
+        loadSessions()
         handler.postDelayed(pollRunnable, POLL_INTERVAL_MS)
         registerRcReceivers()
         registerThinkingReceivers()
@@ -649,6 +645,33 @@ class ChatsListFragment : Fragment() {
         ctx.unregisterReceiver(chatRespondingReceiver)
         ctx.unregisterReceiver(rcThinkingReceiver)
         ctx.unregisterReceiver(rcThinkingClearReceiver)
+    }
+
+    /**
+     * Drop an RC row from the list and ask the orchestrator to end its session.
+     * Only ever called after an explicit confirmation, because this terminates
+     * the CLI process on the PC.
+     */
+    private fun endRcSessionRow(item: ChatListItem.RemoteControlSession) {
+        val ctx = context ?: return
+        rcSessions.remove(item.sessionId)
+        displayList(lastChats, liveSessions)
+
+        val remoteClient = RemoteSessionClient(
+            AppConfig.getOrchestratorUrl(ctx),
+            AppConfig.getApiKey(ctx),
+            AppConfig.getDeviceId(ctx)
+        )
+        remoteClient.endRcSession(item.sessionId) { result ->
+            result.onFailure { err ->
+                LogCollector.e(TAG, "End RC session failed: ${err.message}")
+                val rootView = view ?: return@onFailure
+                Snackbar.make(rootView, "End session failed: ${err.message}", Snackbar.LENGTH_LONG)
+                    .setBackgroundTint(ContextCompat.getColor(ctx, R.color.gbx_bg1))
+                    .setTextColor(COLOR_ERROR_TEXT)
+                    .show()
+            }
+        }
     }
 
     private fun showSessionMenu(session: LiveSession) {
@@ -833,8 +856,15 @@ class ChatsListFragment : Fragment() {
         val isoFmt = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US).apply {
             timeZone = java.util.TimeZone.getTimeZone("UTC")
         }
+        // Apply the same live-CLI promotion the main list does, so a running
+        // chat does not flip back to a red "ended" dot the moment the user
+        // searches for it.
+        val liveIds = liveSessions.filter { it.alive }.mapTo(HashSet()) { it.sessionId }
         val rcItems = searchRcSessions.values.map { rc ->
-            rc to isoFmt.format(java.util.Date(rc.startedAt))
+            val row = if (rc.status != "active" && liveIds.contains(rc.sessionId)) {
+                rc.copy(status = "active")
+            } else rc
+            row to isoFmt.format(java.util.Date(row.startedAt))
         }
         return (chatItems + rcItems)
             .sortedByDescending { it.second }
@@ -1137,10 +1167,7 @@ class ChatsListFragment : Fragment() {
         val liveIds = sessions.filter { it.alive }.mapTo(HashSet()) { it.sessionId }
         val rcValues = rcSessions.values.map { rc ->
             if (rc.status != "active" && liveIds.contains(rc.sessionId)) {
-                // Mark it promoted: the row shows as running, but swipe-to-end
-                // stays disabled so a stray swipe cannot kill a CLI the user
-                // started in their own terminal.
-                rc.copy(status = "active", promotedFromLive = true)
+                rc.copy(status = "active")
             } else rc
         }
 
