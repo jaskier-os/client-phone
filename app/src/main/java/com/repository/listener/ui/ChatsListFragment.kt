@@ -664,9 +664,30 @@ class ChatsListFragment : Fragment() {
                         }
                         startActivity(intent)
                     }
-                    1 -> closeSession(session)
+                    1 -> confirmCloseSession(session)
                 }
             }
+            .show()
+    }
+
+    /**
+     * "Close" terminates the CLI process by pid. These sessions are usually ones
+     * the user started in a terminal on the PC, so an accidental tap destroys
+     * work the phone never started. Name the directory being killed and require
+     * a second, explicit confirmation.
+     */
+    private fun confirmCloseSession(session: LiveSession) {
+        val ctx = context ?: return
+        val dirName = session.workDir.trimEnd('/').substringAfterLast('/')
+            .ifEmpty { session.workDir }
+        MaterialAlertDialogBuilder(ctx)
+            .setTitle("End session in $dirName?")
+            .setMessage(
+                "This terminates the running CLI process on the PC (pid ${session.pid}). " +
+                    "If you started it in a terminal, that session is lost."
+            )
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("End session") { _, _ -> closeSession(session) }
             .show()
     }
 
