@@ -111,17 +111,27 @@
             android:visibility="gone" />
 
         <!-- Action buttons (approve/reject + overflow) - shown above input when permission pending -->
-        <GridLayout
-            android:id="@+id/rcActionButtons"
+        <!-- Question/permission options. Bounded and scrollable: a question
+             with many options used to grow this panel past the screen edge,
+             and with no scroll container the overflowed options could never
+             be reached. Capped so the message list stays visible above it. -->
+        <com.repository.listener.ui.rc.BoundedScrollView
+            android:id="@+id/rcActionButtonsScroll"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:columnCount="2"
             android:background="@color/gbx_bg0_hard"
-            android:paddingStart="12dp"
-            android:paddingEnd="12dp"
-            android:paddingTop="8dp"
-            android:paddingBottom="8dp"
-            android:visibility="gone" />
+            android:visibility="gone">
+
+            <GridLayout
+                android:id="@+id/rcActionButtons"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:columnCount="2"
+                android:paddingStart="12dp"
+                android:paddingEnd="12dp"
+                android:paddingTop="8dp"
+                android:paddingBottom="8dp" />
+        </com.repository.listener.ui.rc.BoundedScrollView>
 
         <!-- Input bar -->
         <LinearLayout

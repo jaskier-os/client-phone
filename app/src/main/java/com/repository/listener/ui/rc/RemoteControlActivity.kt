@@ -84,6 +84,7 @@ class RemoteControlActivity : AppCompatActivity() {
     private val permissionQueue = ArrayDeque<RcMessage.PermissionRequest>()
     private var currentPermissionRequest: RcMessage.PermissionRequest? = null
     private lateinit var actionButtonsContainer: GridLayout
+    private lateinit var actionButtonsScroll: BoundedScrollView
     private var pendingUserInputRequestId: String? = null
     private var receiversRegistered = false
     private var sessionEnded = false
@@ -374,10 +375,30 @@ class RemoteControlActivity : AppCompatActivity() {
                     val reqId = request.requestId
                     val alreadyQueued = permissionQueue.any { it.requestId == reqId }
                     val alreadyCurrent = currentPermissionRequest?.requestId == reqId
-                    val alreadyInAdapter = adapter.getMessages().any {
+                    if (alreadyQueued || alreadyCurrent) return@runOnUiThread
+
+                    // A matching row may already be in the adapter from the HTTP
+                    // transcript, which marks every permission as historical
+                    // (pending=false, completed=true). After a rotation the
+                    // activity is recreated with an empty queue, the transcript
+                    // lands first, and this live re-send is the ONLY signal that
+                    // the question is still open. Treating "already in adapter"
+                    // as a duplicate here silently dropped it, leaving the tool
+                    // call visible with no way to answer. So: if the existing row
+                    // is historical, upgrade it back to a live prompt instead of
+                    // discarding the re-send.
+                    val existing = adapter.getMessages().firstOrNull {
                         it is RcMessage.PermissionRequest && it.requestId == reqId
+                    } as? RcMessage.PermissionRequest
+                    if (existing != null) {
+                        if (existing.pending) return@runOnUiThread
+                        existing.pending = true
+                        existing.completed = false
+                        adapter.notifyItemChanged(adapter.getMessages().indexOf(existing))
+                        permissionQueue.addLast(existing)
+                        showNextPermissionPrompt()
+                        return@runOnUiThread
                     }
-                    if (alreadyQueued || alreadyCurrent || alreadyInAdapter) return@runOnUiThread
 
                     adapter.addMessage(request)
                     scrollToBottom()
@@ -1147,6 +1168,7 @@ class RemoteControlActivity : AppCompatActivity() {
         endedBanner = findViewById(R.id.rcEndedBanner)
         stopButton = findViewById(R.id.rcStopButton)
         actionButtonsContainer = findViewById(R.id.rcActionButtons)
+        actionButtonsScroll = findViewById(R.id.rcActionButtonsScroll)
         thinkingView = findViewById(R.id.rcThinkingView)
         contextPctText = findViewById(R.id.rcContextPct)
         scrollToBottomBtn = findViewById(R.id.rcScrollToBottom)
@@ -1818,7 +1840,7 @@ class RemoteControlActivity : AppCompatActivity() {
             }
         }
 
-        actionButtonsContainer.visibility = View.VISIBLE
+        actionButtonsScroll.visibility = View.VISIBLE
         val showInput = request.toolName == "ExitPlanMode" || isQuestion
         if (showInput) {
             findViewById<View>(R.id.rcInputBar).visibility = View.VISIBLE
@@ -1878,7 +1900,7 @@ class RemoteControlActivity : AppCompatActivity() {
 
 
         // Hide action buttons, show input bar
-        actionButtonsContainer.visibility = View.GONE
+        actionButtonsScroll.visibility = View.GONE
         findViewById<View>(R.id.rcInputBar).visibility = View.VISIBLE
 
         // Show next prompt if queued, or show thinking (stop button visible)

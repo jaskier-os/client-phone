@@ -7373,6 +7373,28 @@ class ListenerService : LifecycleService(),
                             putExtra(EXTRA_RC_DATA, JSONObject().put("workDir", workDir).toString())
                         })
                     }
+                    // Deliver a permission/question prompt exactly as the live
+                    // orchestrator path does. The activity's receiver is
+                    // RECEIVER_NOT_EXPORTED, so a broadcast sent straight from the
+                    // instrumentation process (a different app) is dropped by the
+                    // system; routing it through the service makes it a same-package
+                    // send, which is the only way the real prompt ever arrives.
+                    "permission" -> {
+                        val requestId = params.optString("requestId", "")
+                        val toolName = params.optString("toolName", "")
+                        if (requestId.isEmpty() || toolName.isEmpty()) {
+                            AdbResultWriter.writeError(this, commandId, type,
+                                "permission requires requestId and toolName")
+                            return
+                        }
+                        onRcPermissionRequest(
+                            sessionId,
+                            toolName,
+                            params.optString("toolArgs", "{}"),
+                            requestId,
+                            params.optString("description", "").ifEmpty { null }
+                        )
+                    }
                     "thinking" -> {
                         thinkingRcStartTimes[sessionId] = System.currentTimeMillis()
                         rcDumpState[sessionId]?.let { existing ->
