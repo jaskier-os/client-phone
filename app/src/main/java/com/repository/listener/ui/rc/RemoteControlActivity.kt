@@ -1061,9 +1061,26 @@ class RemoteControlActivity : AppCompatActivity() {
                         .filter { (it as? RcMessage.ToolStatus)?.status.let { s -> s == "calling" || s == "running" } }
                         .flatMapTo(HashSet()) { keysOf(it) }
                         .filterNotTo(HashSet()) { it in finishedKeys }
-                    val reconciled = if (liveKeys.isEmpty()) merged else {
+                    var reconciled = if (liveKeys.isEmpty()) merged else {
                         merged.filterNot { m -> keysOf(m).any { it in liveKeys } } +
                             existing.filter { m -> keysOf(m).any { it in liveKeys } }
+                    }
+                    // A PENDING permission/question is live state too. The
+                    // transcript only ever carries it as historical (pending=false,
+                    // completed=true), so if the orchestrator's live re-send landed
+                    // BEFORE this fetch -- the WS is already up, the HTTP call is a
+                    // fresh request, so it often does -- a wholesale replace would
+                    // swap the answerable row for a "completed" copy while the
+                    // queue still held the original. Keep the pending instance.
+                    val pendingByReq = existing
+                        .filterIsInstance<RcMessage.PermissionRequest>()
+                        .filter { it.pending }
+                        .associateBy { it.requestId }
+                    if (pendingByReq.isNotEmpty()) {
+                        reconciled = reconciled.map { m ->
+                            (m as? RcMessage.PermissionRequest)
+                                ?.let { pendingByReq[it.requestId] } ?: m
+                        }
                     }
                     adapter.submitMessages(reconciled)
                     scrollToBottom()

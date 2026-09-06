@@ -26,7 +26,14 @@ class BoundedScrollView @JvmOverloads constructor(
     var maxHeightFraction: Float = 0.45f
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val cap = (resources.displayMetrics.heightPixels * maxHeightFraction).toInt()
+        var cap = (resources.displayMetrics.heightPixels * maxHeightFraction).toInt()
+        // Never claim more than the parent actually offers. With the keyboard
+        // up in landscape the available height is far below 45% of the screen;
+        // overriding the parent's spec outright would let this panel take the
+        // whole remaining area and starve the message list above it.
+        if (MeasureSpec.getMode(heightMeasureSpec) != MeasureSpec.UNSPECIFIED) {
+            cap = minOf(cap, MeasureSpec.getSize(heightMeasureSpec))
+        }
         val capped = MeasureSpec.makeMeasureSpec(cap, MeasureSpec.AT_MOST)
         super.onMeasure(widthMeasureSpec, capped)
     }
