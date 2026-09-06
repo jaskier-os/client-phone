@@ -511,7 +511,13 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
         }
     }
 
-    fun upsertToolStatus(toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String? = null, isAgent: Boolean = false, agentName: String? = null, agentTask: String? = null, agentToolCount: Int? = null, agentTokens: Long? = null, agentElapsedMs: Long? = null, elapsedMs: Long? = null, seq: Int = 0) {
+    /**
+     * Apply a tool status event. Returns true only when a NEW row was appended;
+     * false when an existing row was updated in place (heartbeat, completion)
+     * or the event was dropped. The caller uses this to decide whether the
+     * chat may auto-scroll: an in-place update never justifies moving the view.
+     */
+    fun upsertToolStatus(toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String? = null, isAgent: Boolean = false, agentName: String? = null, agentTask: String? = null, agentToolCount: Int? = null, agentTokens: Long? = null, agentElapsedMs: Long? = null, elapsedMs: Long? = null, seq: Int = 0): Boolean {
         // Suppress standalone cards for tools that don't need visible output
         if (toolName == "AskUserQuestion" || toolName == "EnterPlanMode") {
             // Just update existing PermissionRequest if found, don't create new card
@@ -523,10 +529,10 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                     // status event that carries the answer IS the completion.
                     msg.completed = true
                     notifyItemChanged(i)
-                    return
+                    return false
                 }
             }
-            return // No card needed
+            return false // No card needed
         }
         // Try to find existing card by toolCallId first (unique per invocation),
         // then fall back to toolName matching for PermissionRequest cards.
@@ -545,14 +551,14 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                 // heartbeat scheduled just before the tool_result can arrive
                 // after 'complete', which would otherwise revert the card to a
                 // running state it can never leave.
-                if (seq > 0 && msg.toolCallId == toolCallId && seq < msg.seq) return
+                if (seq > 0 && msg.toolCallId == toolCallId && seq < msg.seq) return false
                 if (seq > 0) msg.seq = seq
                 if (msg.startedAtMs == null) msg.startedAtMs = System.currentTimeMillis()
                 if (toolCallId != null) msg.toolCallId = toolCallId
                 if (result != null) msg.result = result
                 if (isTerminalStatus(status)) msg.completed = true
                 notifyItemChanged(i)
-                return
+                return false
             }
             // Match existing ToolStatus by toolCallId (precise) or toolName (legacy fallback)
             if (msg is RcMessage.ToolStatus) {
@@ -569,11 +575,11 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                     // goes back to running.
                     if (seq > 0 && seq < msg.seq) {
                         LogCollector.i(TAG, "upsert DROP stale: $toolName $status seq=$seq < row seq=${msg.seq}")
-                        return
+                        return false
                     }
                     if (isTerminalStatus(msg.status) && !isTerminalStatus(status)) {
                         LogCollector.i(TAG, "upsert DROP downgrade: $toolName ${msg.status} -> $status")
-                        return
+                        return false
                     }
                     LogCollector.i(TAG, "upsert ToolStatus row: $toolName ${msg.status} -> $status seq=$seq")
                     // A heartbeat only advances the elapsed counter; the status
@@ -605,7 +611,7 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
                     } else {
                         notifyItemChanged(i)
                     }
-                    return
+                    return false
                 }
             }
         }
@@ -631,6 +637,7 @@ class RcDetailAdapter : RecyclerView.Adapter<RcDetailAdapter.RcViewHolder>() {
             agentElapsedMs = agentElapsedMs
         )
         addMessage(msg)
+        return true
     }
 
     /**

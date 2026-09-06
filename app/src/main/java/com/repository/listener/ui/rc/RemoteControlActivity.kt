@@ -485,11 +485,17 @@ class RemoteControlActivity : AppCompatActivity() {
                     // Logged because a status that arrives but renders wrong is
                     // otherwise indistinguishable from one that never arrived.
                     LogCollector.i(TAG, "rc_tool_status in: tool=$toolName status=$status seq=$seq callId=${toolCallId?.takeLast(8)} elapsed=$elapsedMs")
-                    adapter.upsertToolStatus(toolName, status, result, toolArgs, toolCallId, isAgent, agentName, agentTask, agentToolCount, agentTokens, agentElapsedMs, elapsedMs, seq)
+                    val appended = adapter.upsertToolStatus(toolName, status, result, toolArgs, toolCallId, isAgent, agentName, agentTask, agentToolCount, agentTokens, agentElapsedMs, elapsedMs, seq)
                     if (status == "calling" || status == "running") {
                         ensureToolTicker()
                     }
-                    scrollToBottom()
+                    // Only a NEW row may move the view. This used to scroll on
+                    // every event -- including the 2s heartbeat that just bumps
+                    // the elapsed counter -- so the chat was yanked to the bottom
+                    // for the whole run of a slow tool.
+                    if (RcAutoScroll.shouldScrollToBottom(appended, pixelsFromBottom())) {
+                        scrollToBottom()
+                    }
                 }
             } catch (e: Exception) {
                 LogCollector.e(TAG, "Failed to parse RC tool status: ${e.message}")
@@ -1056,7 +1062,7 @@ class RemoteControlActivity : AppCompatActivity() {
                     val appended = merged.filter { it.id !in known }
                     if (appended.isNotEmpty()) {
                         adapter.appendMessages(appended)
-                        if (isUserNearBottom) scrollToBottom()
+                        scrollToBottom()
                     }
                     LogCollector.i(TAG, "parseAndLoadTranscript: kept ${existing.size} paged rows, appended ${appended.size}")
                 } else {
@@ -1257,9 +1263,11 @@ class RemoteControlActivity : AppCompatActivity() {
         recyclerView.addOnScrollListener(object : RecyclerView.OnScrollListener() {
             override fun onScrolled(rv: RecyclerView, dx: Int, dy: Int) {
                 val lm = rv.layoutManager as? LinearLayoutManager ?: return
-                val lastVisible = lm.findLastVisibleItemPosition()
-                val totalItems = lm.itemCount
-                isUserNearBottom = lastVisible >= totalItems - 3
+                // Pixel distance, not "last 3 items visible": the running tool
+                // row is usually the last item and is tall, so the item proxy
+                // called the user "at the bottom" with a screenful of answer
+                // scrolled past above it -- and every heartbeat snapped back.
+                isUserNearBottom = RcAutoScroll.isNearBottom(pixelsFromBottom())
                 scrollToBottomBtn.visibility = if (isUserNearBottom) View.GONE else View.VISIBLE
                 // Approaching the top: pull in the next older page. Triggering a
                 // few rows early means the history is usually already there by
@@ -2217,11 +2225,25 @@ class RemoteControlActivity : AppCompatActivity() {
         slashPopup?.visibility = View.GONE
     }
 
+    /**
+     * Scroll to the end -- but only if the user is already there. Checked live
+     * against the layout, not the cached [isUserNearBottom]: that flag is only
+     * refreshed by onScrolled, so it goes stale while content grows underneath
+     * a reader who has not touched the screen.
+     */
     private fun scrollToBottom() {
         val count = adapter.itemCount
-        if (count > 0 && isUserNearBottom) {
+        if (count > 0 && RcAutoScroll.isNearBottom(pixelsFromBottom())) {
             recyclerView.scrollToPosition(count - 1)
         }
+    }
+
+    /** How far the viewport's bottom edge is from the end of the content, in px. */
+    private fun pixelsFromBottom(): Int {
+        val range = recyclerView.computeVerticalScrollRange()
+        val offset = recyclerView.computeVerticalScrollOffset()
+        val extent = recyclerView.computeVerticalScrollExtent()
+        return (range - offset - extent).coerceAtLeast(0)
     }
 
     private fun updateContextUsage(pct: Int, costUsd: Double) {
