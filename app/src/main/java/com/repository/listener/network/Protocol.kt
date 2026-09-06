@@ -40,6 +40,8 @@ object Protocol {
     const val TYPE_RC_MESSAGE = "rc_message"
     const val TYPE_RC_PERMISSION_REQUEST = "rc_permission_request"
     const val TYPE_RC_PERMISSION_RESPONSE = "rc_permission_response"
+    /** The prompt was answered elsewhere (on the PC); the phone must retire it. */
+    const val TYPE_RC_PERMISSION_RESOLVED = "rc_permission_resolved"
     const val TYPE_RC_TOOL_STATUS = "rc_tool_status"
     const val TYPE_RC_PLAN_UPDATE = "rc_plan_update"
     const val TYPE_RC_AGENT_STATUS = "rc_agent_status"

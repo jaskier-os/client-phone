@@ -125,6 +125,8 @@ class OrchestratorClient(
         fun onRcSessionEnd(sessionId: String) {}
         fun onRcMessage(sessionId: String, text: String, isFinal: Boolean, requestId: String?, contextPct: Int = -1, costUsd: Double = -1.0) {}
         fun onRcPermissionRequest(sessionId: String, toolName: String, toolArgs: String, requestId: String, description: String?) {}
+        /** A pending prompt was answered on the PC; drop it from the phone UI. */
+        fun onRcPermissionResolved(sessionId: String, requestId: String) {}
         fun onRcToolStatus(sessionId: String, toolName: String, status: String, result: String?, toolArgs: String?, toolCallId: String? = null, contextPct: Int = -1, isAgent: Boolean = false, agentName: String? = null, agentTask: String? = null, agentToolCount: Int? = null, agentTokens: Long? = null, agentElapsedMs: Long? = null, elapsedMs: Long? = null, seq: Int = 0) {}
         fun onRcThinkingEnd(sessionId: String, elapsedMs: Long) {}
         fun onRcPlanUpdate(sessionId: String, entering: Boolean, planContent: String?) {}
@@ -611,6 +613,12 @@ class OrchestratorClient(
                             val requestId = envelope.optString("requestId", "")
                             val description = envelope.optStringOrNull("description")
                             listener?.onRcPermissionRequest(sessionId, toolName, toolArgs, requestId, description)
+                        }
+                        Protocol.TYPE_RC_PERMISSION_RESOLVED -> {
+                            listener?.onRcPermissionResolved(
+                                envelope.optString("sessionId", ""),
+                                envelope.optString("requestId", "")
+                            )
                         }
                         Protocol.TYPE_RC_TOOL_STATUS -> {
                             val sessionId = envelope.optString("sessionId", "")

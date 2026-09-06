@@ -244,6 +244,7 @@ class ListenerService : LifecycleService(),
         const val ACTION_RC_SESSION_END = "com.repository.listener.RC_SESSION_END"
         const val ACTION_RC_MESSAGE = "com.repository.listener.RC_MESSAGE"
         const val ACTION_RC_PERMISSION_REQUEST = "com.repository.listener.RC_PERMISSION_REQUEST"
+        const val ACTION_RC_PERMISSION_RESOLVED = "com.repository.listener.RC_PERMISSION_RESOLVED"
         const val ACTION_RC_TOOL_STATUS = "com.repository.listener.RC_TOOL_STATUS"
         const val ACTION_RC_PLAN_UPDATE = "com.repository.listener.RC_PLAN_UPDATE"
         const val ACTION_RC_AGENT_STATUS = "com.repository.listener.RC_AGENT_STATUS"
@@ -7395,6 +7396,17 @@ class ListenerService : LifecycleService(),
                             params.optString("description", "").ifEmpty { null }
                         )
                     }
+                    // The prompt was answered on the PC: same entry point the
+                    // orchestrator's rc_permission_resolved frame uses.
+                    "permission_resolved" -> {
+                        val requestId = params.optString("requestId", "")
+                        if (requestId.isEmpty()) {
+                            AdbResultWriter.writeError(this, commandId, type,
+                                "permission_resolved requires requestId")
+                            return
+                        }
+                        onRcPermissionResolved(sessionId, requestId)
+                    }
                     "thinking" -> {
                         thinkingRcStartTimes[sessionId] = System.currentTimeMillis()
                         rcDumpState[sessionId]?.let { existing ->
@@ -9669,6 +9681,20 @@ class ListenerService : LifecycleService(),
             setPackage(packageName)
             putExtra(EXTRA_RC_SESSION_ID, sessionId)
             putExtra(EXTRA_RC_DATA, data)
+        })
+    }
+
+    override fun onRcPermissionResolved(sessionId: String, requestId: String) {
+        // Answered on the PC. Same retirement as a phone-side answer: drop the
+        // pending entry so the glasses cannot confirm it a second time, and tell
+        // the open chat to turn its live prompt into a completed row. Without
+        // this the phone kept showing an answerable question for a tool that
+        // had already run.
+        rcPrompts.resolve(sessionId, requestId)
+        sendBroadcast(Intent(ACTION_RC_PERMISSION_RESOLVED).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_RC_SESSION_ID, sessionId)
+            putExtra("rc_request_id", requestId)
         })
     }
 

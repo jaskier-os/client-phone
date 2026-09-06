@@ -91,14 +91,25 @@ class PermissionDialogTest {
         // system and the prompt never appears -- which is why every test in this
         // class failed while the real prompt worked fine. The hook calls the
         // same onRcPermissionRequest the live WebSocket path does.
-        val params = JSONObject().apply {
-            put("sessionId", TEST_SESSION_ID)
+        inject(JSONObject().apply {
             put("action", "permission")
             put("requestId", requestId)
             put("toolName", toolName)
             put("toolArgs", toolArgs)
             put("description", "Permission to use $toolName tool")
-        }
+        })
+    }
+
+    /** The prompt was answered on the PC (what the orchestrator relays as rc_permission_resolved). */
+    private fun resolveOnPc(requestId: String) {
+        inject(JSONObject().apply {
+            put("action", "permission_resolved")
+            put("requestId", requestId)
+        })
+    }
+
+    private fun inject(params: JSONObject) {
+        params.put("sessionId", TEST_SESSION_ID)
         // Send the intent in-process instead of via `am broadcast`:
         // executeShellCommand does not run a shell, so the JSON in --es params
         // cannot be quoted and arrives mangled (the hook then reports
@@ -108,7 +119,7 @@ class PermissionDialogTest {
         ctx.sendBroadcast(Intent("com.repository.listener.ADB_COMMAND").apply {
             setClassName(PKG, "$PKG.adb.AdbCommandReceiver")
             putExtra("type", "rc_inject_event")
-            putExtra("command_id", "perm-$requestId")
+            putExtra("command_id", "inj-${System.nanoTime()}")
             putExtra("params", params.toString())
         })
         Thread.sleep(800)
@@ -314,6 +325,35 @@ class PermissionDialogTest {
         assertTrue(
             "Submitting the last option must dismiss the prompt",
             device.wait(Until.gone(By.text("Submit")), FIND_TIMEOUT)
+        )
+    }
+
+    /**
+     * A question answered ON THE PC must stop being answerable on the phone.
+     * The CLI withdraws the prompt over the attach WebSocket; the orchestrator
+     * used to ignore that frame, so the entry stayed pending server-side and was
+     * re-sent as live on every transcript request. The phone then kept a
+     * question up for a tool that had already run.
+     */
+    @Test
+    fun testQuestionAnsweredOnPcIsRetiredOnPhone() {
+        sendPermissionRequest(
+            requestId = "q-pc",
+            toolName = "AskUserQuestion",
+            toolArgs = questionArgs(3)
+        )
+        assertTextVisible("Option 2")
+
+        resolveOnPc("q-pc")
+
+        assertTrue(
+            "Answering on the PC must take the options off the phone",
+            device.wait(Until.gone(By.textStartsWith("Option 2")), FIND_TIMEOUT)
+        )
+        // And the composer is back, so the chat is usable again.
+        assertTrue(
+            "The message composer must return once the prompt is retired",
+            device.wait(Until.hasObject(By.res(PKG, "rcInput")), FIND_TIMEOUT)
         )
     }
 

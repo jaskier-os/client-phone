@@ -350,6 +350,38 @@ class RemoteControlActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * The prompt was answered on the PC. Retire it here WITHOUT sending a
+     * response -- the CLI already resolved it locally, and echoing a verdict
+     * would be a second, contradictory answer.
+     */
+    private val rcPermissionResolvedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (!matchesSession(intent)) return
+            val reqId = intent.getStringExtra("rc_request_id") ?: return
+            runOnUiThread {
+                permissionQueue.removeAll { it.requestId == reqId }
+                val row = adapter.getMessages().firstOrNull {
+                    it is RcMessage.PermissionRequest && it.requestId == reqId
+                } as? RcMessage.PermissionRequest
+                if (row != null) {
+                    row.pending = false
+                    row.completed = true
+                    val pos = adapter.findPositionById(row.id)
+                    if (pos >= 0) adapter.notifyItemChanged(pos)
+                }
+                if (currentPermissionRequest?.requestId == reqId) {
+                    currentPermissionRequest = null
+                    actionButtonsScroll.visibility = View.GONE
+                    findViewById<View>(R.id.rcInputBar).visibility = View.VISIBLE
+                    inputField.hint = "Send a message..."
+                    if (permissionQueue.isEmpty()) showThinking()
+                    showNextPermissionPrompt()
+                }
+            }
+        }
+    }
+
     private val rcPermissionReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             if (!matchesSession(intent)) return
@@ -1464,6 +1496,7 @@ class RemoteControlActivity : AppCompatActivity() {
         receiversRegistered = true
         registerReceiver(rcMessageReceiver, IntentFilter(ListenerService.ACTION_RC_MESSAGE), Context.RECEIVER_NOT_EXPORTED)
         registerReceiver(rcPermissionReceiver, IntentFilter(ListenerService.ACTION_RC_PERMISSION_REQUEST), Context.RECEIVER_NOT_EXPORTED)
+        registerReceiver(rcPermissionResolvedReceiver, IntentFilter(ListenerService.ACTION_RC_PERMISSION_RESOLVED), Context.RECEIVER_NOT_EXPORTED)
         registerReceiver(rcToolStatusReceiver, IntentFilter(ListenerService.ACTION_RC_TOOL_STATUS), Context.RECEIVER_NOT_EXPORTED)
         registerReceiver(rcPlanUpdateReceiver, IntentFilter(ListenerService.ACTION_RC_PLAN_UPDATE), Context.RECEIVER_NOT_EXPORTED)
         registerReceiver(rcAgentStatusReceiver, IntentFilter(ListenerService.ACTION_RC_AGENT_STATUS), Context.RECEIVER_NOT_EXPORTED)
@@ -1483,6 +1516,7 @@ class RemoteControlActivity : AppCompatActivity() {
         receiversRegistered = false
         unregisterReceiver(rcMessageReceiver)
         unregisterReceiver(rcPermissionReceiver)
+        unregisterReceiver(rcPermissionResolvedReceiver)
         unregisterReceiver(rcToolStatusReceiver)
         unregisterReceiver(rcPlanUpdateReceiver)
         unregisterReceiver(rcAgentStatusReceiver)
