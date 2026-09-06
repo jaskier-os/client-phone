@@ -2238,7 +2238,21 @@ class RemoteControlActivity : AppCompatActivity() {
         }
     }
 
-    /** How far the viewport's bottom edge is from the end of the content, in px. */
+    /**
+     * How far the viewport's bottom edge is from the end of the content, in px.
+     *
+     * Two properties this relies on, both deliberate:
+     *  - It is read synchronously after notify* and BEFORE layout, so it
+     *    reports the geometry from before the update landed. That is the
+     *    right question ("was the reader at the bottom when this arrived"),
+     *    and it is why a tall streamed chunk cannot break auto-follow: its
+     *    height is not yet in the range.
+     *  - The layout manager uses stackFromEnd, which pins the viewport to the
+     *    last row's end while that row grows, so a reader at 0px stays at 0px
+     *    as a bubble or tool result expands beneath them.
+     * LinearLayoutManager's scrollbar estimate is exact at the bottom and only
+     * approximate far from it, which the threshold does not care about.
+     */
     private fun pixelsFromBottom(): Int {
         val range = recyclerView.computeVerticalScrollRange()
         val offset = recyclerView.computeVerticalScrollOffset()

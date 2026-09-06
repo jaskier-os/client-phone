@@ -28,7 +28,7 @@ object RcAutoScroll {
      *   end of the content, in pixels.
      */
     fun shouldScrollToBottom(appended: Boolean, pixelsFromBottom: Int): Boolean =
-        appended && pixelsFromBottom <= NEAR_BOTTOM_PX
+        appended && isNearBottom(pixelsFromBottom)
 
     /** True when the user is close enough to the end to be considered "at the bottom". */
     fun isNearBottom(pixelsFromBottom: Int): Boolean = pixelsFromBottom <= NEAR_BOTTOM_PX
