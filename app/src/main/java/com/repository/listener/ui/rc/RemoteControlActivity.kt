@@ -2239,25 +2239,32 @@ class RemoteControlActivity : AppCompatActivity() {
     }
 
     /**
-     * How far the viewport's bottom edge is from the end of the content, in px.
+     * How far the viewport's bottom edge is from the end of the content, in px,
+     * from REAL geometry.
      *
-     * Two properties this relies on, both deliberate:
-     *  - It is read synchronously after notify* and BEFORE layout, so it
-     *    reports the geometry from before the update landed. That is the
-     *    right question ("was the reader at the bottom when this arrived"),
-     *    and it is why a tall streamed chunk cannot break auto-follow: its
-     *    height is not yet in the range.
-     *  - The layout manager uses stackFromEnd, which pins the viewport to the
-     *    last row's end while that row grows, so a reader at 0px stays at 0px
-     *    as a bubble or tool result expands beneath them.
-     * LinearLayoutManager's scrollbar estimate is exact at the bottom and only
-     * approximate far from it, which the threshold does not care about.
+     * The previous version used computeVerticalScrollRange/Offset/Extent. Those
+     * are scrollbar ESTIMATES: LinearLayoutManager extrapolates the total from
+     * the average height of the rows currently on screen. Chat rows are short
+     * and the running tool row is tall, so with that row just below the
+     * viewport the estimate said "about one short row to go" -- under the
+     * threshold -- while a whole screen of content actually sat below. Every
+     * gated scroll then passed and the list snapped down on each tick. That is
+     * why the fix "held" in unit tests and failed on the phone three times.
+     *
+     * Now: if the last item is not even laid out, the reader is far away by
+     * definition. If it is, measure its bottom edge against the viewport.
+     * Read synchronously after notify* and before layout, so it reflects where
+     * the reader WAS when the update arrived; stackFromEnd keeps a reader at
+     * 0px pinned there while the last row grows.
      */
     private fun pixelsFromBottom(): Int {
-        val range = recyclerView.computeVerticalScrollRange()
-        val offset = recyclerView.computeVerticalScrollOffset()
-        val extent = recyclerView.computeVerticalScrollExtent()
-        return (range - offset - extent).coerceAtLeast(0)
+        val lm = recyclerView.layoutManager as? LinearLayoutManager ?: return Int.MAX_VALUE
+        val last = adapter.itemCount - 1
+        if (last < 0) return 0
+        if (lm.findLastVisibleItemPosition() != last) return Int.MAX_VALUE
+        val lastView = lm.findViewByPosition(last) ?: return Int.MAX_VALUE
+        val viewportBottom = recyclerView.height - recyclerView.paddingBottom
+        return (lastView.bottom - viewportBottom).coerceAtLeast(0)
     }
 
     private fun updateContextUsage(pct: Int, costUsd: Double) {

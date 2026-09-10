@@ -7407,6 +7407,28 @@ class ListenerService : LifecycleService(),
                         }
                         onRcPermissionResolved(sessionId, requestId)
                     }
+                    // A tool status frame (calling/running heartbeat/complete), via
+                    // the same callback the live WebSocket path uses. Lets a test
+                    // drive real heartbeats to prove they no longer move the list.
+                    "tool_status" -> {
+                        val toolName = params.optString("toolName", "")
+                        if (toolName.isEmpty()) {
+                            AdbResultWriter.writeError(this, commandId, type,
+                                "tool_status requires toolName")
+                            return
+                        }
+                        onRcToolStatus(
+                            sessionId, toolName,
+                            params.optString("status", "running"),
+                            params.optString("result", "").ifEmpty { null },
+                            params.optString("toolArgs", "").ifEmpty { null },
+                            params.optString("toolCallId", "").ifEmpty { null },
+                            params.optInt("contextPct", 0),
+                            false, null, null, null, null, null,
+                            if (params.has("elapsedMs")) params.optLong("elapsedMs") else null,
+                            params.optInt("seq", 0)
+                        )
+                    }
                     "thinking" -> {
                         thinkingRcStartTimes[sessionId] = System.currentTimeMillis()
                         rcDumpState[sessionId]?.let { existing ->

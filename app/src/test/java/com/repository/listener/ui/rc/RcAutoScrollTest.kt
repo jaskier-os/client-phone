@@ -28,6 +28,17 @@ class RcAutoScrollTest {
     }
 
     @Test
+    fun aLastItemThatIsNotLaidOutMeansFarFromBottom() {
+        // pixelsFromBottom() reports Int.MAX_VALUE when the last row is not on
+        // screen at all. That is the case that broke three times: the scrollbar
+        // ESTIMATE the old code used said "one short row to go" while a whole
+        // tall tool row sat below the viewport. Whatever the measurement, an
+        // unlaid last item must never read as near.
+        assertFalse(RcAutoScroll.isNearBottom(Int.MAX_VALUE))
+        assertFalse(RcAutoScroll.shouldScrollToBottom(appended = true, pixelsFromBottom = Int.MAX_VALUE))
+    }
+
+    @Test
     fun nearBottomIsPixelsNotItems() {
         // The old item-count proxy called the user "near bottom" whenever the
         // last three items were visible -- true for a tall running-tool row
